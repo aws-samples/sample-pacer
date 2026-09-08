@@ -1,0 +1,64 @@
+{{- if .Values.karpenter.enabled }}
+{{- if not .Values.karpenter.zoneId }}
+{{- fail "karpenter.zoneId is required (AZ ID of the directory bucket, e.g. use1-az4)" }}
+{{- end }}
+# Cache nodepool invariants (ADR-0002, ADR-0004):
+#   - pinned to ONE AZ by AZ ID, matching the S3 Express directory bucket
+#   - Nitro v4+ instance families only (RDMA READ capable)
+#   - instance-store NVMe assembled as RAID0
+#   - EFA interface + cluster placement group + self-referencing SG are
+#     provisioned OUTSIDE this chart (subnet/SG discovery is cluster-specific);
+#     tags below are the hook points.
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: {{ include "pacer.fullname" . }}-cache
+  labels:
+    {{- include "pacer.labels" . | nindent 4 }}
+spec:
+  amiSelectorTerms:
+    - alias: {{ .Values.karpenter.amiFamily | lower }}@latest
+  role: {{ required "karpenter.role is required" .Values.karpenter.role }}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: {{ required "karpenter.clusterName is required" .Values.karpenter.clusterName }}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: {{ .Values.karpenter.clusterName }}
+  # NVMe instance store → single RAID0 array at /mnt/k8s-disks/0
+  instanceStorePolicy: RAID0
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: {{ include "pacer.fullname" . }}-cache
+  labels:
+    {{- include "pacer.labels" . | nindent 4 }}
+spec:
+  template:
+    metadata:
+      labels:
+        pacer.io/nodepool: cache
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: {{ include "pacer.fullname" . }}-cache
+      requirements:
+        - key: topology.k8s.aws/zone-id
+          operator: In
+          values: [{{ .Values.karpenter.zoneId | quote }}]
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values:
+            {{- range .Values.karpenter.instanceFamilies }}
+            - {{ . | quote }}
+            {{- end }}
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+  disruption:
+    # Node churn = cold cache; consolidate only truly empty nodes.
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 300s
+{{- end }}

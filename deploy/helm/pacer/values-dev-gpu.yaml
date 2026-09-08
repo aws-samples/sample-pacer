@@ -1,0 +1,79 @@
+# GPU dev profile — a `gpu-az*` p5 node instead of the cache pool.
+#
+# Layered by `scripts/dev/pacer-dev` ON TOP of values-gpu-ohio.yaml + values-dev.yaml
+# whenever `GPU=1` is set. It is the profile for anything whose subject is a GPU or a
+# client that owns GPU memory (ADR-0027, ADR-0030): the cache pool has EFA but no GPU,
+# and the `general` pool has neither.
+#
+# Why a dev profile at all, when `bench/ladder/values-c2.yaml` already selects this pool:
+# a bench overlay also fixes the measured variables (mem tier, arena, hugepages, keyset
+# geometry) because a number is only comparable if those hold still. This file fixes
+# WHERE the pods land and nothing else, so the edit → `build-pod swap` → run loop works
+# on a GPU node without pretending to be a measurement.
+#
+# It costs what a p5 costs. `GPU=1` is never a default anywhere.
+
+# values-gpu-ohio.yaml selects the cache pool by label; null it out (the chart's
+# `pacer.nodeSelector` helper skips empty values, so this renders as a removal rather
+# than an API-invalid null) and select the GPU pool's own labels instead. The
+# `gpu-placement-az` value is retargeted by pacer-dev for az2/az3 — the label exists only
+# on that pool's nodes, and each gpu-az* pool pins one zone, so this pair also fixes the
+# AZ without a second selector.
+nodeSelector:
+  s3-ai-cache: null
+  nvidia.com/gpu: "true"
+  gpu-placement-az: use2-az1
+
+# Lists replace wholesale (no merge): this REPLACES the cache-pool toleration, which is
+# what the GPU pools do not carry. Every gpu-az* pool taints for nvidia even for a pod
+# that allocates no GPU — and this daemon deliberately allocates none (ADR-0027 point 5:
+# visibility is not allocation), so it tolerates the taint rather than requesting a device.
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+efa:
+  # REACH a device, do not REQUEST one (ADR-0030 point 9). A p5 has 32 interfaces so the
+  # request would not starve a client here the way it does on a one-interface node — but
+  # the daemon holding hardware it only needs to *use* is the thing the ADR rules out, and
+  # a dev profile that models production wrongly is how the rule gets forgotten. The
+  # launcher still requests one at launch, which is what makes Karpenter attach the ENI.
+  enabled: true
+  shareHostDevices: true
+  # And privileged, because the mount alone cannot OPEN what it makes visible: the device
+  # cgroup admits only devices a plugin ALLOCATED, so every `ibv_open_device` came back
+  # EPERM on a p5 with 32 free units and the daemon ran gRPC-only while logging 32 rails
+  # placed (2026-08-24 — see efa.privileged in values.yaml). Since the request is ruled
+  # out, this is the only thing left short of our own device plugin.
+  privileged: true
+  # Registering memory pins it; on this path the daemon registers its own arenas and the
+  # client registers its window.
+  ipcLock: true
+  # **This is what turns ADR-0028's slab ON**, and it is the largest single change to
+  # delivery throughput measured on this path: with the slab, a WRITE reads the cache in
+  # place instead of leasing a holder range and memcpying a 16 MiB chunk into it, and a
+  # 70B-shard restore into 8 H100s went **13.7 -> 52.7 GiB/s, 3.86x**, with the run-to-run
+  # spread collapsing from +-18 % to +-3 % (bench/ladder/results/c5-slab-zerocopy-source.md).
+  # It is not a CPU saving: that copy sat inline in the task driving a request's whole window
+  # set, so removing it lifted in-flight WRITEs from ~29 to 142.
+  #
+  # `pacer.cacheSlabBytes` only derives a slab when this is set, because registration is per
+  # page and repeated once per rail — minutes on 4 KiB pages, seconds on 2 MiB.
+  #
+  # 16Gi is the arithmetic for THIS file's tier, and the chart fails the render rather than
+  # degrade if it is short: requester arena (4Gi) + holder arena (HOLDER_ARENA_RANGES x
+  # chunkSize = 4Gi) + slab (memCapacity + 256 x chunkSize = 8Gi). **Raising
+  # config.memCapacity means raising this by the same amount** — every GiB of tier is a GiB
+  # of slab. The ceiling is the NODE's boot reservation, not this value: gpu-az* userData
+  # reserves 32768 x 2Mi = 64 GiB, so a tier above ~52 GiB cannot be slab-backed here at all
+  # (a request Karpenter cannot satisfy leaves the pod Pending). Bench drivers that move the
+  # tier derive this for themselves — see C5_HUGEPAGES in bench/ladder/c5-safetensors.sh.
+  hugepages: 16Gi
+
+config:
+  # A p5.48xlarge mounts its instance store at the chart's hostPath, so the disk tier is
+  # real here and values-gpu-ohio.yaml's sizing holds. Only the RAM tier is trimmed: a
+  # dev daemon on a 1.9 TiB node has no reason to reserve a bench arm's 16 GiB.
+  memCapacity: 4GiB

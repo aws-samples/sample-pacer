@@ -1,0 +1,98 @@
+[package]
+name = "pacer-daemon"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Node-local S3-compatible caching proxy daemon"
+
+[features]
+default = []
+# Forwarded so `cargo build -F efa` at the workspace root builds the RDMA path.
+efa = ["pacer-transport/efa"]
+
+[dependencies]
+pacer-cache.workspace = true
+pacer-ring = { workspace = true, features = ["k8s"] }
+pacer-transport.workspace = true
+pacer-proto.workspace = true
+pacer-backend.workspace = true
+
+s3s.workspace = true
+s3s-aws.workspace = true
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_yaml_ng.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+tokio-stream.workspace = true
+# `mmap`/`munmap` of a client's shared-memory segment (ADR-0026): the daemon
+# maps memory a client owns, which std cannot express.
+libc.workspace = true
+# CRC32 over delivered bytes (ADR-0026 point 5): with no response body there is
+# no SDK checksum, so the completion header carries one. Already in the tree via
+# the AWS SDK's checksums, so this adds no new supply-chain surface.
+crc32fast.workspace = true
+mixtrics = { workspace = true, features = ["prometheus"] }
+prometheus.workspace = true
+time = "0.3"
+# Global allocator on Linux. foyer allocates a fresh PAGE-aligned buffer the size
+# of the whole entry on EVERY disk-tier read and frees it right after (16 MiB per
+# chunk hit, no buffer pool); glibc serves that from `mmap` and returns it with
+# `munmap`, so each read re-faults 16 MiB of fresh pages. jemalloc retains the
+# span in its arena instead. Kept off non-Linux so a macOS dev build needs no
+# jemalloc toolchain — the daemon only ever runs on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6"
+
+[dev-dependencies]
+# `test-util` gives the listener's unit tests `start_paused`. Test-only, and
+# declared HERE rather than relied on through feature unification: a workspace
+# build happens to unify it in from another crate's dev-dependencies, so
+# `make dev-build-test` was green while `cargo test -p pacer-daemon` — the
+# single-crate inner loop the hook now allows on the Mac — failed to compile
+# with three E0599s. A crate's tests must build from the crate's own manifest.
+tokio = { workspace = true, features = ["test-util"] }
+s3s-fs = "0.14"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+# An SDK interceptor on the daemon's OWN backend client, so a test can assert on the
+# request the daemon PRODUCES rather than only on the one its client supplied — which
+# is what `write_framing.rs` needs and what no public aws-sdk-s3 API exposes. Already
+# in the tree as a transitive dependency of aws-sdk-s3, so this adds no new
+# supply-chain surface, and it is test-only.
+aws-smithy-runtime-api = "1"
+# Named, table-driven cases for the integration arms whose tests differ only by a
+# parameter — see the workspace pin for why this rather than a hand-rolled macro.
+rstest.workspace = true
+
+# ONE integration binary, not one per file. Cargo links a fresh copy of this crate and
+# its whole dependency closure into every `tests/*.rs`, and nine of them was nine link
+# steps for nine copies of the same code — most of the wall clock of a warm
+# `cargo nextest run --workspace`. Under nextest each *test* is a process, so keeping
+# the files as separate binaries no longer buys any parallelism; it only bought link
+# time. `tests/daemon.rs` declares one module per former binary out of
+# `tests/daemon/`, and `tests/common/` is the fixture they share.
+#
+# Declared explicitly rather than left to auto-discovery so this is a statement rather
+# than a side effect of where the files happen to sit: `autotests` stays on, and
+# `tests/daemon/` is a directory with no `main.rs`, so nothing under it is discovered
+# as a target of its own.
+[[test]]
+name = "daemon"
+path = "tests/daemon.rs"
+
+[lints]
+workspace = true

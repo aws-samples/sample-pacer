@@ -1,0 +1,24 @@
+# Dev-loop overlay — apply ON TOP of the environment values, e.g.:
+#   helm upgrade pacer deploy/helm/pacer -n pacer \
+#     -f deploy/helm/pacer/values-gpu-ohio.yaml -f deploy/helm/pacer/values-dev.yaml
+# (scripts/dev/pacer-dev does this for you). See scripts/dev/README.md.
+#
+# Pods start as a busybox supervisor with NO daemon binary and stay NotReady
+# until the first `pacer-dev push`.
+
+devMode:
+  enabled: true
+
+# REUSE the `pacer` ServiceAccount rather than creating one per release. A dev release is
+# session-scoped (`pacer-dev-<token>`, ADR-0029), so `create: true` would name its SA after
+# the release — and EKS Pod Identity is associated with exactly one pair on this cluster,
+# (namespace `pacer`, SA `pacer`). A release with its own SA therefore boots, passes
+# /healthz, and fails EVERY backend call with `InternalError`: no credentials, and nothing
+# in the pod says so. The bench overlays already do this (bench/ladder/values-c1.yaml and
+# friends); the dev loop needs it for the same reason the moment it touches S3.
+serviceAccount:
+  create: false
+  name: pacer
+
+config:
+  logLevel: debug

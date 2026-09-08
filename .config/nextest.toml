@@ -1,0 +1,97 @@
+# cargo-nextest configuration (quality item L2).
+#
+# Why nextest at all: `cargo test` runs one binary per crate with an in-process
+# thread pool, prints nothing machine-readable, and stops the WHOLE run at the
+# first failing binary's first failure. nextest runs each test in its own
+# process, so a panic in one cannot poison another's global state, and it emits
+# JUnit — which is what makes a red pipeline show the failing test names in the
+# MR widget instead of only inside a 4000-line job log.
+#
+# WHAT DOES NOT MOVE HERE: nextest does not run doctests (upstream limitation,
+# nextest-rs/nextest#16). That costs this workspace nothing — every fenced block
+# under `///`/`//!` in crates/ is ```text or ```c, so `cargo test --doc` collects
+# ZERO Rust doctests (verified 2026-09-08, 10 fences, 0 of them Rust). The CI
+# jobs still run `--doc` as a TRIPWIRE so the first real doctest someone writes
+# is executed rather than silently collected by nothing — the same hole the
+# `--examples` line in `.gitlab-ci.yml` was added to close.
+
+[profile.default]
+# The interactive/build-pod profile. No retries: a flaky unit test in this
+# workspace is a defect to fix, not to paper over, and `default:retry` in
+# .gitlab-ci.yml already absorbs the INFRA failures that are not the diff's
+# fault (runner_system_failure and friends).
+retries = 0
+# Run every test even after one fails. The build pod is a remote 16-vCPU node
+# reached over kubectl, so one iteration costs a node-minute and a round trip:
+# surfacing all failures in that one pass is worth more than stopping early.
+fail-fast = false
+# Report a test as slow rather than killing it. `period` only controls WHEN the
+# "SLOW" line is printed; with no `terminate-after` nothing is timed out, which
+# matters because the backend matrix tests talk to a local s3s server and are
+# legitimately slower than a unit test. 60 s is comfortably above every test
+# measured in the pod on 2026-09-08 and still flags a hang early.
+slow-timeout = { period = "60s" }
+
+# NO PER-TEST OVERRIDES, and one is worth recording as deliberately absent.
+#
+# `active_transfer_survives_a_short_idle_deadline` (crates/pacer-daemon/tests/daemon/listener.rs)
+# briefly had `threads-required = "num-test-threads"` here, reserving the whole test-thread
+# pool so it ran alone: its assertion is about REAL time by necessity (a real `TcpStream`), so
+# sharing a 16-vCPU node with ~400 sibling test processes made it measure the machine rather
+# than the daemon — a >1 s stall inside its paced run was indistinguishable from the regression
+# it exists to catch, and it failed 6 of 8 runs at full parallelism (2026-09-08).
+#
+# That override was removed on the same day in favour of the fix it named as cheaper: the
+# deadline it asserts against is TEST-ONLY, not the daemon's shipped default, so raising it
+# (`IDLE_UNDER_LOAD` 1 s → 5 s, `PACED_RUN` 2 s → 10 s, ratio and const assert unchanged)
+# makes a scheduling stall unable to reach it while keeping the proof identical. Serialising
+# cost ~14 s of a ~31 s run and made one test's timing a property of nextest's scheduler; the
+# raised deadline costs nothing, because the test's extra seconds are spent asleep in parallel
+# with everything else. If this arm ever flakes again the answer is another look at the
+# durations in that file, not a `threads-required` here and not a retry — `retries = 0` above
+# is what keeps a real race from passing on the second attempt.
+
+# The CI profile, selected with `--profile ci` by the `rust` job's default-feature
+# run and by `build-binary`'s release run (different jobs on different pods, so one
+# store path cannot collide). Its store directory is `target/nextest/ci/`, which is
+# where the JUnit path below resolves.
+[profile.ci]
+# Same reasoning as above, stated rather than inherited so that changing the
+# interactive profile cannot silently start retrying in CI: a retried test is a
+# green pipeline over a real race (the stream-ordered-consumer race in
+# planning/19 was found by a test that failed once in ten runs).
+retries = 0
+# NOT fail-fast, and this is the point of a separate profile: GitLab shows the
+# JUnit report as a list of failing tests, and that list is only complete if the
+# run continued past the first failure. Stopping early produces a report naming
+# one test out of however many the commit broke.
+fail-fast = false
+slow-timeout = { period = "60s" }
+
+[profile.ci.junit]
+# Relative to the profile store dir, so this is `target/nextest/ci/junit.xml` —
+# the path `.gitlab-ci.yml` collects as `artifacts:reports:junit`. `target/` is
+# already the cargo cache path, so nothing new has to be cached or ignored.
+path = "junit.xml"
+
+# The `--all-features` leg of the `rust` job. A SEPARATE profile purely so its
+# JUnit lands in `target/nextest/ci-all-features/junit.xml` instead of overwriting
+# the default-feature leg's report — two runs in ONE job writing one path means the
+# pipeline UI shows only whichever ran last, and the efa-gated tests are exactly
+# the ones nothing else in the pipeline executes (ci/README.md).
+[profile.ci-all-features]
+inherits = "ci"
+
+# `inherits` copies the junit table too, but the path is resolved against THIS
+# profile's own store dir, so restating it is what makes the destination explicit
+# rather than a property of nextest's inheritance rules.
+[profile.ci-all-features.junit]
+path = "junit.xml"
+
+# ONE TRAP WORTH KNOWING: nextest's store dir is derived from the WORKSPACE root's
+# `target/`, not from `$CARGO_TARGET_DIR`. In CI the two are the same thing, so the
+# paths `.gitlab-ci.yml` collects are right. In the build pod, which redirects
+# `CARGO_TARGET_DIR` to a mounted cache volume, a `--profile ci` run would still
+# write into the mirrored source tree at `/src/target/nextest/` (verified
+# 2026-09-08). The pod uses the `default` profile, which configures no JUnit at
+# all, so it writes no report and the question does not arise there.

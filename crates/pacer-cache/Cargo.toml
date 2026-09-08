@@ -1,0 +1,29 @@
+[package]
+name = "pacer-cache"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "foyer HybridCache wrapper: cache policy (>4MB whole objects, LRU)"
+
+[dependencies]
+foyer.workspace = true
+mixtrics.workspace = true
+bytes = { workspace = true, features = ["serde"] }
+crc32fast.workspace = true
+# O_DIRECT: the read path DMAs from NVMe straight into a registered hugepage frame,
+# and the flag has no portable spelling in std.
+libc = "0.2"
+serde.workspace = true
+bincode.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,96 @@
+# Test deployment on EKS gpu-mumbai (ap-south-1) — the sibling of
+# values-gpu-ohio.yaml, and the base every Mumbai run layers an overlay onto.
+#
+# WHY A SECOND CLUSTER AT ALL: `p6-b200.48xlarge` (8 x B200, 1432.5 GiB of HBM per
+# node) is offered here and not in gpu-ohio, whose GPU pools list only
+# g7e/p5/p5e/p5en. Checked 2026-09-06: `describe-instance-type-offerings` puts
+# p6-b200 in **ap-south-1c only**, and the ap-south-1 Standard bucket is already
+# staged with the large models (Kimi-K2-Instruct, DeepSeek-V3.1,
+# Qwen3-235B-A22B-BF16, Llama-3.1-405B-FP8).
+#
+# THREE WAYS THIS CLUSTER DIFFERS, each of which breaks something if assumed away:
+#
+#   1. **S3 Standard only — there is no Express directory bucket in ap-south-1.**
+#      `list-directory-buckets` returns six in us-east-2 and NONE here, so the
+#      same-AZ directory-bucket invariant (ADR-0002) has nothing to apply to and
+#      `backendType: standard` is not a choice but the only option. Convenient
+#      rather than limiting: ADR-0032's write scatter is Standard-only anyway
+#      (Express is a startup `bail!`), so the write path works here and would not
+#      have worked on an Express bucket.
+#   2. **There is no cache nodepool.** gpu-ohio has `s3-ai-cache` (r8gd, the cheap
+#      host-memory pool the write arms use); Mumbai has `general` plus
+#      `gpu`/`gpu-az1`/`gpu-az2`/`gpu-az3` and nothing else. So the daemon is placed
+#      on the GPU pool by default here, and an arm that wanted a cheap Graviton
+#      cache fleet has to run in Ohio.
+#   3. **The AZ-numbered pools do not map to AZ letters the obvious way.**
+#      `gpu-az2` is **ap-south-1c** and `gpu-az3` is ap-south-1b (checked on the
+#      NodePools, not inferred). Since p6-b200 is only offered in 1c, `gpu-az2` is
+#      the pool for it — and it is the one whose instance-type list actually
+#      includes p6-b200. `gpu-az1` does not.
+#
+# Everything else is deliberately identical to values-gpu-ohio.yaml so a number
+# from one cluster is comparable to a number from the other.
+
+# Helm merges maps: the chart's default `pacer.io/nodepool: cache` must be nulled
+# out explicitly or the DaemonSet selects on both labels and matches nothing.
+#
+# The GPU pool rather than a cache pool, because Mumbai has no cache pool (see
+# above). An overlay narrows this to one AZ — bench/ladder/values-p6-aps1.yaml.
+nodeSelector:
+  pacer.io/nodepool: null
+  nvidia.com/gpu: "true"
+
+# Lists replace wholesale (no merge), so this REPLACES the chart's cache-pool
+# toleration rather than adding to it. Every GPU node here carries the nvidia taint.
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+image:
+  # us-east-2 for now, which is a CROSS-REGION pull from this cluster. It works
+  # credential-free for the same reason it does in Ohio — the node role's
+  # `AmazonEC2ContainerRegistryReadOnly` is on `Resource: "*"` and is not
+  # region-scoped — and it was verified here on 2026-09-06 with a 3 GiB pull onto a
+  # Mumbai node. ECR replication INTO ap-south-1 is being added separately; when it
+  # lands, point this at the ap-south-1 registry, because a cold pull across the
+  # Indian Ocean is minutes of a ~$48/hr node.
+  repository: 123456789012.dkr.ecr.us-east-2.amazonaws.com/s3-ai-cache
+  # No pullSecrets: this cluster's `pacer` namespace has none, and the node role
+  # already authenticates the pull. Naming a secret that does not exist only adds a
+  # kubelet warning to every pod event list.
+
+config:
+  s3Endpoint: ""
+  awsRegion: ap-south-1
+  # Standard, not a directory bucket — see note 1 above. `run.sh` overrides this per
+  # run (`--set config.bucketMap.cache`), so this is the default rather than a pin.
+  backendType: standard
+  bucketMap:
+    cache: s3-ai-cache-standard-123456789012-aps1
+  cacheDir: /var/cache/pacer
+  memCapacity: 2GiB
+  diskCapacity: 700GiB
+  minObjectSize: 4MiB
+  logLevel: info
+
+cluster:
+  enabled: true
+
+# **Do NOT let the chart create a release-named ServiceAccount here.** The backend
+# is reached by EKS Pod Identity (the only mechanism the daemon supports), and this
+# cluster's association is for `serviceAccount: pacer` in namespace `pacer`
+# (association a-tsirczb6geicjtclg, confirmed 2026-09-06). A release-named SA gets
+# no association, the daemon then has no credentials, and every backend call fails
+# in a way that has been read as a product defect in this repo before.
+serviceAccount:
+  create: false
+  name: pacer
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 4Gi
+  limits:
+    memory: 8Gi

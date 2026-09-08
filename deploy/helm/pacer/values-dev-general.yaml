@@ -1,0 +1,44 @@
+# Cheap dev profile — the general nodepool instead of the cache pool.
+#
+# Layered by `scripts/dev/pacer-dev` ON TOP of values-gpu-ohio.yaml + values-dev.yaml
+# whenever `EFA=1` is not set, which is the default: most iterations ask "does my change
+# boot and serve", and that does not need an r8gd at ~$2-4/hr. `EFA=1 pacer-dev up`
+# skips this file and takes a real cache node.
+#
+# What this profile cannot do, deliberately: RDMA (the `general` pool has no EFA
+# devices) and anything that depends on the instance-store NVMe. The S3 backend path,
+# the gRPC peer plane, /healthz, metrics and the whole edit→swap loop all work.
+
+# Off the cache pool and onto the untainted general one (c/m/r, generation > 5,
+# consolidateAfter 60s — the same pool the remote build pod uses).
+#
+# No capacity type here on purpose: the DaemonSet lands on nodes this session already
+# claimed, and what bought them was the placeholder that provisioned them
+# (scripts/dev/pacer-dev, spot unless SPOT=0). A capacity-type selector on the daemon
+# would only add a second way for its nodeSelector to stop matching.
+#
+# `s3-ai-cache: null` works here because the chart's `pacer.nodeSelector` helper skips
+# empty values: Helm's own "key: null" deletion applies to chart DEFAULTS only, never
+# between two -f overlays, so without that helper this would render an API-invalid null.
+nodeSelector:
+  s3-ai-cache: null
+  node-type: general
+
+# The general pool is untainted, so there is nothing to tolerate. An array REPLACES
+# rather than merges, which is what drops values-gpu-ohio.yaml's cache-pool toleration.
+tolerations: []
+
+# A general node has no instance-store RAID at /mnt/k8s-disks/0, so the cache dir would
+# be created (hostPath is DirectoryOrCreate) on the root EBS volume under a path whose
+# name promises an NVMe array. Point it somewhere honest instead.
+cache:
+  hostPath: /var/lib/pacer-dev-cache
+
+config:
+  # 700GiB is sized for the cache pool's smallest instance store; on a general node the
+  # cache dir is on the root volume, which is tens of GiB in total and also holds the
+  # container runtime. The daemon treats this as a budget it may fill, so overstating it
+  # fills the node's root disk instead — 20GiB leaves the disk tier real and the node
+  # healthy. Cheap iteration does not need a large disk tier; a measurement does, and a
+  # measurement belongs on `EFA=1` or a bench driver.
+  diskCapacity: 20GiB

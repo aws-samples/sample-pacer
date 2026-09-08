@@ -1,0 +1,454 @@
+syntax = "proto3";
+
+package pacer.v1;
+
+// ---- Field/value-number evolution rule (every message and enum below) ----
+//
+// A field number, once it ships, is assigned FOREVER. Renaming a field is
+// free — the wire only ever carries numbers, never names — but deleting one
+// is not: a peer running an older or newer build may still send or expect
+// that number, so it must never be reinterpreted as something else, and a
+// number an old build wrote must never be silently reread as a new field
+// with an incompatible type. The same holds for an enum's values.
+//
+// So when a field or enum value is removed, its number (and, since prost/JSON
+// also care, its name) is added to that message's or enum's `reserved` list —
+//   reserved 7;
+//   reserved "old_field_name";
+// — which makes protoc itself refuse any later field that tries to reuse
+// either. A field is never resurrected under its old number either: give a
+// re-added field the next unused number and leave the old one reserved.
+//
+// As of this commit no field, enum value, message or RPC has ever been
+// removed from this file (checked against the full `git log -p --follow`
+// history) — there is nothing to `reserved` yet, and none is added
+// speculatively (an unused number reserved "just in case" documents nothing
+// and blocks nothing a missing `reserved` wouldn't already block). This
+// block exists so the FIRST removal follows the rule above instead of
+// improvising one; `pacer-proto`'s `field_number_hygiene` test module
+// guards the two ways this rule is normally broken by hand: two live fields
+// sharing a number, and a "removed" field whose number was freed for reuse
+// instead of reserved.
+
+// Peer-to-peer control plane between pacer daemons. Always runs over gRPC/TCP,
+// even when the blob data path is RDMA (ADR-0003): capability negotiation and
+// fallback both need a transport that is guaranteed to exist.
+service Peer {
+  // Exchanged once at peer connect. RDMA is used only when BOTH ends report
+  // hardware (non-emulated) support for the required primitive.
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+
+  // Fetch a cached blob from a peer. Control only, always gRPC (ADR-0019):
+  // carries the fetch command and, on the RDMA path, doubles as the
+  // ADR-0018 done signal after the holder's one-sided WRITE lands. The data
+  // itself moves over `BlobChunk.data` (gRPC fallback) OR the holder's RDMA
+  // WRITE into `FetchBlobRequest.rdma_buffer` (EFA path) OR its WRITE into
+  // `FetchBlobRequest.client_token` (ADR-0030's remote half: straight into the
+  // reading client, one hop fewer) — never more than one.
+  rpc FetchBlob(FetchBlobRequest) returns (stream BlobChunk);
+
+  // Drop a key from the peer's cache. Sent to the key's owner after a
+  // write-through (ADR-0007 read-after-write, extended cluster-wide).
+  rpc Invalidate(InvalidateRequest) returns (InvalidateResponse);
+
+  // Chunk directory (ADR-0017), v1 RPC lookup transport (v2 is ADR-0020's
+  // one-sided RDMA READ). Sent to a chunk key's home.
+  //
+  // Announce: a holder tells the home it admitted or evicted a chunk, so the
+  // home's sharer set stays current. Fire-and-forget from the caller's
+  // perspective (a dropped announce costs one stale-entry retry later, never
+  // a wrong serve — ADR-0017 soft-state contract).
+  rpc Announce(AnnounceRequest) returns (AnnounceResponse);
+  // Lookup: who currently holds this chunk? An empty sharer set is the
+  // ADR-0017 miss path (the home performs/delegates the read-through).
+  rpc LookupSharers(LookupSharersRequest) returns (LookupSharersResponse);
+
+  // ADR-0032 write scatter. A PUT's coordinator opens one multipart upload and
+  // offers each `chunk_size` window to that chunk's home, which uploads it as
+  // one part with its OWN node credentials (ADR-0006) and stages the bytes it
+  // just uploaded.
+  //
+  // The only other RPC here that carries bulk data is FetchBlob, and this is
+  // the one the ADR-0018 WRITE verb replaces in the RDMA leg (planning/24
+  // Phase 5) — with the trigger inverted, since here the sender holds the bytes.
+  //
+  // Refusal is a NORMAL response, not an error: an owner with no staged-byte
+  // budget answers immediately so the coordinator can upload that window
+  // itself. That is what breaks the all-to-all deadlock when every node is at
+  // once coordinating its own write and homing others' chunks.
+  rpc StoreChunk(StoreChunkRequest) returns (StoreChunkResponse);
+
+  // Make an upload's staged chunks visible, now that Complete has made the
+  // object exist in S3. The coordinator does NOT await this and it needs no
+  // atomicity: it turns a guaranteed miss into a possible hit, and a miss is
+  // always legal — the inverse of Invalidate, which must be awaited because a
+  // holder that misses it serves STALE bytes.
+  rpc CommitUpload(CommitUploadRequest) returns (CommitUploadResponse);
+
+  // Drop an upload's staged chunks: Complete failed or the upload was aborted,
+  // so those bytes describe an object that will never exist.
+  rpc DiscardUpload(DiscardUploadRequest) returns (DiscardUploadResponse);
+}
+
+message StoreChunkRequest {
+  // Cache key this window is stored under, "{bucket}/{key}#{size}:{index}"
+  // (see pacer-cache::chunk) — the owner is this chunk's home, so caching it
+  // here is a local directory write with no further RPC (ADR-0017
+  // "home-is-holder").
+  string chunk_key = 1;
+  // The coordinator's multipart upload id. Groups an owner's staged chunks so
+  // CommitUpload/DiscardUpload can address them all without listing keys.
+  string upload_id = 2;
+  // The BACKEND bucket, already resolved through the coordinator's bucket map —
+  // not the name the client used. Sending the resolved name keeps the owner
+  // from re-mapping an already-mapped bucket, which would be a silent
+  // wrong-target write.
+  string bucket = 3;
+  // Object key the part belongs to.
+  string key = 4;
+  // S3 part number: the chunk's 0-based grid index plus one. Contiguous
+  // coverage makes these 1..N with no gaps.
+  int32 part_number = 5;
+  // The window's bytes. Exactly `chunk_size` except for an object's last
+  // window, which S3 exempts from its 5 MiB minimum part size.
+  bytes data = 6;
+  // Base64 CRC32 of `data` in S3's ChecksumCRC32 form. Covers the
+  // coordinator→owner hop: a window corrupted in transit is rejected by S3 at
+  // UploadPart rather than assembled into the object (rejection verified in
+  // spike/mpu-scatter, gate 0.2c).
+  string checksum_crc32 = 7;
+}
+
+message StoreChunkResponse {
+  // Present iff the owner uploaded the part. The coordinator needs every
+  // part's ETag to call CompleteMultipartUpload.
+  optional string e_tag = 1;
+  // Present iff the owner refused. Exactly one of these two fields is set.
+  optional StoreRefusal refusal = 2;
+}
+
+// Why an owner would not take a window. Never an error status: the coordinator
+// handles the window itself either way, but the reason decides whether it
+// should keep offering to this owner.
+message StoreRefusal {
+  RefusalReason reason = 1;
+  // Bytes the owner had staged when it refused, for the coordinator's log.
+  uint64 staged_bytes = 2;
+  // The owner's configured staging ceiling.
+  uint64 budget_bytes = 3;
+}
+
+enum RefusalReason {
+  REFUSAL_REASON_UNSPECIFIED = 0;
+  // Staging would exceed the byte budget — load, so a cooldown clears it. The
+  // coordinator should stop offering to this owner for a while rather than
+  // re-offer every window, since by the time an owner can refuse it has
+  // already received the bytes.
+  REFUSAL_REASON_BUDGET_EXHAUSTED = 1;
+  // Another upload has this chunk key staged: two writers racing one key,
+  // which ADR-0032 puts out of contract for v1. Refusing keeps either
+  // version's chunks from being cached under an ambiguous ETag.
+  REFUSAL_REASON_RACING_UPLOAD = 2;
+  // The window is larger than the owner's whole budget — a misconfiguration
+  // (budget below chunk_size), which no cooldown clears. Distinguished from
+  // BUDGET_EXHAUSTED so a coordinator does not sit in a cooldown loop waiting
+  // for load that was never the problem.
+  REFUSAL_REASON_OVERSIZED_FOR_BUDGET = 3;
+  // This owner is not accepting scattered writes at all — the feature is off,
+  // or its backend is not a general-purpose bucket (ADR-0032 § 6). Permanent
+  // until the owner is reconfigured.
+  REFUSAL_REASON_NOT_ACCEPTING = 4;
+}
+
+message CommitUploadRequest {
+  // Which upload's staged chunks to publish.
+  string upload_id = 1;
+  // The object's final ETag from CompleteMultipartUpload, stored with each
+  // committed chunk as its version witness (ADR-0032 § 7). Unknowable before
+  // Complete, which is why commit is a second round trip rather than a flag on
+  // StoreChunk.
+  string e_tag = 2;
+}
+
+message CommitUploadResponse {
+  // How many chunks became visible, for the coordinator's metrics. Zero is not
+  // an error: the owner may have reaped them on its TTL, and an uncached chunk
+  // is a miss, never a wrong answer.
+  uint32 committed = 1;
+}
+
+message DiscardUploadRequest {
+  string upload_id = 1;
+}
+
+message DiscardUploadResponse {
+  // How many staged chunks were dropped.
+  uint32 discarded = 1;
+}
+
+message InvalidateRequest {
+  string cache_key = 1;
+}
+
+message InvalidateResponse {}
+
+// A holder's storage tier for one chunk copy — a source-selection latency
+// hint only, never a byte address (ADR-0017; the holder still drives the
+// transfer, ADR-0018).
+enum Tier {
+  TIER_UNSPECIFIED = 0;
+  TIER_DRAM = 1;
+  TIER_NVME = 2;
+}
+
+message AnnounceRequest {
+  // Chunk key, "{bucket}/{key}#{size}:{index}" (see pacer-cache::chunk).
+  string chunk_key = 1;
+  // The announcing holder's stable node name.
+  string node = 2;
+  // Admit: present. Evict: absent (tier is meaningless on evict).
+  optional Tier tier = 3;
+  // Per-holder admission counter — lets an admit/evict pair that arrives out
+  // of order fold correctly (ADR-0017: distinguishes a re-admit from a stale
+  // registration). Required on both admit and evict.
+  uint64 generation = 4;
+  // True = this is an evict announcement; false = admit.
+  bool evict = 5;
+}
+
+message AnnounceResponse {}
+
+message LookupSharersRequest {
+  string chunk_key = 1;
+}
+
+message LookupSharersResponse {
+  repeated Sharer sharers = 1;
+  // Set once the home stopped tracking individual holders for this chunk key
+  // (ADR-0017 max_sharers_tracked cap) — readers pick among the listed
+  // sharers or fall back, rather than treating this as "nobody has it".
+  bool widely_held = 2;
+}
+
+message Sharer {
+  string node = 1;
+  Tier tier = 2;
+  uint64 generation = 3;
+}
+
+// Discovered via the efadv/ibverbs capability probe (ADR-0021: create+activate
+// an SRD QP with one-sided send-ops, efadv_query_device caps — the efadv
+// equivalent of libfabric's fi_getinfo/FI_OPT_EFA_EMULATED_READ==false this
+// message's naming predates). All fields false on nodes without EFA (e.g. g5,
+// c5n) — they speak gRPC only.
+message RdmaCapabilities {
+  bool rdma_read = 1;
+  bool rdma_write = 2;
+  bool send_recv = 3;
+}
+
+// An ibverbs SRD endpoint (ADR-0021: NOT a libfabric fi_addr), enough for a
+// peer to build an address handle and address sends to this node.
+// jonhoo/ibverbs' own stable wire encoding (`QueuePairEndpoint::to_bytes`,
+// 23 bytes: qp_num + optional lid + optional GID) — carried opaquely here so
+// this proto never has to track that crate's internal layout.
+message EfaEndpoint {
+  // Rail 0's endpoint. Kept as its own field (not folded into
+  // `rail_endpoints`) for wire compatibility: single-rail peers predating A5
+  // multi-rail populate and read only this.
+  bytes queue_pair_endpoint = 1;
+  // A5 multi-rail: one endpoint per local EFA rail, in rail order, INCLUDING
+  // rail 0 (so `rail_endpoints[i]` is always rail i; readers use this list
+  // whenever it is non-empty and fall back to `queue_pair_endpoint` alone
+  // otherwise). Rails pair by index — requester rail i is addressed by holder
+  // rail i — and the usable count is min(local, peer) on each side.
+  repeated bytes rail_endpoints = 2;
+}
+
+message HandshakeRequest {
+  string node_id = 1;
+  RdmaCapabilities capabilities = 2;
+  // Daemon protocol version for forward-compatible negotiation.
+  uint32 protocol_version = 3;
+  // Present iff `capabilities` has any RDMA bit set. ADR-0019/ADR-0018
+  // finding 6: EFA one-sided RDMA needs SYMMETRIC address handles — the
+  // WRITE's target (here, whichever end owns the destination buffer) must
+  // hold an AH for the initiator before any RDMA op, even though the
+  // initiator is the only one sending. Exchanging this on the per-peer
+  // handshake (rather than ADR-0019's eager cluster-wide membership
+  // broadcast, which needs the EndpointSlice/directory plumbing A1 does not
+  // yet have) is the bidirectional exchange scoped down to what
+  // `EfaRdmaTransport` alone can guarantee: each side AH-inserts the other
+  // before either issues a WRITE against it.
+  optional EfaEndpoint efa_endpoint = 4;
+}
+
+message HandshakeResponse {
+  string node_id = 1;
+  RdmaCapabilities capabilities = 2;
+  uint32 protocol_version = 3;
+  optional EfaEndpoint efa_endpoint = 4;
+}
+
+message FetchBlobRequest {
+  // Cache key: "`bucket`/`key`" (see pacer-cache::object_key).
+  string cache_key = 1;
+  // Optional byte range within the cached whole object (whole-object caching:
+  // ranges are sliced server-side from the cached body). Mirrors HTTP Range:
+  // either range_start (+ optional inclusive range_end), or suffix_len
+  // ("bytes=-N"). An unsatisfiable range fails the RPC with OUT_OF_RANGE.
+  optional uint64 range_start = 2;
+  optional uint64 range_end = 3; // inclusive, per HTTP Range semantics
+  optional uint64 suffix_len = 4;
+  // The owner must serve without populating its cache (requester saw
+  // Cache-Control: no-store — the directive travels with the read, ADR-0012).
+  bool no_fill = 5;
+  // Present only when the requester negotiated RDMA at handshake (ADR-0018
+  // point 1): a slot leased from its pre-registered buffer pool, offered so
+  // the holder can WRITE straight into it instead of streaming `BlobChunk`s.
+  // A1 has no chunk-granular cache yet (ADR-0015 is a later track), so this
+  // covers the whole (possibly range-sliced) object body, not a fixed chunk.
+  optional RdmaBuffer rdma_buffer = 6;
+  // The requester's `node_id` (matches its `HandshakeRequest.node_id`), set
+  // whenever `rdma_buffer` is. FetchBlob is a plain gRPC call with no
+  // caller identity otherwise, but the holder must look up the AH it
+  // AH-inserted for THIS specific requester at handshake time (ADR-0018
+  // finding 6/ADR-0019 bidirectionality) before it can WRITE into
+  // `rdma_buffer` — an unaddressed WRITE cannot be issued.
+  optional string requester_node_id = 7;
+  // Present when the READ this fetch serves is delivering into memory the
+  // CLIENT registered itself (ADR-0030), and the requester wants the holder to
+  // write there directly instead of into the requester (planning/19 C3,
+  // "parallel fill"). Mutually exclusive with `rdma_buffer`: they name two
+  // different destinations for the same bytes, and a holder that honoured both
+  // would write the chunk twice.
+  //
+  // The requester still resolves *which* chunk lands *where* — it owns the
+  // chunk→window arithmetic — so this names one window, already narrowed to
+  // this chunk, in the client's own address space.
+  optional ClientToken client_token = 8;
+}
+
+// A window of client-registered memory, for a holder to WRITE into directly
+// (ADR-0030 point 4).
+//
+// Kept separate from `RdmaBuffer` rather than folded into it, because the two
+// differ in the field that decides where a WRITE is posted from.
+// `RdmaBuffer.rail` names the REQUESTER's rail and binds the holder to its own
+// same-index rail (the by-index pairing rule), since only that PD's rkey is
+// valid. A client token is a SET — one rkey per client rail, because the client
+// registered its window once per rail — and any holder rail can reach any
+// client rail (measured, L0.6), so the holder picks its source rail freely and
+// spreads over the client's. Overloading one message with both meanings is how
+// a holder would post from the wrong PD.
+message ClientToken {
+  // First byte of THIS chunk's destination, absolute, in the client's own
+  // address space. The requester has already folded the token's base address,
+  // the request's offset and the chunk's offset within the delivery together —
+  // so a holder does no window arithmetic and cannot get it wrong.
+  uint64 addr = 1;
+  // How many bytes of the client's window this chunk may write. A holder whose
+  // cached body is LARGER must decline rather than truncate (a torn WRITE is
+  // not a recoverable partial result) and stream the body instead, exactly as
+  // `RdmaBuffer.len` requires.
+  uint64 len = 2;
+  // One entry per rail the client registered this window on, in the client's
+  // own preference order (ADR-0030 point 1: highest first — only the client
+  // knows which of its rails is PCIe-local to the GPU holding the tensor).
+  // Never empty: a token nothing can address is refused before it reaches the
+  // wire.
+  repeated ClientTokenRail rails = 3;
+  // Whether the holder must report `BlobMeta.written_crc32` over what it wrote.
+  //
+  // Requested rather than unconditional because verification is O(delivered
+  // bytes) on the HOLDER's CPU, and a client may have opted out
+  // (`x-pacer-target;checksum=none`). Under this scheme the requester never
+  // sees the bytes, so the source-side digest ADR-0030 point 7 requires can
+  // only come from here.
+  bool checksum = 4;
+}
+
+// One rail of a client's registered window: where to write, and the endpoint
+// whose NIC will acknowledge the write.
+//
+// Every field is opaque to the daemons that carry it — `rkey` goes to the NIC,
+// `gid`/`qpn` are what an address handle is built from. See
+// `pacer_transport::token::TokenRail`, whose fields these mirror.
+message ClientTokenRail {
+  // GID of the client rail that issued `rkey`, exactly 16 bytes in wire byte
+  // order. Length-checked on decode: a short GID padded on the wrong end
+  // addresses a different device, and nothing downstream can tell.
+  bytes gid = 1;
+  // Queue pair the client's window is reachable at. **`0` is legitimate** — EFA
+  // firmware assigns from a small set including it — so it is never a sentinel.
+  uint32 qpn = 2;
+  // Remote key for the client's window, valid only at the protection domain of
+  // the rail named by `gid`.
+  uint32 rkey = 3;
+}
+
+// A pre-registered pool slot on the requester (ADR-0018 point 1: "the buffer
+// comes from a pre-registered per-node pool ... never registered per-read").
+// `addr`/`rkey` are meaningless to software on the holder — they are handed
+// straight to `ibv_post_send` as the WRITE's remote destination and are only
+// ever dereferenced by the EFA NIC, never by the holder's own code.
+message RdmaBuffer {
+  uint64 addr = 1;
+  uint32 rkey = 2;
+  // Capacity in bytes. If the object body does not fit, the holder must NOT
+  // truncate it into the slot — a torn WRITE is not a recoverable partial
+  // result — so it falls back to streaming the whole body over `BlobChunk`
+  // instead (ADR-0003: automatic fallback on ANY error is transport-
+  // transparent; `BlobMeta.served_via_rdma` tells the requester which
+  // happened).
+  uint64 len = 3;
+  // A5 multi-rail: the requester rail whose protection domain registered this
+  // buffer. An rkey is only valid at the PD that issued it, so the holder MUST
+  // address its WRITE to the requester's rail-`rail` endpoint (pairing by
+  // index: holder posts from its own rail `rail`). Absent/0 = rail 0, which is
+  // exactly the single-rail wire behavior this field predates.
+  uint32 rail = 4;
+}
+
+message BlobChunk {
+  // Empty when `meta.served_via_rdma` is set: the bytes already landed via
+  // the holder's RDMA WRITE into the buffer the request offered, and this
+  // message carries only the done signal (ADR-0018 point 3 — the fetch RPC's
+  // response doubling as both completion and integrity check).
+  bytes data = 1;
+  // Set on the first chunk only.
+  optional BlobMeta meta = 2;
+}
+
+// Enough metadata for the requester to reproduce full S3 GET response headers
+// (Content-Range needs the whole-object length even for a sliced body).
+message BlobMeta {
+  // Length of the returned (possibly sliced) body.
+  uint64 total_len = 1;
+  optional string e_tag = 2;
+  // Length of the whole object.
+  uint64 object_len = 3;
+  // Offset within the whole object where the returned body starts (the
+  // requester reconstructs Content-Range from body_start/total_len/object_len).
+  uint64 body_start = 6;
+  optional string content_type = 4;
+  optional int64 last_modified_epoch_secs = 5;
+  // True iff the holder WROTE `total_len` bytes into the request's
+  // `rdma_buffer` rather than sending them in `BlobChunk.data`. False on
+  // every response when the request carried no `rdma_buffer`, and also when
+  // one was offered but the holder chose (or had to) fall back to streaming
+  // — the requester must check this flag, never assume it got what it asked
+  // for (ADR-0003: automatic fallback on ANY error is transport-transparent).
+  bool served_via_rdma = 7;
+  // CRC32 (IEEE, the `zlib`/S3 flavour) of the bytes this holder WROTE into a
+  // `FetchBlobRequest.client_token` window. Present iff that token asked for one
+  // AND `served_via_rdma` is set.
+  //
+  // It exists because under a client token the requester never sees the bytes:
+  // the holder's NIC writes them straight into the client, so the delivery
+  // digest the client checks (`x-pacer-checksum`) can only be folded from what
+  // each holder reports (ADR-0030 point 7 — a client-registered window cannot
+  // be read back, so the digest comes from the side that holds the bytes).
+  // Absent on every other path, where the requester digests for itself.
+  optional uint32 written_crc32 = 8;
+}

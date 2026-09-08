@@ -1,0 +1,130 @@
+# Derived ConfigMap values — the ones whose default is a DATA-LOSS bug rather than a
+# preference.
+#
+# `pacer.submitQueueThreshold` bounds foyer's in-flight DRAM->NVMe writes, and foyer's OWN
+# default is 16 MiB — exactly ONE entry at the shipped chunk size. An enqueue past the budget
+# is SILENTLY DROPPED (foyer counts `foyer_storage_inner_op_total{op="channel_overflow"}`,
+# the chunk never reaches disk, and a later read misses to a peer or the backend). Sizing it
+# took the drop count from 4229 and 2244 to exactly 0, twice
+# (bench/ladder/results/c4-foyer-readpath.md). A regression to foyer's default would read as
+# "slightly fewer disk hits", which is why it is asserted rather than trusted.
+#
+# THE DERIVATION: `flushers x chunkSize x depth`, depth = 4 because that is the reader
+# look-ahead knee the C4 ladder found (bench/ladder/results/c4-fanout-depth.md: depth 4 is
+# where delivery peaks, depth 8 buys +5.4 % for double the queue). `flushers` floors at
+# foyer's own 1 when unset, never 0 — a threshold of 0 means "foyer's default" TO THE DAEMON,
+# i.e. the bug this helper closes.
+#
+# CHART DEFAULTS: config.tuning.flushers 32, config.chunkSize unset (16MiB).
+#   32 x 16MiB x 4 = 2147483648   (2 GiB, the shipped default)
+#   32 x 64MiB x 4 = 8589934592   (8 GiB, tracking chunkSize)
+#
+# These two cases replace the equivalent grep assertions that used to live in the CI `helm`
+# job: same arithmetic, but a failure names the expected and actual value instead of printing
+# `grep -q` exit 1. The remaining grep assertions in that job cover the OPT-IN negatives
+# (a key that must be ABSENT from the default render), which a rendered-value comparison
+# cannot express as directly.
+suite: derived ConfigMap values
+templates:
+  - configmap.yaml
+tests:
+  - it: "the submit-queue threshold is DERIVED as flushers x chunkSize x 4 (2 GiB default)"
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'submit-queue-threshold: "2147483648"'
+
+  - it: "and it tracks chunkSize: 32 x 64MiB x 4 = 8 GiB"
+    # Raising chunkSize cannot silently re-create the drops. A 64 MiB chunk against foyer's
+    # own 16 MiB default would be 4x past the whole budget.
+    set: { config.chunkSize: 64MiB }
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'submit-queue-threshold: "8589934592"'
+
+  - it: "and it tracks flushers: 8 x 16MiB x 4 = 512 MiB"
+    set: { config.tuning.flushers: 8 }
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'submit-queue-threshold: "536870912"'
+
+  - it: "0 still buys foyer's own 16 MiB, for a control arm"
+    # Helm coerces `--set ...=0` to the integer 0, which Go templates call falsey, so a bare
+    # `if` in the helper would re-derive the budget and take the control arm away.
+    set: { config.tuning.submitQueueThreshold: 0 }
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'submit-queue-threshold: "0"'
+
+  - it: "an explicit value wins over the derivation"
+    set: { config.tuning.submitQueueThreshold: 4Gi }
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'submit-queue-threshold: "4Gi"'
+
+  - it: "the scatter staging budget is emitted EXPLICITLY, so budget and enforcement match"
+    # pacer.memoryLimit had to budget for a specific number; emitting it is how the daemon is
+    # held to the same one. 2Gi = 2147483648 restates DEFAULT_STAGING_BYTES.
+    set: { scatter.enabled: true, config.backendType: standard }
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'staging-bytes: "2147483648"'
+
+  - it: "scatter.enabled=false is emitted explicitly, so the daemon's own default cannot win"
+    # The daemon applies the SAME backend-scoped default when the file says nothing, so an
+    # omitted block on a Standard backend would turn the scatter back on and overrule the
+    # operator.
+    set: { scatter.enabled: false, config.backendType: standard }
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'scatter:\n\s+enabled: false'
+
+  - it: "Express with the knob unset emits NO scatter block at all"
+    # The one combination that must render a byte-identical ConfigMap to every pre-ADR-0032
+    # Express release, so its pods do not roll for a default that does not apply to them.
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: 'scatter:'
+
+  - it: "the HTTP/2 windows are ABSENT by default, so hyper's own values still apply"
+    # The control arm for the StoreChunk flow-control question. Absent and 0 are not the same
+    # thing here and the difference is not subtle: a 0 window is a legal HTTP/2 setting
+    # meaning "send nothing", so a key that rendered empty-as-zero would deadlock the peer
+    # plane on its first RPC instead of falling back to a default.
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: 'h2-stream-window'
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: 'h2-connection-window'
+
+  - it: "and both render as quoted byte sizes when set"
+    set: { cluster.h2StreamWindow: 16MiB, cluster.h2ConnectionWindow: 64MiB }
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'h2-stream-window: "16MiB"'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'h2-connection-window: "64MiB"'
+
+  - it: "hugepages tell the daemon to map its arenas from the same pool"
+    # Derived from efa.hugepages rather than being its own knob: an arena mapping a size the
+    # pod never requested fails ENOMEM and would degrade to 4 KiB pages, silently wasting the
+    # reservation.
+    set: { efa.enabled: true, efa.hugepages: 13Gi }
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'rdma-arena-page-mib: 2'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'cache-slab-bytes: "5368709120"'

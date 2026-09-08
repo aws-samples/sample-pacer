@@ -1,0 +1,43 @@
+[package]
+name = "pacer-transport"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PeerTransport trait + implementations (gRPC; EFA-RDMA behind the `efa` feature)"
+
+[features]
+default = []
+# Phase 3: EfaRdmaTransport (ADR-0018 holder-driven RDMA WRITE). Pulls the
+# git-pinned ibverbs crate, so this only builds where libefa/libibverbs are
+# present (EFA hardware, or the finch-built spike/efa image) — CI's default
+# `cargo build --workspace` never enables it (ADR-0008/ADR-0021). `libc` rides
+# along for the arena's `mmap`/`munmap` (ADR-0024): the registered arena is a
+# mapping we own, which std cannot express.
+efa = ["ibverbs/efa", "dep:libc"]
+
+[dependencies]
+pacer-ring.workspace = true
+pacer-proto.workspace = true
+tonic.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+# Git-pinned to a REV, not a branch: the `efa` feature is unreleased on
+# crates.io (0.9.2 lacks it); it landed on `main` via PR #103. Same rev the
+# A0 spike validated cross-node on real EFA hardware (planning/09,
+# spike/efa/Cargo.toml) — do not bump without re-running that spike.
+ibverbs = { git = "https://github.com/jonhoo/rust-ibverbs", rev = "d9a5c01fa8096f516b08a126738d4f1107812f61", optional = true }
+# `mmap`/`munmap` for the RDMA arena's own mapping (ADR-0024) — the same
+# hugepage-explicit mapping `spike/efa/src/regbuf.rs` validated on hardware.
+# Optional: only the `efa` feature needs it.
+libc = { workspace = true, optional = true }
+
+[lints]
+workspace = true

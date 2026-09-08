@@ -1,0 +1,88 @@
+# Dependency version updates, proposed as pull requests by Dependabot.
+#
+# This complements rather than replaces the supply-chain gate: `cargo deny check`
+# FAILS a build on a dependency carrying a RustSec advisory or a non-permissive
+# license, and the release workflow's Trivy scan FAILS on a CRITICAL/HIGH in the
+# image. Neither of those ever tells you an upgrade exists — they only tell you,
+# after the fact, that you needed one. This file is the other half.
+#
+# What is covered, and what is NOT — the gaps are not obvious from the file:
+#   - `cargo`: the workspace manifest and `Cargo.lock` at the repo root.
+#   - `github-actions`: every `uses:` in `.github/workflows/`. Those are pinned
+#     to commit SHAs because an action tag is mutable, which also makes them the
+#     one pin nobody bumps by hand — the highest-value entry here.
+#   - `docker`: the `FROM` image references of the Dockerfiles under the three
+#     directories listed below.
+#   - NOT covered: a version carried in an `ARG` instead of a `FROM` tag. The
+#     Docker manager reads image references, so `RUST_VERSION` (`Dockerfile`,
+#     `ci/Dockerfile.efa-builder`) and `EFA_INSTALLER_VERSION`
+#     (`ci/Dockerfile.efa-builder`) stay manual, as does
+#     `ci/Dockerfile.release`'s `FROM ${BUILDER_IMAGE}` (a build argument, not an
+#     image).
+#   - Also NOT covered, and for a different reason: `dtolnay/rust-toolchain` is
+#     pinned to a SHA on a moving BRANCH (`stable`), not to a release tag, so
+#     there is no version for Dependabot to compare against and it will never
+#     propose one. That pin is the Rust version the public CI compiles with —
+#     bumping it is a deliberate act, which is why the workflow says so at the
+#     line itself.
+#   - Consequence worth stating once: the Rust toolchain version lives in THREE
+#     shipped places — `.devcontainer/Dockerfile`'s `FROM rust:<v>-bookworm`
+#     (which Dependabot does see) plus the two `ARG RUST_VERSION` pins (which it
+#     does not). A base-image PR that moves only the first is a PARTIAL bump;
+#     move all three in one change, or none.
+version: 2
+updates:
+  # --- GitHub Actions ---------------------------------------------------------
+  # Grouped into a single PR: each bump is a one-line SHA change whose review is
+  # "read the release notes", and N separate PRs would run the full CI matrix N
+  # times for no extra information. Keep the trailing `# vN` comment next to the
+  # SHA when merging — Dependabot rewrites it, and it is the only human-readable
+  # record of which release a SHA is.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # --- Rust (workspace + lockfile) --------------------------------------------
+  # No `versioning-strategy` on purpose: the default edits `Cargo.toml` only when
+  # the new version falls OUTSIDE the declared requirement. So in-range bumps
+  # arrive as `Cargo.lock`-only changes — which is what this repo's loose semver
+  # ranges plus a committed lockfile already mean (see the note in
+  # `Cargo.toml`) — while an out-of-range release still gets proposed.
+  # `lockfile-only` would suppress that second half entirely, and an out-of-range
+  # release is exactly what clears an advisory `ignore` in `deny.toml`.
+  #
+  # Grouped for minor/patch only; a major gets its own PR, because it needs its
+  # own reading. Caveat on the grouped PR: for a pre-1.0 crate, `0.22 -> 0.23` is
+  # semver-MINOR and lands in the group, yet Cargo treats it as breaking — so the
+  # group can carry a breaking upgrade. Read its release notes; don't rubber-stamp.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # --- Container base images --------------------------------------------------
+  # Monthly, not weekly: the AL2023 bases are DATE-tagged
+  # (`2023.x.<yyyymmdd>.0`) and republished continuously, so a weekly cadence
+  # yields a PR most weeks whose whole content is "the base was rebuilt". What
+  # keeps a vulnerable base out of a release is the Trivy gate, which runs on
+  # every release regardless; this cadence is about not drifting years behind.
+  - package-ecosystem: docker
+    directories:
+      - "/"  # Dockerfile, Dockerfile.runtime
+      - "/.devcontainer"  # the contributor build environment
+      - "/ci"  # Dockerfile.efa-builder, Dockerfile.release
+    schedule:
+      interval: monthly
+    groups:
+      base-images:
+        patterns: ["*"]

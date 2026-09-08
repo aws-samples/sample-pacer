@@ -1,0 +1,19 @@
+[package]
+name = "pacer-proto"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Control-plane protobufs: capability handshake, peer blob fetch"
+
+[dependencies]
+tonic.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+protoc-bin-vendored.workspace = true
+
+[lints]
+workspace = true

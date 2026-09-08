@@ -1,0 +1,75 @@
+# Test deployment on EKS example (us-east-2) — Phase 1 single-node, now
+# Phase 2 cluster tier (cluster.enabled below).
+#
+# The cache nodepool (`s3-pacer`) is managed OUTSIDE this chart by the
+# cluster's ArgoCD bootstrap (karpenter.enabled stays false). It labels nodes
+# `s3-pacer=true` and taints them `s3-pacer=true:NoSchedule`; it is
+# on-demand, amd64, i3en/i4i/i7ie with instance-store RAID0.
+#
+# Bucket per AZ (same-AZ invariant, ADR-0002): the daemon must talk to the
+# directory bucket of the AZ its node runs in —
+#   us-east-2a / use2-az1 → amzn-s3-demo-bucket--use2-az1--x-s3
+#   us-east-2b / use2-az2 → amzn-s3-demo-bucket--use2-az2--x-s3
+# Clients pick the bucket by node AZ (exposed to pods via the daemon's node
+# labels / downward API); cross-AZ requests still work but pay latency.
+
+# Helm merges maps: the default `pacer.io/nodepool: cache` key must be nulled
+# out explicitly or the DaemonSet selects on both labels and matches nothing.
+nodeSelector:
+  pacer.io/nodepool: null
+  s3-pacer: "true"
+
+tolerations:
+  - key: s3-pacer
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+image:
+  pullSecrets:
+    - pacer-registry
+
+config:
+  # Regional Express endpoint; the SDK routes per-bucket to the zonal endpoint.
+  s3Endpoint: ""
+  awsRegion: us-east-2
+  # Clients address `cache`; the daemon maps it to the AZ-local directory
+  # bucket. Pinned to us-east-2a — the Phase 2 nodepool is single-AZ (peer
+  # traffic must stay intra-AZ), so one bucket serves the whole ring.
+  #
+  # A MAP: the chart's configmap iterates this value. The `alias=real,…` string
+  # form is the daemon's own `PACER_BUCKET_MAP` env override and does NOT render
+  # here — copying it into a values file fails with `range can't iterate over …`,
+  # which is exactly what this file used to hand a first-time contributor.
+  bucketMap:
+    cache: amzn-s3-demo-bucket--use2-az1--x-s3
+  cacheDir: /var/cache/pacer
+  memCapacity: 2GiB
+  # Sized for the SMALLEST instance store in the nodepool (i4i.xlarge,
+  # ~858 GiB usable); i3en/i7ie nodes simply leave capacity unused. Revisit
+  # per-node sizing (downward API or init probe) before real benchmarks.
+  diskCapacity: 700GiB
+  minObjectSize: 4MiB
+  # Clamped to blockSize (1GiB default) at startup: objects above a block
+  # never persist to the disk tier, so admitting them only churns RAM.
+  maxObjectSize: 1GiB
+  logLevel: info
+
+# Phase 2: ring + peer gRPC across the DaemonSet. All cache nodes sit in
+# us-east-2a (same-AZ invariant), so peer traffic is intra-AZ and free.
+cluster:
+  enabled: true
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 4Gi
+  limits:
+    memory: 8Gi
+
+serviceAccount:
+  create: true
+  # Auth is EKS Pod Identity (no SA annotation needed): role pacer-daemon-example
+  # (s3express:CreateSession on both directory buckets) is associated to this
+  # SA via `aws eks create-pod-identity-association` — see planning/06-roadmap.
+  annotations: {}

@@ -1,0 +1,22 @@
+# yamllint ratchet baseline — files this job does NOT gate on, and why.
+#
+# Format: one path per line, relative to the repo root. Same contract as
+# ci/lint/shellcheck-baseline.txt: ci/lint/yamllint.sh still RUNS yamllint against a
+# baselined file and prints its findings, but a finding in one of these files does
+# not fail the job. Blank lines and lines starting with `#` are ignored.
+#
+# THIS FILE MUST SHRINK TO ZERO. Every entry is a deploy/helm/pacer/** file — off-
+# limits to this agent (schema/tests/docs there are another agent's, per this task's
+# "Do not" list). Re-checked after the 2026-09-08 harness-rewrite rebase:
+# values.yaml DROPPED OUT — the 1060->439 line rewrite (design notes moved to
+# docs/helm/) also fixed its one "too few spaces before comment" warning, confirmed
+# clean with a direct run, not just inferred. Chart.yaml keeps its original one.
+# tests/{configmap_derivations,lifecycle,memory_limit}_test.yaml are new files that
+# same rebase added: helm-unittest's `set: { a.b: c }` override syntax is real,
+# parseable YAML (unlike the Go-template/envsubst trees `.yamllint`'s `ignore:`
+# drops), so it is in scope — and yamllint's `braces` rule (error severity by
+# default) flags the spaces inside `{ }` on every one of them.
+deploy/helm/pacer/Chart.yaml
+deploy/helm/pacer/tests/configmap_derivations_test.yaml
+deploy/helm/pacer/tests/lifecycle_test.yaml
+deploy/helm/pacer/tests/memory_limit_test.yaml

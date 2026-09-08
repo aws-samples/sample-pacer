@@ -1,0 +1,47 @@
+# EFA-RDMA production overlay — turns the EFA peer transport ON.
+#
+# Layer this on top of the base chart (and any environment overlay) when the
+# target nodepool has EFA hardware + the aws-efa-k8s-device-plugin:
+#
+#   helm upgrade --install pacer deploy/helm/pacer \
+#     -f deploy/helm/pacer/values-<env>.yaml \
+#     -f deploy/helm/pacer/values-efa.yaml
+#
+# Why this is a separate overlay and not the base default: `efa.enabled: true`
+# adds a `vpc.amazonaws.com/efa: 1` resource request, which makes the pod
+# UNSCHEDULABLE on non-EFA nodes. EFA is hardware-gated, so it can't be a
+# universal chart default — but per the A4 benchmark (planning/14, 2026-07-21)
+# it IS the intended default wherever EFA hardware exists: the holder-driven
+# WRITE data plane beat gRPC on throughput AND holder CPU at high fan-out
+# (ADR-0008 flip gate met, ADR-0018).
+#
+# NOTE: the daemon image must be built `--features efa` (Dockerfile.runtime is;
+# the plain Dockerfile is not) or the binary has no RDMA code to enable. Where
+# the feature is built but the node lacks EFA, the startup probe falls back to
+# gRPC-only automatically (ADR-0018); every RDMA error falls back per-peer to
+# gRPC (ADR-0003). So enabling this on a mixed nodepool is safe — it never
+# breaks the read path, it just requests the device.
+efa:
+  enabled: true
+  # hugepages/ipcLock stay OFF: the A4 run confirmed EFA memory registration
+  # works on ordinary 4 KiB pages with no IPC_LOCK (planning/11 finding #7,
+  # re-confirmed live on the real daemon), and the ADR-0024 arena keeps that
+  # property — it degrades to 4 KiB pages with a warning rather than failing.
+  # Turning it on here would make Karpenter refuse to launch on a node that
+  # pre-reserves none, which is why this file (a generic EFA overlay, any pool)
+  # leaves it empty.
+  #
+  # ⚠ **"hugepages buys registration cost and TLB footprint, NOT bandwidth"
+  # (planning/18 RESULT 5) is true of the PEER plane and false of client
+  # delivery.** It predates ADR-0028: `pacer.cacheSlabBytes` derives a slab only
+  # when hugepages are set, and with a slab a WRITE reads the cache in place
+  # instead of memcpying a chunk into a holder range — measured 2026-08-25 as
+  # **13.7 -> 52.7 GiB/s (3.86x)** delivering 70B shards into 8 H100s
+  # (bench/ladder/results/c5-slab-zerocopy-source.md). So on a pool whose nodes
+  # DO pre-reserve 2 MiB pages, setting this is the largest delivery win
+  # available — see values-dev-gpu.yaml, which sets it for exactly that reason.
+  # The ceiling is the boot reservation: s3-ai-cache userData reserves 16 GiB,
+  # which at the 16 MiB chunk covers a tier of only ~4 GiB (arenas take 8), so
+  # flipping it for the cache pool needs a bigger reservation first.
+  ipcLock: false
+  hugepages: ""

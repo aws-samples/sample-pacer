@@ -6,7 +6,7 @@
 # "green in my container" and "green in CI" mean the same thing for fmt, clippy,
 # test, doc and smoke. The one gate it CANNOT reproduce is `--features efa`, which
 # needs the EFA userspace — that is what .devcontainer/efa is for.
-FROM public.ecr.aws/docker/library/rust:1.96-bookworm
+FROM public.ecr.aws/docker/library/rust:1.98-bookworm
 
 # The official Rust image carries a MINIMAL toolchain: `rustup component list
 # --installed` in 1.96-bookworm returns cargo, rustc and rust-std — no rustfmt and

@@ -1,0 +1,137 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pacer-daemon",
+    "crates/pacer-cache",
+    "crates/pacer-ring",
+    "crates/pacer-transport",
+    "crates/pacer-proto",
+    "crates/pacer-backend",
+    "crates/pacer-client",
+]
+# The EFA hardware spike (planning/09) links libefa via a git-pinned ibverbs and
+# only builds on EFA hardware; it is its OWN workspace (spike/efa/Cargo.toml) so
+# the CI runners — which have no libfabric/libefa — never try to build it.
+# Listed here explicitly so `cargo` at the repo root ignores the directory and a
+# future stray `cargo build` from spike/ can't accidentally treat the root as its
+# workspace. See spike/efa/README.md.
+#
+# The GDS spike (planning/20, Track N) is likewise its own workspace: a throwaway
+# NVMe→HBM probe that is Linux-only (O_DIRECT, /proc/driver/nvidia-fs) and pointless
+# to build on a CI runner with no GPU. It links no GPU library (CUDA and cuFile are
+# dlopen'ed), so unlike spike/efa it type-checks anywhere — but it is still rig code,
+# not a workspace member.
+#
+# The allocator/io probe (spike/allocfault) is the same shape again: it reproduces
+# foyer's read-buffer and io_uring submit patterns to price them off the daemon, so it
+# links the daemon's allocator but nothing of the daemon, and it opts out of the
+# workspace lints a probe would only fight. Listed here for the stray-`cargo`
+# reason above rather than because CI would otherwise build it — nothing does.
+# See spike/allocfault/README.md, which also records what has been settled since.
+exclude = [
+    "spike/efa",
+    "spike/gds",
+    "spike/allocfault",
+]
+
+[workspace.package]
+version = "0.1.0"
+# Distributed as a container image + Helm chart, not on crates.io.
+publish = false
+edition = "2021"
+license = "MIT-0"
+repository = "https://github.com/aws-samples/sample-s3-pacer"
+
+# Deliberately loose semver ranges (Cargo's default resolution), not exact `=`
+# pins: Cargo.lock is checked into this repo and is the actual reproducibility
+# mechanism (`cargo build` and CI both use it unless `cargo update` is run
+# explicitly), which is the standard Rust convention. Exact pins here would
+# fight Cargo's own resolver for no reproducibility gain and make routine
+# patch-level bumps (security fixes included) needlessly manual.
+[workspace.dependencies]
+pacer-cache = { path = "crates/pacer-cache" }
+pacer-ring = { path = "crates/pacer-ring" }
+pacer-transport = { path = "crates/pacer-transport" }
+pacer-proto = { path = "crates/pacer-proto" }
+pacer-backend = { path = "crates/pacer-backend" }
+pacer-client = { path = "crates/pacer-client" }
+
+s3s = "0.14"
+s3s-aws = "0.14"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+foyer = { version = "0.22", features = ["serde"] }
+mixtrics = "0.2"
+prometheus = "0.14"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+protoc-bin-vendored = "3"
+bytes = "1"
+# `mmap`/`munmap` for the EFA arena's own hugepage mapping (ADR-0024) and for
+# mapping a client's shared-memory segment (ADR-0026). The `efa` feature of
+# pacer-transport and pacer-daemon's delivery path pull it in.
+libc = "0.2"
+# CRC32 (IEEE) over bytes delivered into client memory (ADR-0026 point 5). Kept
+# to the same flavour the S3 SDKs checksum bodies with, so a client shim can
+# re-verify from any language's standard library.
+crc32fast = "1"
+futures = "0.3"
+async-trait = "0.1"
+thiserror = "2"
+tracing = "0.1"
+# `json` is not decoration: the daemon's default log encoding is one JSON object
+# per line (ADR-0036), because its logs are read out of `kubectl logs` by tooling
+# far more often than by a person. `text` remains selectable at runtime, so both
+# formatters have to be compiled in.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+# The disk tier's on-disk format (ADR-0028, pacer-cache's `codec`). Pinned to the
+# SAME major foyer's own `Code` blanket impl used, because that format is what a
+# cache directory written by a previous build contains and the hand-written codec
+# has to keep reading it — and because `foyer::Error::bincode_error` takes a
+# `bincode::Error`, which is only the same type across one major.
+bincode = "1"
+# YAML config file (ADR-0013). serde_yaml (dtolnay) is archived; serde_yaml_ng
+# is the maintained API-compatible fork.
+serde_yaml_ng = "0.10"
+# Property-based testing (T5): neither proptest nor quickcheck was in the
+# dependency graph before this, so this is a fresh choice — proptest, for its
+# shrinking (a failing case reduces to a minimal repro) and its `Strategy`
+# combinators, which compose the bounded generators the range/chunk/codec
+# properties need more directly than quickcheck's `Arbitrary`. Dev-only: no
+# crate ships it in a non-test build.
+proptest = "1"
+# Table-driven test cases (T2). The daemon's integration suite had two arms whose
+# tests differed only by a parameter — a backend shape, a commit prefix — and both
+# expressed that with a hand-rolled `macro_rules!` that generated one
+# `#[tokio::test]` per value. rstest replaces the macro with named cases, so a
+# failure says which value failed instead of which expansion did, and adding a value
+# is one line rather than an edit to a macro. Chosen over `test-case` for its
+# `#[case::name(..)]` labels and its first-class async support (the whole suite is
+# `#[tokio::test]`). Dev-only: no crate ships it in a non-test build.
+rstest = { version = "0.23", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Workspace-wide lint policy (see CLAUDE.md "Coding style"). Every crate opts
+# in via `[lints] workspace = true`; CI runs clippy with -D warnings, so a
+# warn here is a merge blocker.
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+too_many_lines = "warn"
+too_many_arguments = "warn"
+excessive_nesting = "warn"
+unreadable_literal = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"

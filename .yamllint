@@ -1,0 +1,66 @@
+# yamllint config — read by ci/lint/yamllint.sh (CI job `yamllint`) and a bare
+# `yamllint -c .yamllint <path>` locally.
+#
+# Chart TEMPLATES (deploy/helm/pacer/templates/*.yaml) are Go templates, not YAML —
+# `{{ .Values.foo }}` is not valid YAML syntax on its own, so this file's `ignore:`
+# list excludes them; `helm lint` (the `helm` CI job) is what checks those. Everything
+# else tracked as *.yaml/*.yml, including this chart's OWN values*.yaml and Chart.yaml
+# (real, template-free YAML), is in scope — see ci/lint/yamllint.sh for the exact list.
+#
+# The remaining `**/k8s/*.yaml` trees are envsubst TEMPLATES, same reason:
+# `labels: { app: ${APP_LABEL} }` is not valid YAML either — the literal `{` straight
+# after `$` reads to a YAML parser as an unclosed nested flow mapping, not a placeholder,
+# so these fail to PARSE at all (not just style) until envsubst has run. Confirmed
+# empirically: every "syntax"/"braces"/"commas" finding this job would otherwise report
+# lands in one of these ignored trees, zero outside them.
+#
+# H1 SHRANK THIS LIST, which is the visible half of that item: `bench/ladder/k8s/` — 21
+# templates, the largest of the three trees — is gone, replaced by
+# `deploy/helm/pacer-bench`, whose Go templates are excluded for the SAME reason the daemon
+# chart's are and whose renders are checked by `helm lint`, `helm unittest`, `kubeconform`
+# and `bench/ladder/bench-chart-equivalence-test.sh` instead. What is left is
+# `bench/b4/**/k8s/`, `bench/efa/k8s/`, `bench/incluster/k8s/`, `bench/staging/k8s/` and
+# `spike/**/k8s/`, none of which H1 was scoped to; each shrinks this list further when it
+# moves. Building a fake envsubst environment here to render them first is a different job
+# (kubeconform's job in this same file, and it declines the same way).
+ignore: |
+  deploy/helm/pacer/templates/
+  deploy/helm/pacer-bench/templates/
+  bench/**/k8s/
+  spike/**/k8s/
+
+extends: default
+
+rules:
+  # Generous rather than off: a config value pasted from an AWS ARN, an envsubst
+  # `${VAR}` list, or a multi-line comment explaining a chart derivation (see
+  # deploy/helm/pacer/templates/configmap.yaml's ADR-0032 comments) routinely runs long
+  # in this repo, and 80 is yamllint's own default. 160 catches the genuinely
+  # runaway line (an unwrapped paragraph, a forgotten fold) without flagging the
+  # normal case.
+  line-length:
+    max: 160
+    allow-non-breakable-words: true
+    allow-non-breakable-inline-mappings: true
+
+  # Most of this repo's YAML (bench manifests, chart values) has no `---` document
+  # marker and was never meant to have one — these are single-document files, not a
+  # multi-doc stream, so requiring the marker would be ~80 mechanical additions for a
+  # marker nothing reads. The ~18 files that DO start with `---` mostly do so because
+  # they render as one artifact from a multi-doc `envsubst` pipeline; a mixed
+  # convention is not something this job should force one way.
+  document-start: disable
+
+  # A defaulted `enabled:` field parsed as the STRING "true"/"false" instead of a bool
+  # is exactly the class of bug ADR-0032's scatter default guards against in the helm
+  # job (see .gitlab-ci.yml) — truthy left ON for VALUES (yamllint's default) catches
+  # the same mistake (`enabled: yes`, `Yes`, `on`) anywhere it might slip into a bench
+  # manifest or values file too.
+  #
+  # check-keys is the one override: it defaults to true, and the truthy rule's own
+  # docs name this exact case — a GitHub Actions workflow's `on:` trigger key is YAML
+  # 1.1's boolean spelling of `true`, so the KEY itself would need `"on":` quoting on
+  # every workflow file for a check this job otherwise never wants (nothing here
+  # writes an actual boolean-looking KEY by mistake; VALUES are where that bug lives).
+  truthy:
+    check-keys: false

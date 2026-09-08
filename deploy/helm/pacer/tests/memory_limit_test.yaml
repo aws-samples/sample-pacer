@@ -1,0 +1,290 @@
+# pacer.memoryLimit — the whole matrix, with the arithmetic written out.
+#
+# WHY EVERY NUMBER IS SPELLED OUT BY HAND. This helper is the chart's most consequential
+# derivation: it decides the cgroup limit, and every failure mode it guards against is a
+# daemon OOMKill that surfaces client-side as `IncompleteRead(... more expected)` or
+# `EndpointConnectionError` — never as a memory error. Four separate incidents came from a
+# term nobody added (docs/runbooks/daemon-oom.md). A test that recomputed the formula would
+# pass for any formula; these numbers are computed independently, so changing the helper
+# forces a reviewer to re-derive them CONSCIOUSLY and say why in the diff.
+#
+# THE FORMULA (templates/_helpers.tpl, `pacer.memoryLimit`):
+#
+#   bytes = toBytes(resources.limits.memory)                          always
+#   if efa.enabled            bytes += toBytes(efa.pinnedPoolReservation)
+#   if a slab is derived/set  bytes += pacer.cacheSlabBytes            (ONCE, not per rail)
+#   if delivery.enabled       bytes += toBytes(delivery.pinnedReservation)
+#                             bytes += pacer.deliveryWorkingSetBytes
+#   if pacer.scatterEnabled   bytes += pacer.scatterStagingBytes
+#                             bytes += pacer.scatterCoordinatorBytes
+#   if NO term applied        emit resources.limits.memory UNCHANGED, as a quantity
+#
+# THE SUB-DERIVATIONS, each restating a daemon constant:
+#
+#   cacheSlabBytes            explicit, else (efa.enabled AND efa.hugepages)
+#                               -> memCapacity + 256 x chunkSize        (HOLDER_SERVE_SLOTS)
+#                             else none
+#   deliveryWorkingSetBytes   explicit, else parallelism x chunkSize    (default 64)
+#   scatterStagingBytes       explicit, else 2Gi                        (DEFAULT_STAGING_BYTES)
+#   scatterCoordinatorBytes   coordinatorReservation, else
+#                               coordinatorConcurrency x perPut, where perPut =
+#                               coordinatorObjectBytes, else windowsInFlight x chunkSize
+#                               (windowsInFlight default 16)
+#
+# CHART DEFAULTS USED BELOW: resources.limits.memory 4Gi, efa.pinnedPoolReservation 8Gi,
+# delivery.pinnedReservation 8Gi, config.memCapacity 1GiB, config.chunkSize unset (16MiB).
+#
+#   1Gi   = 1073741824      4Gi   = 4294967296      8Gi  = 8589934592
+#   2Gi   = 2147483648     16Gi   = 17179869184    20Gi  = 21474836480
+#   16MiB =   16777216     64MiB  =    67108864   256MiB =   268435456
+#
+# The scatter needs config.backendType=standard: ADR-0032 is Standard-only and
+# pacer.validateScatter refuses the Express render (asserted in lifecycle_test.yaml).
+suite: pacer.memoryLimit across efa x delivery x scatter x diskTier
+templates:
+  - daemonset.yaml
+  # configmap.yaml is listed ONLY because daemonset.yaml `include`s it for its
+  # `checksum/config` annotation, and helm-unittest parses exactly the templates a suite
+  # names — omitting it fails every case with `no template ... associated with template`.
+  # Every assert below names daemonset.yaml, so nothing here asserts on the ConfigMap.
+  - configmap.yaml
+tests:
+  # ── chunkSize 16MiB (the daemon default, left unset) ───────────────────────────────────
+  - it: "off/off/off emits resources.limits.memory UNCHANGED, as a quantity"
+    # No pinned term applies, so the operator's own value is passed through rather than
+    # converted. This is what keeps the arithmetic off every install that asked for none of
+    # it — and a regression here would show up as a byte count where a `4Gi` used to be, in
+    # every plain deployment.
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 4Gi
+        template: daemonset.yaml
+
+  - it: "efa on: 4Gi + 8Gi pinned pool = 12884901888"
+    set: { efa.enabled: true }
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 12884901888
+        template: daemonset.yaml
+
+  - it: "delivery on: 4Gi + 8Gi pinned client pages + 64 x 16MiB working set = 13958643712"
+    set: { delivery.enabled: true }
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 13958643712
+        template: daemonset.yaml
+
+  - it: "scatter on: 4Gi + 2Gi staging + 1 x 16 x 16MiB coordinator = 6710886400"
+    set: { scatter.enabled: true, config.backendType: standard }
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 6710886400
+        template: daemonset.yaml
+
+  - it: "efa + delivery: 4Gi + 8Gi + 8Gi + 1Gi = 22548578304"
+    set: { efa.enabled: true, delivery.enabled: true }
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 22548578304
+        template: daemonset.yaml
+
+  - it: "efa + scatter: 4Gi + 8Gi + 2Gi + 256MiB = 15300820992"
+    set: { efa.enabled: true, scatter.enabled: true, config.backendType: standard }
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 15300820992
+        template: daemonset.yaml
+
+  - it: "delivery + scatter: 4Gi + 8Gi + 1Gi + 2Gi + 256MiB = 16374562816"
+    set: { delivery.enabled: true, scatter.enabled: true, config.backendType: standard }
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 16374562816
+        template: daemonset.yaml
+
+  - it: "all three on: 4Gi + 8Gi + 8Gi + 1Gi + 2Gi + 256MiB = 24964497408"
+    set:
+      efa.enabled: true
+      delivery.enabled: true
+      scatter.enabled: true
+      config.backendType: standard
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 24964497408
+        template: daemonset.yaml
+
+  # ── chunkSize 64MiB: every derived term has to track it ────────────────────────────────
+  #
+  # efa.pinnedPoolReservation must be raised with it or pacer.validateArenaReservation fails
+  # the render: the holder arena is 256 x chunkSize, so 4Gi + 16Gi = 20Gi. That is not
+  # incidental to these cases — it is the relationship the guard exists for.
+  - it: "64MiB, delivery on: working set is 64 x 64MiB = 4Gi, total 17179869184"
+    set: { delivery.enabled: true, config.chunkSize: 64MiB }
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 17179869184
+        template: daemonset.yaml
+
+  - it: "delivery on, parallelism 256 x 16MiB reaches the same 17179869184"
+    # The same total from the other knob, so the term cannot silently stop tracking one.
+    set: { delivery.enabled: true, delivery.parallelism: 256 }
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 17179869184
+        template: daemonset.yaml
+
+  - it: "64MiB, scatter on: coordinator fallback is 16 x 64MiB = 1Gi, total 7516192768"
+    set: { scatter.enabled: true, config.backendType: standard, config.chunkSize: 64MiB }
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 7516192768
+        template: daemonset.yaml
+
+  - it: "64MiB, efa on with a 20Gi pool: 4Gi + 20Gi = 25769803776"
+    set:
+      efa.enabled: true
+      config.chunkSize: 64MiB
+      efa.pinnedPoolReservation: 20Gi
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 25769803776
+        template: daemonset.yaml
+
+  - it: "64MiB, all three on with a 20Gi pool: 4+20+8+4+2+1 Gi = 41875931136"
+    set:
+      efa.enabled: true
+      delivery.enabled: true
+      scatter.enabled: true
+      config.backendType: standard
+      config.chunkSize: 64MiB
+      efa.pinnedPoolReservation: 20Gi
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 41875931136
+        template: daemonset.yaml
+
+  # ── ADR-0028's slab: derived from hugepages, added ONCE ────────────────────────────────
+  - it: "hugepages derive a slab of memCapacity + 256 x chunkSize, added once: 18253611008"
+    # slab = 1Gi + 4Gi = 5368709120; total = 4294967296 + 8589934592 + 5368709120.
+    # efa.hugepages must cover requester 4Gi + holder 4Gi + slab 5Gi = 13Gi, which is what
+    # pacer.validateHugepages checks — so 13Gi is the smallest render that works here.
+    set: { efa.enabled: true, efa.hugepages: 13Gi }
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 18253611008
+        template: daemonset.yaml
+
+  - it: "cacheSlabBytes=0 disables the slab even though Go templates call 0 falsey"
+    # Back to the no-slab total. Helm coerces `--set ...=0` to the integer 0, so a bare `if`
+    # in pacer.cacheSlabBytes would re-derive a slab and take the documented escape hatch
+    # away.
+    set: { efa.enabled: true, efa.hugepages: 13Gi, cluster.cacheSlabBytes: 0 }
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 12884901888
+        template: daemonset.yaml
+
+  # ── diskTier must NOT change the number, in either direction ───────────────────────────
+  #
+  # THE POINT OF THESE TWO. `config.diskTier: store` makes only READS O_DIRECT; its writes
+  # are buffered and nothing drops the pages afterwards
+  # (crates/pacer-cache/src/store.rs: "Reads are O_DIRECT and writes are not, which is the
+  # whole point"). So both tiers instantiate page cache when they POPULATE, and a helper
+  # that branched on diskTier hoping otherwise would under-budget exactly the write arm that
+  # already OOMKilled three of five daemons (bench/ladder/results/w1-write-scatter.md).
+  # Asserted as the SAME number as the foyer arm rather than as a bare render.
+  - it: "diskTier=foyer with all three features on is 24964497408"
+    set:
+      efa.enabled: true
+      delivery.enabled: true
+      scatter.enabled: true
+      config.backendType: standard
+      config.diskTier: foyer
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 24964497408
+        template: daemonset.yaml
+
+  - it: "diskTier=store is the SAME number — the derivation must not branch on it"
+    set:
+      efa.enabled: true
+      delivery.enabled: true
+      scatter.enabled: true
+      config.backendType: standard
+      config.diskTier: store
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 24964497408
+        template: daemonset.yaml
+
+  # ── the control arms: `0` must still mean "add nothing" ────────────────────────────────
+  - it: "delivery.workingSetReservation=0 adds nothing: 4Gi + 8Gi = 12884901888"
+    set: { delivery.enabled: true, delivery.workingSetReservation: 0 }
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 12884901888
+        template: daemonset.yaml
+
+  - it: "scatter.coordinatorReservation=0 adds nothing: 4Gi + 8Gi staging = 12884901888"
+    set:
+      scatter.enabled: true
+      config.backendType: standard
+      scatter.stagingBytes: 8Gi
+      scatter.coordinatorReservation: 0
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 12884901888
+        template: daemonset.yaml
+
+  # ── the regression this exists for: concurrency must multiply the coordinator term ─────
+  #
+  # The 2026-08-27 arm's own shape (bench/ladder/results/w1-write-scatter.md): 4Gi base +
+  # 8Gi staging + 8 x 4Gi coordinator = 44 GiB, where the pre-fix derivation gave 13 GiB.
+  # If this number drops back it must be because a hardware arm earned it, not because
+  # someone simplified the helper.
+  - it: "coordinatorConcurrency x coordinatorObjectBytes = 47244640256"
+    set:
+      scatter.enabled: true
+      config.backendType: standard
+      scatter.stagingBytes: 8Gi
+      scatter.windowsInFlight: 64
+      scatter.coordinatorConcurrency: 8
+      scatter.coordinatorObjectBytes: 4Gi
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 47244640256
+        template: daemonset.yaml
+
+  - it: "concurrency 8 with neither knob renders, using the semaphore fallback: 8589934592"
+    # 4Gi + 2Gi staging + 8 x 16 x 16MiB = 8 GiB. The inverse of what CI asserted until
+    # 2026-08-31: the old guard refused past concurrency 1 because the fallback was only the
+    # semaphore's NOMINAL bound; ebe07c07 made it real.
+    set:
+      scatter.enabled: true
+      config.backendType: standard
+      scatter.coordinatorConcurrency: 8
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 8589934592
+        template: daemonset.yaml

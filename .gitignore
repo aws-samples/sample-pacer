@@ -1,0 +1,19 @@
+/target
+/target-zigbuild
+__pycache__/
+
+# macOS Finder metadata — regenerated in whatever directory gets browsed, so this
+# is unanchored on purpose. Committing one would also ship it to the OSS mirror.
+.DS_Store
+
+# Claude Code session state. `.claude/settings.json` IS tracked (it wires the
+# no-host-toolchain hook for everyone); these two are per-machine.
+/.claude/settings.local.json
+/.claude/worktrees/
+
+# bench run artifacts (probe logs, results)
+bench/*/out/
+
+# Build artifacts staged by bench drivers (a swapped-in spike binary, per session).
+bench/ladder/results/.efa-spike-*
+bench/ladder/results/.c2-token-client-*.out

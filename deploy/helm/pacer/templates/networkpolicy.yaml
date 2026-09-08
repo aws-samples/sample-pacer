@@ -1,0 +1,102 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- /* An empty `clients` list renders NO rule for :9000, which denies it — the one
+       shape an operator can reach by accident rather than on purpose. */ -}}
+{{- include "pacer.validateNetworkPolicy" . -}}
+# Ingress policy for the daemon (ADR-0006 / threat-model.md M-001).
+#
+# ADR-0006 makes network reachability the AUTHORIZATION boundary: the daemon strips the
+# caller's signature and re-signs outbound with this node's IAM identity, so anything that
+# can reach :9000 gets that identity's S3 access. This object is what scopes "can reach".
+#
+# THREE THINGS THIS DOES NOT DO — each has bitten a deployment that assumed otherwise:
+#
+#  1. **It enforces nothing unless your CNI implements NetworkPolicy.** The API server
+#     accepts this object on every cluster; only a policy-enforcing CNI acts on it. On EKS
+#     with the AWS VPC CNI that means the network-policy agent must be ENABLED — the addon
+#     ships it disabled (`--enable-network-policy=false`), which is how a cluster ends up
+#     with this policy applied, `kubectl get netpol` looking correct, and reachability
+#     completely unchanged. Verify before believing it (README "Enforcement is not
+#     automatic"), because a policy that silently does nothing is worse than no policy:
+#     it retires the follow-up.
+#
+#  2. **It cannot say "same node".** ADR-0006 talks about restricting which pods ON THIS
+#     NODE may reach the listener; NetworkPolicy has no node-topology selector, and under
+#     the VPC CNI pod IPs come from shared subnets so there is no per-node ipBlock either.
+#     `internalTrafficPolicy: Local` (service.yaml) constrains Service-VIP routing only —
+#     any pod this policy admits can still dial a daemon POD ip directly. So the boundary
+#     this draws is "these pods, cluster-wide", not "these pods, here".
+#
+#  3. **It does not cover the EFA/RDMA data plane.** One-sided RDMA over SRD goes
+#     device-to-device and is never seen by the CNI's iptables/eBPF hooks, so the bulk
+#     path stays scoped by the self-referencing security group and placement group
+#     (threat-model.md M-006). Only the ports below are in scope here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pacer.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pacer.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pacer.selectorLabels" . | nindent 6 }}
+  # Ingress ONLY, deliberately. An egress rule set here would have to enumerate S3 (:443
+  # to a regional endpoint whose addresses rotate), kube-dns, the API server (the
+  # EndpointSlice watch — see rbac.yaml), and every peer pod; getting any one of them
+  # wrong takes the daemon from "serving" to "cannot fill", and a fill failure surfaces to
+  # the client as a slow GET rather than as a policy denial. Egress restriction belongs
+  # in the operator's own policy, where those addresses are known.
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- with .Values.networkPolicy.clients }}
+    # :{{ $.Values.ports.s3 }} — the S3 proxy. This is the confused-deputy surface
+    # (threat-model.md T-001): whoever is admitted here spends the node's IAM identity.
+    - ports:
+        - port: {{ $.Values.ports.s3 }}
+          protocol: TCP
+      from:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    # :{{ .Values.ports.admin }} — /healthz, /readyz, /metrics.
+    #
+    # `probeCidrs` is separate from `metrics` because the kubelet's probes are not a pod:
+    # they arrive from the NODE's address, which no podSelector or namespaceSelector can
+    # match. Deny them and the startupProbe never passes — the DaemonSet CrashLoops with
+    # no hint that a network policy caused it. Hence the permissive default, and hence
+    # narrowing it to your node subnets rather than dropping it.
+    - ports:
+        - port: {{ .Values.ports.admin }}
+          protocol: TCP
+      from:
+        {{- range .Values.networkPolicy.probeCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.networkPolicy.metrics }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    {{- if .Values.cluster.enabled }}
+    # :{{ .Values.ports.peer }} — the peer gRPC plane, restricted to this release's own
+    # daemons and not configurable. The plane is unauthenticated by design (threat-model.md
+    # T-002/T-003: `requester_node_id` is self-asserted, and `Invalidate`/`Announce` take
+    # no credential), so admitting anything beyond the fleet hands out cache contents and
+    # directory writes. A bare podSelector matches only this namespace, which is where a
+    # release's own pods are — deliberately tighter than the cross-namespace default on
+    # :{{ .Values.ports.s3 }} above.
+    - ports:
+        - port: {{ .Values.ports.peer }}
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "pacer.selectorLabels" . | nindent 14 }}
+    {{- end }}
+    {{- with .Values.networkPolicy.extraIngress }}
+    # Operator passthrough (values.yaml `networkPolicy.extraIngress`), last so it can only
+    # ADD reachability — a NetworkPolicy's rules are a union, so nothing here can tighten
+    # what the rules above already admit.
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,29 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SccacheObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::s3-ai-cache-sccache-123456789012-euc1/*",
+        "arn:aws:s3:::s3-ai-cache-sccache-123456789012-use2/*"
+      ]
+    },
+    {
+      "Sid": "SccacheListBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": [
+        "arn:aws:s3:::s3-ai-cache-sccache-123456789012-euc1",
+        "arn:aws:s3:::s3-ai-cache-sccache-123456789012-use2"
+      ]
+    }
+  ]
+}

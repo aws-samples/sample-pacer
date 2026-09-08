@@ -1,0 +1,15 @@
+# Build context excludes for every image built from this repo (bench/incluster,
+# and any future Dockerfile). The build stages compile fresh inside the image;
+# shipping host artifacts only bloats the context and can exhaust the builder.
+
+# Rust build artifacts — regenerated in the image's build stage. On a dev machine
+# this is multiple GB; a fresh CI checkout has none, so excluding it makes local
+# builds match CI instead of copying the whole target/ tree into the context.
+target/
+
+# Git metadata — not read by any build step.
+.git/
+
+# Editor / OS cruft.
+.DS_Store
+*.swp

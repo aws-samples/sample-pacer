@@ -1,0 +1,29 @@
+# shellcheck config — read by every `shellcheck` invocation rooted at the repo (CI's
+# `shellcheck` job via ci/lint/shellcheck.sh, and a bare `shellcheck <file>` locally).
+#
+# NOTE ON SEVERITY: `severity=` is a CLI flag (`-S`/`--severity`), not an .shellcheckrc
+# key — shellcheck 0.11.0 silently ignores it here rather than erroring, which is how
+# this repo almost shipped a no-op line. The actual gate at error+warning (info/style —
+# SC2016 unquoted `${VAR}` in an envsubst template, SC1091 "not following" a sourced
+# file, SC2116 useless echo, … — visible but non-blocking) is `--severity=warning` on
+# every invocation in ci/lint/shellcheck.sh. This repo's `envsubst '${A} ${B}'` idiom
+# deliberately single-quotes template variables, which is exactly what SC2016 flags on
+# every one of them, and re-litigating that idiom repo-wide is not this job's purpose.
+
+# This repo's harness sources one file from another constantly (bench/ladder/dcp.sh,
+# deliver.sh, resume.sh, onenode.sh, … all read variables/functions a sibling defines
+# instead of a cluster), and several `source "$LADDER_DIR/foo.sh"` targets use a
+# runtime-built path shellcheck cannot resolve on its own. `external-sources=true` lets
+# it follow `# shellcheck source=` hints instead of stopping at SC1091 for every one.
+external-sources=true
+
+# Resolve a bare `source "$SOME_VAR/x.sh"` (common in bench/ladder/*.sh, which all
+# `cd` to the repo root first) relative to the sourcing script's own directory rather
+# than the directory `shellcheck` was invoked from — matches how these scripts already
+# resolve their own siblings.
+source-path=SCRIPTDIR
+
+# No repo-wide `disable=` here on purpose (CLAUDE.md / the G2 task): a code that is
+# unsafe to fix blind in one script is not evidence it is unsafe everywhere, so those
+# live as a `# shellcheck disable=SCxxxx  # <why>` on the one line that needs it — see
+# ci/lint/shellcheck.sh and ci/lint/shellcheck-baseline.txt for the files still owed one.

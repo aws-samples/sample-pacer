@@ -1,0 +1,308 @@
+# Pod lifecycle and disruption (ADR-0035), and the cross-field guards in _validate.tpl.
+#
+# Every case here asserts something whose failure is SILENT or MISATTRIBUTED at runtime: a
+# grace period below the drain deadline turns a deliberate rollout into client-visible
+# errors; a missing PDB turns one consolidation event into a fleet-wide cold cache; and each
+# validator guards an OOMKill that presents client-side as a truncated body.
+suite: pod lifecycle, disruption budget and cross-field validation
+templates:
+  - daemonset.yaml
+  - configmap.yaml
+  - pdb.yaml
+  - prometheusrule.yaml
+tests:
+  # ── terminationGracePeriodSeconds vs the 20 s SIGTERM drain (ADR-0035 § 5) ─────────────
+  - it: "the grace period is STATED, not inherited from Kubernetes' own default"
+    # It was 30 by coincidence before; with a 20 s drain deadline landing it is arithmetic.
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 30
+        template: daemonset.yaml
+
+  # A grace period AT the drain deadline is refused twice over — `exclusiveMinimum: 20` in
+  # values.schema.json and `pacer.validateGracePeriod` for a --skip-schema-validation render —
+  # and NEITHER is asserted here, deliberately: helm-unittest always validates the schema and
+  # offers no per-suite way to skip it, so the schema error arrives before any template runs
+  # and `failedTemplate` can never see the template guard. Both halves are asserted in the CI
+  # `helm` job instead, one with --skip-schema-validation and one without.
+
+  # ── the drain deadline as an OPERATOR knob (ADR-0036) ──────────────────────────────────
+  - it: "a non-default drain reaches the daemon, and still fits the shipped grace period"
+    # The knob is only real if it renders: the daemon's default is 20 and the chart omits the
+    # block at 0, so a drain that never reached the ConfigMap would look identical to one that
+    # did on every observable except the one that matters during a rollout. 25 is chosen
+    # because it is ABOVE the built-in 20 and BELOW the shipped grace of 30 — the render
+    # therefore also proves pacer.validateGracePeriod compares against the configured value
+    # rather than the built-in one, since comparing 30 against 20 would pass either way and
+    # comparing it against a mistakenly-zero drain would pass anything.
+    set: { config.shutdownDrainTimeoutSecs: 25 }
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'drain-timeout-secs: 25'
+        template: configmap.yaml
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 30
+        template: daemonset.yaml
+
+  - it: "the default render omits the shutdown block, leaving the daemon its own default"
+    # 0 means "the daemon's default" everywhere in `config`, and the chart expresses that by
+    # emitting nothing — so an existing release's ConfigMap is byte-identical apart from the
+    # log block. Asserted as a NEGATIVE because the failure it guards is silent: a rendered
+    # `drain-timeout-secs: 0` would be read by the daemon as a zero-second drain.
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: 'drain-timeout-secs'
+        template: configmap.yaml
+
+  # ── log encoding (ADR-0036) ────────────────────────────────────────────────────────────
+  - it: "config.logFormat=text is accepted by the schema and reaches the ConfigMap"
+    # This case earns its place twice. helm-unittest validates values.schema.json BEFORE any
+    # template runs, so a key missing from the schema fails here as a suite error rather than
+    # an assertion — which is exactly how the five ADR-0036 keys were caught after the schema
+    # landed with additionalProperties:false. And `text` is the escape hatch a human tailing a
+    # pod needs, so it has to survive being an enum member and not just a string.
+    set: { config.logFormat: text }
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'format: "text"'
+        template: configmap.yaml
+
+  - it: "and json is what ships, since a log pipeline reads these before a person does"
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'format: "json"'
+        template: configmap.yaml
+
+  # ── PodDisruptionBudget (ADR-0035 § 4) ────────────────────────────────────────────────
+  - it: "a PDB ships by default, at maxUnavailable 1, matching updateStrategy"
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+        template: pdb.yaml
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+        template: pdb.yaml
+
+  - it: "the PDB selector is PER-RELEASE, so another session's Pending pod cannot eat it"
+    # session.exclusiveNodes (ADR-0029) deliberately leaves a SECOND release's pod Pending on
+    # a claimed node. It carries a different app.kubernetes.io/instance, so it is outside this
+    # budget — which is only true because the selector is pacer.selectorLabels and not the
+    # chart name alone.
+    asserts:
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
+        template: pdb.yaml
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/name"]
+          value: pacer
+        template: pdb.yaml
+
+  - it: "podDisruptionBudget.enabled=false renders nothing"
+    set: { podDisruptionBudget.enabled: false }
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: pdb.yaml
+
+  # ── QoS: no CPU limit, deliberately (ADR-0035 § 1) ────────────────────────────────────
+  - it: "there is NO cpu limit — a CFS quota would stall ADR-0025's pinned rail reapers"
+    # Burstable on purpose. A default cpu limit added here would be an invisible decision:
+    # CFS deschedules every thread in the container for the rest of a 100 ms period, and a
+    # rail's reaper is blocked on a completion fd.
+    asserts:
+      - isNull:
+          path: spec.template.spec.containers[0].resources.limits.cpu
+        template: daemonset.yaml
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: "1"
+        template: daemonset.yaml
+
+  - it: "an operator MAY still set one, and the chart renders it verbatim"
+    set: { resources.limits.cpu: "8" }
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.cpu
+          value: 8
+        template: daemonset.yaml
+
+  # ── PrometheusRule (C2) ───────────────────────────────────────────────────────────────
+  - it: "no PrometheusRule by default — monitoring.coreos.com/v1 is a CRD that may be absent"
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: prometheusrule.yaml
+
+  - it: "enabled, it carries all four cgroup alerts"
+    set: { monitoring.prometheusRule.enabled: true }
+    asserts:
+      - isKind:
+          of: PrometheusRule
+        template: prometheusrule.yaml
+      - equal:
+          path: spec.groups[0].rules[0].alert
+          value: PacerDaemonMemoryNearLimit
+        template: prometheusrule.yaml
+      - equal:
+          path: spec.groups[0].rules[1].alert
+          value: PacerDaemonAnonymousMemoryNearLimit
+        template: prometheusrule.yaml
+      - equal:
+          path: spec.groups[0].rules[2].alert
+          value: PacerDaemonCgroupOom
+        template: prometheusrule.yaml
+      - equal:
+          path: spec.groups[0].rules[3].alert
+          value: PacerDaemonOomKilled
+        template: prometheusrule.yaml
+
+  - it: "the anonymous-headroom alert is current MINUS file over max, not anon over max"
+    # `current - file` is the part no reclaim can free, and `file` is the term the operator
+    # then has to reason about (rule 3 of docs/helm/memory-model.md). The subtraction is also
+    # derivable on any hierarchy that publishes the first two series.
+    set: { monitoring.prometheusRule.enabled: true }
+    asserts:
+      - matchRegex:
+          path: spec.groups[0].rules[1].expr
+          pattern: 'pacer_cgroup_memory_current_bytes - pacer_cgroup_memory_file_bytes'
+        template: prometheusrule.yaml
+
+  - it: "the thresholds and windows are configurable"
+    set:
+      monitoring.prometheusRule.enabled: true
+      monitoring.prometheusRule.memoryRatio: 0.75
+      monitoring.prometheusRule.memoryFor: 3m
+      monitoring.prometheusRule.oomWindow: 1m
+      monitoring.prometheusRule.runbookUrl: https://wiki/pacer-oom
+    asserts:
+      - matchRegex:
+          path: spec.groups[0].rules[0].expr
+          pattern: '> 0.75'
+        template: prometheusrule.yaml
+      - equal:
+          path: spec.groups[0].rules[0].for
+          value: 3m
+        template: prometheusrule.yaml
+      - matchRegex:
+          path: spec.groups[0].rules[2].expr
+          pattern: 'increase\(pacer_cgroup_memory_oom_total\[1m\]\) > 0'
+        template: prometheusrule.yaml
+      - equal:
+          path: spec.groups[0].rules[0].annotations["runbook_url"]
+          value: https://wiki/pacer-oom#budget-mismatch
+        template: prometheusrule.yaml
+
+  - it: "a fifth alert covers the CONFIGURED budget, which the four cgroup ones cannot"
+    # R3 added pacer_memory_budget_total_bytes (and the per-term family behind it), and
+    # nothing alerted on it: the four above MEASURE, this one DECLARES, and the pair
+    # total-vs-max is what separates "the configuration never fitted" from "it fitted and
+    # something grew". Appended LAST so the four index assertions above keep their positions.
+    set: { monitoring.prometheusRule.enabled: true }
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[4].alert
+          value: PacerDaemonMemoryBudgetNearLimit
+        template: prometheusrule.yaml
+      - matchRegex:
+          path: spec.groups[0].rules[4].expr
+          pattern: 'pacer_memory_budget_total_bytes \* \(1 \+ 0\.10\)'
+        template: prometheusrule.yaml
+      - matchRegex:
+          path: spec.groups[0].rules[4].expr
+          pattern: '/ pacer_cgroup_memory_max_bytes > 0\.95'
+        template: prometheusrule.yaml
+      # It points at the runbook section that lists which values key to raise, not at the
+      # page's top: this alert always has a configuration answer.
+      - equal:
+          path: spec.groups[0].rules[4].annotations["runbook_url"]
+          value: docs/runbooks/daemon-oom.md#budget-mismatch
+        template: prometheusrule.yaml
+
+  - it: "the alert's headroom is the SAME fraction the daemon's startup check enforces"
+    # An alert computed from a different headroom than memory_budget.rs applies is worse than
+    # no alert — it pages over configurations that start fine, or stays quiet over ones that
+    # will not start. Both directions: the mirrored default when the key is unset, and the
+    # operator's value when it is set.
+    set:
+      monitoring.prometheusRule.enabled: true
+      config.memoryHeadroomFraction: 0.05
+    asserts:
+      - matchRegex:
+          path: spec.groups[0].rules[4].expr
+          pattern: '\(1 \+ 0\.05\)'
+        template: prometheusrule.yaml
+
+  - it: "the budget alert's threshold and window are configurable too"
+    set:
+      monitoring.prometheusRule.enabled: true
+      monitoring.prometheusRule.budgetRatio: 0.5
+      monitoring.prometheusRule.budgetFor: 30m
+    asserts:
+      - matchRegex:
+          path: spec.groups[0].rules[4].expr
+          pattern: '> 0\.5'
+        template: prometheusrule.yaml
+      - equal:
+          path: spec.groups[0].rules[4].for
+          value: 30m
+        template: prometheusrule.yaml
+
+  - it: "alerts carry the owning session's label so a bench fleet can be routed apart"
+    set: { monitoring.prometheusRule.enabled: true, session.id: abc123 }
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[0].labels["pacer.io/session"]
+          value: abc123
+        template: prometheusrule.yaml
+
+  # ── the cross-field guards (templates/_validate.tpl) ──────────────────────────────────
+  - it: "limits.memory below memCapacity fails the render — the tier cannot fit at all"
+    # Rule 1 of docs/helm/memory-model.md. The 256 GiB run that died was at EQUALITY, which
+    # still renders on purpose (a 128 MiB tier on a 4Gi limit is a real bench shape); this is
+    # the unambiguous half.
+    set: { config.memCapacity: 8GiB }
+    asserts:
+      - failedTemplate:
+          errorPattern: "resources.limits.memory \\(4294967296 bytes\\) is below config.memCapacity \\(8589934592 bytes\\)"
+        template: daemonset.yaml
+
+  - it: "raising chunkSize on an EFA node without the pool fails — the holder arena is 256x it"
+    # 4Gi requester + 256 x 64MiB holder = 20Gi against the 8Gi default. pinnedPoolReservation
+    # is a BUDGET LINE, not a cap: the daemon registers both arenas regardless, so the cgroup
+    # limit stops covering pinned pages and the pod OOMKills under seed load (planning/16 §4.5).
+    set: { efa.enabled: true, config.chunkSize: 64MiB }
+    asserts:
+      - failedTemplate:
+          errorPattern: "efa.pinnedPoolReservation \\(8589934592 bytes\\) is below the two arenas"
+        template: daemonset.yaml
+
+  - it: "a submit-queue threshold under one chunk fails — every demotion would be dropped"
+    set: { config.tuning.submitQueueThreshold: 1MiB }
+    asserts:
+      - failedTemplate:
+          errorPattern: "config.tuning.submitQueueThreshold \\(1048576 bytes\\) is below config.chunkSize"
+        template: daemonset.yaml
+
+  - it: "a flush buffer under one chunk fails — entries larger than it never reach disk"
+    set: { config.flushBufferSize: 1MiB }
+    asserts:
+      - failedTemplate:
+          errorPattern: "config.flushBufferSize \\(1048576 bytes\\) is below config.chunkSize"
+        template: daemonset.yaml
+
+  - it: "the scatter on an Express backend fails the render, as ADR-0032 § 6 requires"
+    # The daemon bails at startup too, so without this the failure mode is a CrashLoopBackOff
+    # and a `helm --wait` that dies on "context deadline exceeded".
+    set: { scatter.enabled: true }
+    asserts:
+      - failedTemplate:
+          errorPattern: "the write scatter is scoped to general-purpose \\(Standard\\) buckets"
+        template: daemonset.yaml

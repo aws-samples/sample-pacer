@@ -1,0 +1,125 @@
+# A complete worked example: PACER on EKS in us-east-2, with the cluster peer
+# tier on. START HERE — copy this file, change the bucket/endpoint/region to
+# yours, and `helm install -f` it. Every value below is explained; the chart's
+# own defaults and the full key reference are in values.yaml and docs/helm/.
+#
+# This example assumes the cache nodepool is managed OUTSIDE the chart
+# (`karpenter.enabled` stays false, its default), by whatever provisions nodes
+# in your cluster — Karpenter, a managed node group, Cluster Autoscaler. It
+# expects that pool to label its nodes `s3-pacer=true` and taint them
+# `s3-pacer=true:NoSchedule`, which is what the nodeSelector and toleration
+# below match; rename them to match your own pool. The pool this was written
+# against is on-demand amd64, i3en/i4i/i7ie, with the instance-store NVMe in a
+# RAID0 — the disk tier wants local NVMe, not EBS. To have the chart create the
+# pool for you instead, see `karpenter.*` in values.yaml.
+#
+# Bucket per AZ (same-AZ invariant, ADR-0002): the daemon must talk to the
+# directory bucket of the AZ its node runs in —
+#   us-east-2a / use2-az1 → amzn-s3-demo-bucket--use2-az1--x-s3
+#   us-east-2b / use2-az2 → amzn-s3-demo-bucket--use2-az2--x-s3
+# Clients pick the bucket by node AZ (exposed to pods via the daemon's node
+# labels / downward API); cross-AZ requests still work but pay latency.
+
+# Helm merges maps: the default `pacer.io/nodepool: cache` key must be nulled
+# out explicitly or the DaemonSet selects on both labels and matches nothing.
+nodeSelector:
+  pacer.io/nodepool: null
+  s3-pacer: "true"
+
+tolerations:
+  - key: s3-pacer
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+image:
+  pullSecrets:
+    - pacer-registry
+
+config:
+  # Regional Express endpoint; the SDK routes per-bucket to the zonal endpoint.
+  s3Endpoint: ""
+  awsRegion: us-east-2
+  # Clients address `cache`; the daemon maps it to the AZ-local directory
+  # bucket. Pinned to us-east-2a — the Phase 2 nodepool is single-AZ (peer
+  # traffic must stay intra-AZ), so one bucket serves the whole ring.
+  #
+  # A MAP: the chart's configmap iterates this value. The `alias=real,…` string
+  # form is the daemon's own `PACER_BUCKET_MAP` env override and does NOT render
+  # here — copying it into a values file fails with `range can't iterate over …`,
+  # which is exactly what this file used to hand a first-time contributor.
+  bucketMap:
+    cache: amzn-s3-demo-bucket--use2-az1--x-s3
+  cacheDir: /var/cache/pacer
+  memCapacity: 2GiB
+  # Sized for the SMALLEST instance store in the nodepool (i4i.xlarge,
+  # ~858 GiB usable); i3en/i7ie nodes simply leave capacity unused. Revisit
+  # per-node sizing (downward API or init probe) before real benchmarks.
+  diskCapacity: 700GiB
+  minObjectSize: 4MiB
+  # Clamped to blockSize (1GiB default) at startup: objects above a block
+  # never persist to the disk tier, so admitting them only churns RAM.
+  maxObjectSize: 1GiB
+  logLevel: info
+
+# Phase 2: ring + peer gRPC across the DaemonSet. All cache nodes sit in
+# us-east-2a (same-AZ invariant), so peer traffic is intra-AZ and free.
+cluster:
+  enabled: true
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 4Gi
+  limits:
+    memory: 8Gi
+
+serviceAccount:
+  create: true
+  # Auth is EKS Pod Identity, which needs NO annotation here — the association is
+  # made cluster-side, against the ServiceAccount this chart creates:
+  #
+  #   aws eks create-pod-identity-association --cluster-name <cluster> \
+  #     --namespace pacer --service-account pacer --role-arn <your-role>
+  #
+  # The role needs `s3express:CreateSession` on the directory bucket(s) in
+  # `config.bucketMap` (or `s3:GetObject`/`PutObject` for a Standard bucket).
+  # The Pod Identity Agent add-on must be installed on the cluster. To use IRSA
+  # instead, put the role ARN in `eks.amazonaws.com/role-arn` here.
+  annotations: {}
+
+# --- Optional: the EFA RDMA peer transport -----------------------------------
+#
+# A cache miss can be served by a peer node that already holds the object. That
+# always works over gRPC/TCP; on EFA hardware it can instead be a one-sided RDMA
+# WRITE, which is faster and costs the holder less CPU.
+#
+# It is OFF in the base chart, and this block is commented out, for one reason:
+# `efa.enabled: true` adds a `vpc.amazonaws.com/efa: 1` resource request, which
+# makes the pod UNSCHEDULABLE on any node without an EFA device. So it cannot be
+# a universal default — but wherever the hardware exists it is the intended
+# setting.
+#
+# Uncomment to enable. Three prerequisites, all of them hard:
+#   1. EFA-capable nodes (Nitro v4+) in the pool this DaemonSet targets.
+#   2. The `aws-efa-k8s-device-plugin` installed, plus a cluster placement group
+#      and a self-referencing security group.
+#   3. An image built with `--features efa`. The published release image is;
+#      a plain `docker build -f Dockerfile` is NOT, and without the feature the
+#      binary has no RDMA code to turn on.
+#
+# Enabling it is safe on a mixed pool: the daemon probes for EFA at startup and
+# speaks gRPC-only where it is absent, and any RDMA error falls back to gRPC
+# per-peer. RDMA is never a hard dependency of the read path.
+#
+# efa:
+#   enabled: true
+#   # Both of these stay off deliberately. EFA memory registration works on
+#   # ordinary 4 KiB pages, so neither is needed to get RDMA working, and
+#   # `hugepages` makes the scheduler refuse any node that does not pre-reserve
+#   # them at boot. Set `hugepages` only if your nodes DO reserve 2 MiB pages —
+#   # on those it is the single largest client-delivery win available, because
+#   # the cache is then read in place rather than copied. See
+#   # docs/helm/efa-and-rdma.md for how to size the reservation.
+#   ipcLock: false
+#   hugepages: ""

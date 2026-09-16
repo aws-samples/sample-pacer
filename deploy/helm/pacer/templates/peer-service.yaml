@@ -1,0 +1,22 @@
+{{- if .Values.cluster.enabled }}
+# Headless Service for the peer plane: its EndpointSlices are the membership
+# source (per-pod IP + nodeName + readiness). Peers dial each other's pod IPs
+# directly — this Service is never used as a VIP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pacer.fullname" . }}-peer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pacer.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  # A not-ready daemon must still LEAVE the slices' ready set (that's the
+  # membership signal) — default behavior; do not publishNotReadyAddresses.
+  selector:
+    {{- include "pacer.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: peer
+      port: {{ .Values.ports.peer }}
+      targetPort: peer
+{{- end }}

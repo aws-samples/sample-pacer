@@ -1,0 +1,556 @@
+# PACER daemon — Helm values.
+#
+# ONE SHORT COMMENT PER KEY: what it is, its unit, its default, and where the design note
+# lives. The reasoning, the measurements and the failure history are in docs/helm/ —
+# see docs/helm/README.md for the map. values.schema.json validates every key here, so a
+# typo fails the render rather than being silently ignored.
+
+image:
+  # Image repository. Default is the public multi-arch GHCR image; override for a
+  # private-registry build. docs/helm/scheduling.md#the-image
+  repository: ghcr.io/aws-samples/sample-pacer
+  # Image tag. Empty → Chart.appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+  # Names of existing docker-registry secrets in the release namespace. Empty is correct
+  # for ECR pulled via the node IAM role.
+  pullSecrets: []
+
+# Listener ports. docs/helm/network-policy.md#the-three-ports
+ports:
+  # S3 API — clients point here.
+  s3: 9000
+  # Admin — probes + /metrics.
+  admin: 9090
+  # Peer gRPC data/control plane (cluster tier).
+  peer: 9100
+
+# Cluster cache tier (Phase 2) and the EFA-RDMA transport shape.
+# docs/helm/efa-and-rdma.md
+cluster:
+  # Ring + peer plane across the DaemonSet. false = independent Phase 1 nodes.
+  enabled: true
+  # Chunks buffered per peer blob stream. Small on purpose: the stream is the backpressure.
+  channelCapacity: 8
+  # HTTP/2 receive windows for the peer plane. Empty → hyper's own defaults, which are
+  # ASYMMETRIC by direction: a server advertises 1 MiB/1 MiB (connection/stream) and a
+  # client 5 MiB/2 MiB. A StoreChunk is a 16 MiB unary message INTO a server, so the save
+  # path runs on the smaller pair while a FetchBlob body runs on the larger — and
+  # bench/ladder/results/laguna-store-remotewrite.md measured those two legs at 0.61 and
+  # 1.75 GiB/s. Empty is the control arm; these are what test whether that is the reason.
+  #
+  # A window is receive credit the node must be prepared to buffer, per peer, BEFORE the
+  # application reads it — so it is memory the ADR-0032 staging budget cannot refuse, and a
+  # value that becomes a default owes an entry in the memory budget.
+  h2StreamWindow: ""
+  h2ConnectionWindow: ""
+  # HTTP/2 connections opened per peer. Empty → daemon default 1, which is what a single
+  # cached channel has always been — and therefore one TCP flow and one framing task carrying
+  # every concurrent RPC to that peer. EC2 caps a single VPC flow at 5 Gbps (10 in a cluster
+  # placement group) and EFA does not carry gRPC, so the save's StoreChunk leg measured
+  # 5.19 Gbps per node in results/laguna-disk4096-and-control-rot.md. Widening spreads the
+  # fan-out over N flows; N sockets and N HTTP/2 state machines per peer is what it costs.
+  peerConnections: ""
+  # Co-home count R (ADR-0016). Empty → daemon default 2; 1 forces a single-home split.
+  replicationR: ""
+  # Requester-local admission threshold (ADR-0016 layer 1). Empty → daemon default 2.
+  localAdmissionThreshold: ""
+  # Requester-side RDMA arena, bytes, node-wide (ADR-0024). Empty → transport default 4Gi.
+  # Raising it must raise efa.pinnedPoolReservation by the same amount.
+  rdmaArenaBytes: ""
+  # ADR-0028's registered cache slab, bytes. Empty → DERIVED (memCapacity + 256 × chunkSize)
+  # wherever efa.hugepages is set, else no slab. 0 = no slab.
+  # docs/helm/efa-and-rdma.md#adr-0028s-cache-slab
+  cacheSlabBytes: ""
+  # WRITEs one EFA rail may have on the wire at once. Empty/0 = unbounded.
+  rdmaRailWindow: ""
+  # Pin each rail's reaper and arenas on that rail's own NIC NUMA node (ADR-0025).
+  # Empty → on. false is the control arm for the ~58-vs-15.7 GiB/s comparison, not a knob.
+  rdmaAffinity: ""
+  # EFA rails to bring up. Empty/0 = all the node exposes; 1 = pre-A5 single-rail.
+  efaRails: ""
+  # SRD queue pairs per rail. Empty/1 = one QP per rail.
+  efaQpsPerRail: ""
+
+# Rendered into a ConfigMap mounted at /etc/pacer/config.yaml (ADR-0013). Precedence:
+# built-in defaults < this file < PACER_* env. A ConfigMap edit rolls the DaemonSet via a
+# checksum annotation. docs/helm/cache-and-disk-tier.md
+config:
+  # Backend shape (ADR-0023): express (S3 Express One Zone directory bucket, same-AZ) or
+  # standard (S3 Standard regional). Explicit, never sniffed from the bucket name.
+  backendType: express
+  # Zonal (Express) or regional (Standard) endpoint. Empty = default SDK resolution.
+  s3Endpoint: ""
+  # Force path-style addressing (localstack/minio test backends).
+  forcePathStyle: false
+  # Region for the backend SDK, passed as AWS_REGION env. Empty = ambient resolution;
+  # required in-cluster where pods cannot reach IMDS.
+  awsRegion: ""
+  # Bucket aliases, alias → real bucket. A MAP, never the daemon's `alias=real,…` env
+  # string. On express, clients MUST address the alias, not the `*--x-s3` name.
+  # docs/helm/cache-and-disk-tier.md#backend-shape-adr-0023-and-bucket-aliasing
+  bucketMap: {}
+  # Where the disk tier lives inside the container; the hostPath volume mounts here.
+  cacheDir: /var/cache/pacer
+  # RAM tier size. resources.limits.memory must hold this plus working room — read
+  # docs/helm/memory-model.md before raising it.
+  memCapacity: 1GiB
+  # Disk tier size, as a budget the daemon may fill.
+  diskCapacity: 100GiB
+  # Smallest object worth caching.
+  minObjectSize: 4MiB
+  # Optional whole-object admission cap (ADR-0015). Unset → unbounded, which is the point
+  # of chunking. An operator safety valve, decoupled from blockSize.
+  # maxObjectSize: ""
+  # Cluster cache chunk size (ADR-0015): the unit of placement, fetch and invalidation.
+  # Embedded in every chunk key, so changing it is a cache-flush event — pin per cluster.
+  # Empty → daemon default 16MiB.
+  chunkSize: ""
+  # foyer disk block: eviction unit, max on-disk entry size, and fd divisor (one fd per
+  # block; keep diskCapacity/blockSize under the nofile limit).
+  blockSize: 1GiB
+  # foyer DRAM→NVMe flush buffer. Empty → daemon auto-sizes to 2×blockSize. Entries larger
+  # than this are SILENTLY DROPPED on demotion.
+  # docs/helm/cache-and-disk-tier.md#the-flush-buffer
+  flushBufferSize: ""
+  # Disk I/O engine: psync (portable default) or uring (Linux, NVMe depths).
+  # ⚠ The tuning block below is sized for uring; the read-path win is uring-only.
+  ioEngine: psync
+  # io_uring tuning; used only when ioEngine is uring. sqpoll off (a poll thread burns a
+  # core).
+  uring:
+    threads: 4
+    ioDepth: 256
+  # foyer storage-engine tuning. NOT foyer's own defaults — the 2x2 in
+  # bench/ladder/results/c4-foyer-readpath.md measured foyer's against these and the tuned
+  # side ships. 0/"" restores foyer's value, which is what a control arm asks for.
+  # docs/helm/cache-and-disk-tier.md#foyer-storage-tuning
+  tuning:
+    # Blocks flushed into concurrently — and therefore io_uring shards a sequential read
+    # spreads over, worth +52.8 %/+47.2 % on delivery. 32 matches a 32-thread uring engine.
+    flushers: 32
+    # Concurrent block reclaimers; a quarter of flushers. One reclaimer against 32 writers
+    # runs the engine out of clean blocks.
+    reclaimers: 8
+    # In-flight DRAM→NVMe write budget, bytes. Empty → DERIVED as flushers × chunkSize × 4.
+    # foyer's own 16MiB is ONE chunk entry and drops the rest SILENTLY — a data-loss fix,
+    # not a rate knob. 0 restores foyer's 16MiB.
+    submitQueueThreshold: ""
+    # Worker threads for a runtime dedicated to the disk tier. 0 shares the main runtime
+    # (foyer's default). Left at 0: its contribution is confounded and it changes threading.
+    storageRuntimeThreads: 0
+  # Whether a chunk read promotes a disk hit into the RAM tier: on-disk-hit (empty,
+  # foyer's behaviour) or never. `never` also gives up single-flight coalescing.
+  promotion: ""
+  # Which implementation holds chunk BODIES on disk (ADR-0033): foyer (an entry per chunk) or
+  # store (one pread into a registered frame). Not a hot flip.
+  #
+  # Empty → DERIVED (ADR-0038): `store` wherever a cache slab is derived — i.e. wherever
+  # efa.hugepages is set, the same gate as cluster.cacheSlabBytes — and `foyer` where none is.
+  # The store measured 1.633x foyer on one node while foyer touched the drives for 0.005 % of
+  # its bytes; but its read is O_DIRECT into a registered frame, so with NO slab it silently
+  # reads BUFFERED at ~half the rate and the daemon REFUSES to start on that combination.
+  # Hence the condition rather than a bare `store`. Set `foyer` to opt out.
+  # docs/helm/cache-and-disk-tier.md#which-implementation-owns-the-disk-tier-adr-0033
+  diskTier: ""
+  # Verify a chunk body's CRC32 on every store read. Off: ~1.1 ms against a 1.335 ms device
+  # read to re-check what NVMe protection and the client's digest already cover. The slot's
+  # KEY is checked regardless.
+  verifyChunkBody: false
+  # Whether a GET carrying `If-Match` may be served from the cache when the ETag the client
+  # named equals the one this node resolved (ADR-0039). Default true: Mountpoint-for-S3 puts
+  # `If-Match` on EVERY GET, so with this off its measured hit rate against PACER is 0 % and
+  # 100 % of its reads bypass. A mismatch always passes through — never a 412 — so this can
+  # only ever cost the optimisation.
+  # ⚠ The one place PACER answers a conditional differently from S3: on a hit the ETag
+  # compared against is the CACHED one, so a client cannot use `If-Match` through PACER to
+  # detect that an object was replaced in place. ADR-0015 requires a new name per version,
+  # under which the condition can never legitimately fail. Set false for strict semantics.
+  conditionalGetFromCache: true
+  # Chunk reads in flight against the ADR-0033 store, node-wide. Empty/0 = the daemon's
+  # measured default (16); `unlimited` is the pre-ceiling behaviour and must be asked for by
+  # NAME, because 0 already means "the default" here as it does everywhere else.
+  #
+  # A CEILING that RAISES throughput: the array saturates at ~4 concurrent 16 MiB reads, so
+  # past a shallow knee width is queueing. 48.7 GiB/s at depth 16 against 43.1 at 48, service
+  # linear in depth throughout — and nothing else bounds the total, since fillParallelism is
+  # per GET and delivery.parallelism per request.
+  storeReadConcurrency: ""
+  # Whether a store hit's 4 KiB header read and its 16 MiB body read are issued one after the
+  # other (empty/two-read) or together (overlap). MEASURED NULL on a p5 — 43.03 vs 43.06 GiB/s
+  # — so this exists to keep the question answerable, not because either is better.
+  storeReadShape: ""
+  # tokio worker threads; 0 = one per core.
+  workerThreads: 0
+  # tokio workers for the dedicated RDMA serve-path runtime, isolated so client GETs cannot
+  # starve RDMA serve scheduling. 0 = one per core; a small explicit 2-4 is the intended
+  # production setting. EFA + cluster mode only.
+  rdmaWorkerThreads: 0
+  # What the daemon does at startup when the terms pacer.memoryLimit sums do not fit its
+  # own cgroup limit: enforce (refuse to start) or warn. crates/pacer-daemon/src/memory_budget.rs
+  memoryCheck: enforce
+  # Fraction of that limit left for the two terms no template can compute — page cache and
+  # the delivery path's measured working set. Empty → 0.10, which is an UPPER bound: past
+  # ~0.167 the check refuses this chart's own efa+delivery render.
+  memoryHeadroomFraction: ""
+  # Rendered as RUST_LOG. A targeted directive (`pacer=debug,info`) goes in extraEnv.
+  logLevel: info
+  # Log encoding (ADR-0036): "json" (default) or "text". JSON keeps `kubectl logs
+  # | jq` and any log pipeline working; use text when a human is tailing a pod.
+  logFormat: json
+  # Concurrent S3 connections the daemon holds open (ADR-0036). 0 = the daemon
+  # default (1024, derived from 8 ranks x 64 pooled connections per node). At the
+  # cap the daemon stops accepting rather than failing a request, so a value that
+  # is too low shows up as slow connects — watch pacer_s3_connections_at_capacity_total.
+  s3MaxConnections: 0
+  # Seconds a connection may go without a complete request head (ADR-0036); also
+  # how long an idle keep-alive connection is kept. 0 = the daemon default (120).
+  s3HeaderTimeoutSecs: 0
+  # Seconds a connection may go with no byte moving in either direction (ADR-0036)
+  # — a stalled upload or an unread response. Resets on activity, so it never cuts
+  # a slow-but-moving transfer. 0 = the daemon default (300).
+  s3IdleTimeoutSecs: 0
+  # Seconds in-flight requests get to finish after SIGTERM (ADR-0036). 0 = the
+  # daemon default (20), paired with terminationGracePeriodSeconds: 30 — keep this
+  # strictly below that, or the kubelet SIGKILLs the pod mid-drain.
+  shutdownDrainTimeoutSecs: 0
+
+# docs/helm/scheduling.md#serviceaccount — backend auth is EKS Pod Identity (ADR-0006),
+# associated cluster-side, so no annotation is needed. ⚠ A release-named SA gets no
+# association and every backend call fails with InternalError.
+serviceAccount:
+  create: true
+  name: ""
+  # Generic passthrough for anything else that annotates the SA.
+  annotations: {}
+
+service:
+  # Hard node-locality: kube-proxy only routes to endpoints on the same node.
+  internalTrafficPolicy: Local
+
+# ADR-0006's authorization boundary: reaching :9000 IS the authorization to spend the node's
+# IAM identity, so this is the client-side security model, not a hardening extra — which is
+# why it ships ON. ⚠ It enforces NOTHING unless your CNI enforces NetworkPolicy, and the AWS
+# VPC CNI addon ships enforcement DISABLED. docs/helm/network-policy.md
+networkPolicy:
+  enabled: true
+  # Who may reach :9000, as NetworkPolicyPeers. THE SHIPPED DEFAULT IS CLUSTER-WIDE and is
+  # the thing to tighten; an EMPTY list DENIES the port and the chart refuses to render it.
+  clients:
+    - namespaceSelector: {}
+  # Addresses allowed to reach :9090, as CIDRs. The ONLY entry that can admit the kubelet's
+  # probes — they come from the node and match no selector. Narrow it, never empty it.
+  probeCidrs:
+    - 0.0.0.0/0
+  # Pods allowed to reach :9090 beyond probeCidrs. /metrics is unauthenticated and
+  # discloses key and topology detail (threat-model.md T-008). May be empty.
+  metrics:
+    - namespaceSelector: {}
+  # Extra ingress rules, appended verbatim. Rules are a UNION, so this can only WIDEN.
+  extraIngress: []
+  # :9100 is not configurable: it admits this release's own daemon pods and nothing else.
+  # The plane carries no credential of any kind (threat-model.md T-002/T-003).
+
+cache:
+  # Host path for the on-disk chunk cache: a dedicated SUBDIRECTORY of the NVMe array, NOT
+  # the array root — that filesystem also backs /var/lib/containerd, and a recursive delete
+  # at the root took down four nodes on 2026-08-04.
+  # docs/helm/cache-and-disk-tier.md#where-the-cache-lives-on-the-node
+  hostPath: /mnt/k8s-disks/0/pacer-cache
+
+# ⚠ limits.memory is NOT the container's limit. It is the BUDGET for what the cache's own
+# accounting can see; pacer.memoryLimit then ADDS the arenas, ADR-0028's slab and the
+# delivery/scatter footprints, so the rendered limit is larger. `helm template … | grep -A1
+# 'limits:'` shows what the kubelet will apply. READ docs/helm/memory-model.md BEFORE
+# RAISING config.memCapacity — every OOMKill this project has had came from a term nobody
+# added, and the largest term (page cache) is one no template can compute.
+#
+# No cpu limit, deliberately: the daemon runs Burstable (ADR-0035).
+# docs/helm/scheduling.md#cpu-qos-and-why-there-is-no-cpu-limit
+resources:
+  requests:
+    cpu: "1"
+    memory: 2Gi
+  limits:
+    memory: 4Gi
+
+# Schedule only on the cache nodepool. Null values are skipped by pacer.nodeSelector, which
+# is what lets a later -f overlay remove an earlier one's label.
+nodeSelector:
+  pacer.io/nodepool: cache
+
+# Session isolation (ADR-0029) — how several fleets share one cluster. A production install
+# leaves `id` empty and nothing here changes its scheduling.
+# docs/helm/scheduling.md#session-isolation-adr-0029--how-several-fleets-share-one-cluster
+session:
+  # Opaque token identifying the owning session. Stamped as `pacer.io/session` on every
+  # object and on the pod template. Empty = a single unowned fleet, the production shape.
+  id: ""
+  # Confine the DaemonSet to nodes labelled `pacer.io/session: <id>`. Without it, `id` is a
+  # label with no teeth. Ignored when `id` is empty.
+  requireClaimedNodes: true
+  # At most one pacer daemon per node across ALL releases: a required podAntiAffinity over
+  # the CHART name. The interloper stays Pending instead of corrupting one cache dir.
+  exclusiveNodes: true
+
+tolerations: []
+
+# A preemption that evicts the cache turns every co-located client's reads into backend
+# round-trips.
+priorityClassName: system-node-critical
+
+# Seconds the kubelet waits after SIGTERM before SIGKILL. Must EXCEED the daemon's 20 s
+# drain deadline or the drain is cut short and buys nothing; 30 = that deadline plus room
+# for the listeners to close and a final metrics scrape. pacer.validateGracePeriod enforces
+# the relationship. docs/helm/scheduling.md#terminationgraceperiodseconds
+terminationGracePeriodSeconds: 30
+
+# Extends the DaemonSet's one-at-a-time rollout to disruptions the controller does not own
+# (node consolidation, Karpenter drains, upgrades) — anything using the Eviction API. It
+# does NOT affect `kubectl drain --ignore-daemonsets`, which never evicts DaemonSet pods.
+# On by default because a cache-tier restart is a cold cache on that node; turn it off for a
+# fleet deliberately left partially Pending.
+# docs/helm/scheduling.md#poddisruptionbudget
+podDisruptionBudget:
+  enabled: true
+  # 1 matches updateStrategy.rollingUpdate.maxUnavailable. Integer or percentage string.
+  maxUnavailable: 1
+  annotations: {}
+
+# Alerts on the daemon's own cgroup accounting — the numbers the kernel kills on, and the
+# only ones that see page cache. docs/helm/monitoring.md
+monitoring:
+  prometheusRule:
+    # Off by default: monitoring.coreos.com/v1 is a CRD, and rendering it on a cluster
+    # without the Prometheus Operator fails the whole install.
+    enabled: false
+    # Merged onto the object's metadata. A Prometheus Operator ruleSelector usually needs a
+    # match here; without one the rule is inert and looks like a healthy install.
+    labels: {}
+    annotations: {}
+    # Emitted as `runbook_url` on every alert, with a per-alert #anchor appended.
+    runbookUrl: docs/runbooks/daemon-oom.md
+    # current/max above this, for this long, fires PacerDaemonMemoryNearLimit.
+    memoryRatio: 0.9
+    memoryFor: 10m
+    # (current − file)/max above this fires PacerDaemonAnonymousMemoryNearLimit: no
+    # headroom left for the page cache the next cold pass will instantiate.
+    anonRatio: 0.85
+    anonFor: 15m
+    # increase() range for the two OOM counters. Not a `for:` duration — a single reclaim
+    # failure pages immediately.
+    oomWindow: 5m
+    # The CONFIGURED budget, not a measurement: total x (1 + config.memoryHeadroomFraction)
+    # over max above this fires PacerDaemonMemoryBudgetNearLimit. 0.95 rather than 1.0
+    # because at 1.0 the daemon refuses to START — so the interesting range is just below
+    # it, where the pod is running and the next limit change or added term will not fit.
+    budgetRatio: 0.95
+    # Longer than memoryFor on purpose: this ratio is STATIC for a process's life (the
+    # budget series are published once at startup), so a `for:` this long costs nothing and
+    # rules out a scrape gap or a rolling restart as the cause.
+    budgetFor: 15m
+
+# glibc bounds, rendered as MALLOC_* env because the daemon does not own those names.
+# The two knobs are NOT symmetric, which is why one is on and one is not.
+# docs/helm/memory-model.md#why-allocator-is-a-first-class-block
+allocator:
+  # Cap glibc's per-thread arenas. Empty/0 → glibc's own 8 × ncores (1536 on a
+  # p5.48xlarge), each retaining its own free lists — the floor nobody sized. 8 keeps 8-way
+  # malloc concurrency and cannot slow the hot path. ⚠ Its warrant is reasoning, not
+  # measurement.
+  arenaMax: 8
+  # Return freed memory above this many bytes, as a size (e.g. 128MiB); rendered as decimal
+  # bytes because glibc uses strtol. Empty → glibc's dynamic behaviour. OFF by default:
+  # setting it pins the mmap threshold, putting every 16 MiB chunk body through an
+  # mmap/munmap pair on the hot path for an unmeasured cost.
+  trimThreshold: ""
+
+# Extra container environment, appended LAST so it wins over everything the chart renders,
+# `allocator` included. For variables the daemon does not own. PACER_* knobs go in `config`,
+# which is checksummed into a pod roll (ADR-0013). These entries are in the pod template, so
+# a change rolls the DaemonSet by itself — except a `valueFrom` reference, whose referenced
+# VALUE is not. docs/helm/scheduling.md#extraenv
+extraEnv: []
+
+# Dev iteration mode (scripts/dev/): a supervisor that swaps in a locally cross-compiled
+# binary, no image rebuild. NEVER enable in a real deployment.
+# docs/helm/scheduling.md#devmode
+devMode:
+  enabled: false
+  # Supervisor image. Empty → the release image, which is the only default that can work:
+  # the pushed binary needs glibc and, under --features efa, libibverbs.
+  image: ""
+
+# Phase 3 (EFA-RDMA path). Off in THIS base chart; the block that turns it on ships
+# commented at the end of values-example.yaml — `enabled: true`
+# requests an EFA device, which makes the pod UNSCHEDULABLE on non-EFA nodes, so it cannot
+# be a universal default. The daemon speaks gRPC-only where EFA is absent and falls back
+# per-peer on any RDMA error. The knobs below are deliberately INDEPENDENT.
+# docs/helm/efa-and-rdma.md
+efa:
+  enabled: false
+  # Requires aws-efa-k8s-device-plugin on the nodepool.
+  resourceName: vpc.amazonaws.com/efa
+  count: 1
+  # IPC_LOCK capability (memory-registration memlock). Only needed if ibv_reg_mr hits
+  # RLIMIT_MEMLOCK — registration works on 4 KiB pages without it.
+  ipcLock: false
+  # REACH a device without REQUESTING one (ADR-0030 point 9): hostPath-mount
+  # /dev/infiniband instead of taking a unit the delivery client or a tenant's NCCL job
+  # needs. ⚠ NOT sufficient alone — see `privileged`.
+  shareHostDevices: false
+  # Run the daemon privileged, which is what actually lets it OPEN the devices
+  # `shareHostDevices` mounts: the device cgroup admits only devices a plugin ALLOCATED, so
+  # the mount alone gives EPERM on every ibv_open_device. THE SUPPORTED PRODUCTION
+  # MECHANISM, still off by default because a chart must never silently escalate privileges.
+  privileged: false
+  # Request boot-reserved hugepages, as a quantity (e.g. 8Gi). Setting it also turns
+  # ADR-0028's cache slab ON, so it must cover rdmaArenaBytes + 256 × chunkSize + the slab —
+  # the render fails with the exact figure if it does not. Empty/0 → no request (arenas map
+  # on 4 KiB pages: registration cost and TLB pressure, not bandwidth).
+  hugepages: ""
+  # Which hugepage SIZE, in MiB: 2 (the default, `hugepages-2Mi`) or 1024 (`hugepages-1Gi`).
+  # Decides the pod's resource NAME and the daemon's `rdma-arena-page-mib` together, because
+  # they cannot disagree: an arena mapping a size the pod never requested fails ENOMEM and
+  # degrades to 4 KiB pages, silently wasting the whole reservation (planning/18 harness note).
+  #
+  # ONLY 2 AND 1024 EXIST. `ArenaPages::from_mib` maps anything else to base pages — silently,
+  # which is why the render refuses an unknown value rather than passing it through.
+  #
+  # NOT a throughput knob: page size buys registration cost and translation footprint, not
+  # bandwidth. 1024 is worth asking for when a single registration is large enough that 2 MiB
+  # PTEs and fragmentation start to matter — an 18Gi holder reservation is ~9200 pages at 2 MiB
+  # against 18 at 1 GiB — and it needs the node to reserve that size at boot
+  # (`hugepages-1048576kB/nr_hugepages`), which a nodeclass userData does and a running node
+  # cannot be talked into.
+  hugepageSizeMib: 2
+  # The two registered arenas, ADDED to the container memory limit — invisible to
+  # config.memCapacity, and omitting them OOMKills the pod under seed load. Must cover
+  # rdmaArenaBytes (requester) + 256 × chunkSize (holder) = 8Gi at the defaults.
+  pinnedPoolReservation: 8Gi
+
+# Delivery into client-supplied memory (ADR-0026): a cooperating client sends
+# `x-pacer-target` on a GET and the daemon writes the bytes there, answering header-only —
+# removing the HTTP/TCP leg measured at 87 % of the daemon's throughput. A client that sends
+# no header is unaffected, which is what makes it safe to ship ON. It is still a privilege
+# rather than a tuning knob — the daemon maps and pins memory a CLIENT named — so both quotas
+# below ship on their FLOOR. docs/helm/delivery.md
+delivery:
+  # ON BY DEFAULT. A client that sends no `x-pacer-target` header is served exactly as before,
+  # so enabling this cannot change an existing workload — the cost is not behavioural, it is
+  # the memory limit: `pinnedReservation` + `workingSetReservation` are ADDED to it (4Gi + a
+  # derived 1Gi here, so the shipped limit is 9Gi rather than 4Gi). Set false to get 4Gi back.
+  enabled: true
+  # Mount the node's tmpfs at `shmDir` so client pods can share segments. hostPath, never an
+  # emptyDir — an emptyDir is per-POD and can never be shared. ON with `enabled`, because
+  # without it `shm:` targets can never resolve a client's segment and only `nic:` works.
+  # The chart already hostPath-mounts the cache dir, so this adds no new class of mount.
+  sharedShm: true
+  # Host path to mount. /dev/shm is already a tmpfs (~50 % of RAM) everywhere. Point this
+  # AND `shmDir` at /dev/hugepages for hugepage-backed client segments — the cheapest lever
+  # on the host-memory delivery path, and it needs no protocol change.
+  # docs/helm/delivery.md#hugepage-backed-client-segments
+  shmHostPath: /dev/shm
+  # Where `shm:/name` resolves inside the daemon. Empty → /dev/shm. The mount path follows
+  # this value, so the two cannot drift.
+  shmDir: ""
+  # Per-request ceiling on client memory one GET may pin. Over it, the read is
+  # body-delivered rather than failed. 4Gi and not the daemon's 1GiB because a published
+  # checkpoint's embedding is ONE tensor that grows with the vocabulary — 1.957 GiB at 70B,
+  # which at 1GiB the daemon DECLINES. Above pinnedBytesMax it FAILS the render.
+  # docs/helm/delivery.md#why-the-per-request-ceiling-ships-at-4gi
+  maxTargetBytes: 4Gi
+  # Node-wide ceiling on concurrently pinned client memory. Empty → daemon default 8Gi.
+  # Keep pinnedReservation in step; the render fails if it falls below this.
+  #
+  # Pinned at 4Gi rather than left empty because this term lands in the container memory
+  # limit, and 4Gi is the FLOOR: it may not fall below maxTargetBytes (the render refuses),
+  # and maxTargetBytes cannot drop under 4Gi while one 70B embedding tensor is 1.957 GiB.
+  # So this is the cheapest default that still delivers a real checkpoint.
+  #
+  # ⚠ WHAT THE FLOOR COSTS, and it is a THROUGHPUT cliff rather than an error. At 4Gi this
+  # EQUALS maxTargetBytes, so the node-wide budget admits exactly ONE maximal window: a second
+  # concurrent GET naming one is DECLINED and served as an ordinary body — correct bytes, the
+  # slow path, and visible only as delivery looking unhelpful. Anything delivering to several
+  # ranks on one node wants N × maxTargetBytes here, with pinnedReservation raised in step
+  # (so N=8 for a TP=8 loader is 32Gi + 32Gi, and the container limit follows both).
+  pinnedBytesMax: 4Gi
+  # planning/19 C3: have a remote chunk's HOLDER write it straight into the reading client's
+  # own registered window. `nic:` targets only. Off as the CONTROL ARM, not as a safety
+  # valve — the off path is exactly the on path's per-chunk fallback.
+  # docs/helm/delivery.md#remote-write-planning19-c3-the-holder-writes-the-client-directly
+  remoteWrite: false
+  # `gpuTargets` and `gpuHostIpc` lived here until 2026-09-08. Both existed for ADR-0027's
+  # `cuda-ipc:` scheme — the daemon needed the driver injected to import a client's IPC
+  # handle, and possibly the host IPC namespace to do it. That scheme is removed: device
+  # memory now arrives as a `nic:` token the CLIENT registered (ADR-0030), so the daemon
+  # needs no CUDA and no GPU visibility, and nothing here shares a namespace with the host.
+  # Windows delivered concurrently per GET. Empty → daemon default 64. NOT
+  # config.fillParallelism: these are disjoint destinations with no ordering constraint.
+  parallelism: ""
+  # Client-pinned pages ADDED to the container memory limit — the analogue of
+  # efa.pinnedPoolReservation. Should match pinnedBytesMax; the render fails if smaller.
+  # Tracks pinnedBytesMax at 4Gi: these two move together, always.
+  pinnedReservation: 4Gi
+  # The delivery path's OWN in-flight bodies, ADDED to the limit. Empty → DERIVED as
+  # parallelism × chunkSize. ⚠ A FLOOR, not the measured working set — a 70B cold load
+  # OOMKilled the daemon with every other term inside budget. 0 = add nothing (control arm).
+  workingSetReservation: ""
+
+# Write scatter (ADR-0032): a PUT of a new key becomes a multipart upload whose parts are
+# uploaded by the chunks' own homes, and every part is cached on the node that uploaded it.
+# ON BY DEFAULT WHERE THE DESIGN APPLIES — Standard backends only. ⚠ A scattered PUT is a
+# multipart upload, so the ETag a client sees is the composite `-N` form; anything comparing
+# ETags to a local MD5 must move to `x-amz-checksum-crc32` or set `enabled: false`.
+# docs/helm/write-scatter.md
+scatter:
+  # THREE-state. null (this default) = ON for `standard`, OFF for `express`. true/1/on/yes =
+  # ON, and on Express that FAILS the render. false/0/no = OFF on any backend, emitted
+  # explicitly so the daemon's own default cannot overrule you.
+  enabled: null
+  # Node-wide ceiling on bytes this node holds for OTHER nodes between their UploadPart and
+  # the coordinator's commit. Empty → daemon default 2GiB, which the chart then emits
+  # explicitly because it is also added to the memory limit. Bounds CONCURRENCY, not load.
+  stagingBytes: ""
+  # Seconds a staged chunk may sit before the reaper returns its budget. Empty/0 → 900. The
+  # backstop for a coordinator that died between an owner's upload and its commit.
+  stagingTtlSecs: ""
+  # Windows a coordinator keeps in flight; a real node-wide byte bound (× chunkSize) as of
+  # ebe07c07. Empty/0 → daemon default 16. Not a throughput lever: 16→32 measured flat.
+  windowsInFlight: ""
+  # Concurrent scattered PUTs this node coordinates. 1 is the shape a training save has.
+  # nil/""/0 all mean one PUT. docs/helm/write-scatter.md#the-coordinators-own-buffered-windows
+  coordinatorConcurrency: 1
+  # The largest object this node will coordinate. Empty → the chart falls back to
+  # windowsInFlight × chunkSize, which since ebe07c07 is what the semaphore actually bounds.
+  coordinatorObjectBytes: ""
+  # Escape hatch: state the coordinator's total footprint yourself. 0 = add nothing, i.e.
+  # the pre-2026-08-27 arithmetic, which exists so a control arm can ask for it deliberately.
+  coordinatorReservation: ""
+  # Smallest object to scatter. Empty → daemon default 128MiB. Confines the ETag change to
+  # objects big enough for a parallel upload to pay for it. Distinct from
+  # config.minObjectSize, which decides what is CACHEABLE.
+  minObjectBytes: ""
+  # Seconds a coordinator stops offering windows to an owner that refused for load.
+  # Empty/0 → 5. An owner can only refuse AFTER gRPC delivered the window.
+  saturatedCooldownSecs: ""
+
+# Karpenter nodepool for the cache tier, rendered only if enabled — requires Karpenter v1
+# CRDs. See templates/karpenter.yaml for the invariants and
+# docs/helm/scheduling.md#karpenter.
+karpenter:
+  enabled: false
+  # AZ ID (not a name!) of the directory bucket, e.g. use1-az4. Names shuffle per account.
+  zoneId: ""
+  amiFamily: AL2023
+  clusterName: ""
+  # Node IAM role name.
+  role: ""
+  # Nitro v4+ only (RDMA READ capable — ADR-0004). g5/c5n are deliberately absent: no RDMA,
+  # they would silently degrade to gRPC.
+  instanceFamilies:
+    - c6in
+    - m7i
+    - r7i
+    - g6
+    - g6e

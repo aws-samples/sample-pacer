@@ -1,0 +1,50 @@
+PACER {{ .Chart.AppVersion }} installed as {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Point client SDKs at the node-local Service, path-style, with the placeholder credentials:
+
+  endpoint_url = http://{{ include "pacer.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.ports.s3 }}
+
+{{ if .Values.networkPolicy.enabled }}
+=============================== READ THIS ONE ===============================
+ A NetworkPolicy shipped, but NOTHING ENFORCES IT UNTIL YOUR CNI DOES.
+
+ This daemon re-signs every request with the NODE's IAM identity (ADR-0006), so
+ whatever can reach :{{ .Values.ports.s3 }} holds that identity's S3 access. The policy is the
+ only thing scoping that, and the API server accepts it whether or not any CNI
+ implements it. On EKS with the AWS VPC CNI, enforcement is OPT-IN.
+
+ Check now — a "false" here means you have no policy:
+
+   kubectl -n kube-system get pods -l k8s-app=aws-node -o jsonpath=\
+'{.items[0].spec.containers[?(@.name=="aws-eks-nodeagent")].args}'
+
+ Want --enable-network-policy=true. Read a live POD, as above, and not the
+ aws-node DaemonSet template: the two can disagree, and the template is the read
+ that reports "disabled" on a cluster that is in fact enforcing.
+ NETWORK_POLICY_ENFORCING_MODE on the aws-node container is NOT this switch.
+
+ Authoritative source is the addon itself:
+   aws eks describe-addon --cluster-name <c> --region <r> --addon-name vpc-cni \
+     --query addon.configurationValues
+ Fix with the same --configuration-values '{"enableNetworkPolicy":"true"}'.
+ Calico/Cilium enforce by default.
+{{- if contains "true" (include "pacer.networkPolicyClientsWideOpen" .) }}
+
+ And it is currently CLUSTER-WIDE on :{{ .Values.ports.s3 }}: networkPolicy.clients admits
+ every pod in every namespace — the same reachability as no policy at all, so enforcing
+ it changes nothing until you narrow it. Set networkPolicy.clients to the pods that
+ should be allowed to spend this node's IAM identity; values.yaml has the two-selector
+ form. Until then the peer plane (:{{ .Values.ports.peer }}) is the only port this policy actually scopes.
+{{- end }}
+=============================================================================
+{{ else }}
+=============================================================================
+ WARNING: networkPolicy.enabled=false — :{{ .Values.ports.s3 }} is reachable by any pod that
+ can route to it, and this daemon re-signs every request with the NODE's IAM
+ identity (ADR-0006). Reachability IS the authorization boundary here. Supply your
+ own policy, or set networkPolicy.enabled=true.
+=============================================================================
+{{ end }}
+Neither the policy nor any CNI covers the EFA/RDMA data plane: one-sided RDMA over SRD
+is device-to-device and never reaches the CNI's hooks. Scope that with the EFA security
+group and placement group. Full posture: docs/helm/network-policy.md.

@@ -72,7 +72,7 @@ tokio-stream = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
-tonic = "0.12"
+tonic = "0.14"
 tonic-build = "0.12"
 prost = "0.13"
 protoc-bin-vendored = "3"

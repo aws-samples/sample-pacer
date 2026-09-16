@@ -101,7 +101,7 @@ serde = { version = "1", features = ["derive"] }
 # cache directory written by a previous build contains and the hand-written codec
 # has to keep reading it — and because `foyer::Error::bincode_error` takes a
 # `bincode::Error`, which is only the same type across one major.
-bincode = "1"
+bincode = "3"
 # YAML config file (ADR-0013). serde_yaml (dtolnay) is archived; serde_yaml_ng
 # is the maintained API-compatible fork.
 serde_yaml_ng = "0.10"

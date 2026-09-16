@@ -120,7 +120,7 @@ proptest = "1"
 # is one line rather than an edit to a macro. Chosen over `test-case` for its
 # `#[case::name(..)]` labels and its first-class async support (the whole suite is
 # `#[tokio::test]`). Dev-only: no crate ships it in a non-test build.
-rstest = { version = "0.23", default-features = false }
+rstest = { version = "0.27", default-features = false }
 
 [profile.release]
 lto = "thin"

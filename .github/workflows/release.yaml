@@ -1,0 +1,249 @@
+name: Release
+
+# Tag-driven release: pushing a `vX.Y.Z` tag publishes the multi-arch daemon
+# image and the OCI Helm chart to GHCR, then cuts a GitHub Release on the tag.
+# `:latest` is deliberately never touched — release tags are immutable, and
+# nothing here runs on branches.
+#
+# Stage order mirrors the invariants of the internal pipeline this replaces:
+# per-arch native build → vulnerability scan → manifest stitch → chart →
+# GitHub Release. A failed scan can leave throwaway `-<arch>` tags in the
+# registry, but the release tag (what the chart's default image reference
+# pulls) never points at an unscanned image, the chart is only published once
+# that tag exists, and the Release itself — the last stage — never appears
+# until every artifact it names is already in GHCR.
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+
+permissions:
+  contents: read
+  packages: write
+
+# Action pins follow the same policy as `ci.yaml`, and it matters more here:
+# this workflow holds `packages: write` and pushes the artifacts adopters
+# install, so a retargeted action tag would ship, not merely build. Immutable
+# commit SHA + a comment naming the exact release; audit with
+# `scripts/ci/verify-action-pins`. See ci.yaml's header and threat-model.md
+# (M-019 / T-012).
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  # Per-arch EFA build environment, pushed so the release Dockerfile can FROM
+  # it (daemon-less builds cannot `load:` an image locally).
+  BUILDER_IMAGE: ghcr.io/${{ github.repository }}/efa-builder
+  # Charts live under a separate OCI path so chart versions and image tags
+  # cannot collide in one repository namespace.
+  #
+  # Namespaced under `github.repository`, NOT `github.repository_owner`: the owner
+  # is a shared organization (`aws-samples`), so an owner-level `…/charts/pacer`
+  # would claim one package name for the whole org and collide with any sibling
+  # sample that packages a chart of the same name. GHCR permissions are per
+  # package, so that collision is also a permissions problem, not just a naming
+  # one. Under the repository the path is unambiguous and the package inherits
+  # this repo's own access.
+  CHART_REPO: oci://ghcr.io/${{ github.repository }}/charts
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          # One NATIVE runner per arch — no QEMU. The `efa` build compiles
+          # vendored rdma-core (cmake + bindgen) and the full AWS SDK; under
+          # emulation that multiplies a long build by an order of magnitude.
+          # `ubuntu-24.04-arm` runners are free for public repositories.
+          #
+          # The labels are overridable via repo variables (RELEASE_RUNNER_AMD64
+          # / RELEASE_RUNNER_ARM64) so a private repo can point the builds at
+          # self-hosted runners (e.g. ARC on Kubernetes) — unset, they fall
+          # back to the GitHub-hosted defaults. Each label must be pinned to
+          # its architecture (the assert step below fails fast on a mixed
+          # pool), and self-hosted runners should be detached from the repo
+          # before it is made public — a self-hosted runner on a public repo
+          # is reachable by fork-PR code.
+          - arch: amd64
+            uname: x86_64
+            runner: "${{ vars.RELEASE_RUNNER_AMD64 || 'ubuntu-24.04' }}"
+          - arch: arm64
+            uname: aarch64
+            runner: "${{ vars.RELEASE_RUNNER_ARM64 || 'ubuntu-24.04-arm' }}"
+    runs-on: ${{ matrix.runner }}
+    # Deliberately NO job-level `container:` here — and don't add one. On
+    # daemon-less self-hosted runners (ARC kubernetes container mode) a job
+    # container is spawned as a separate pod by the runner hooks, which cannot
+    # see the buildkitd sidecar's unix socket; the steps must run directly in
+    # the runner container, where the socket and its env are mounted.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      # Fail fast if the scheduler put this job on the wrong architecture — an
+      # unpinned self-hosted pool with mixed nodes would otherwise ship a
+      # cross-labeled binary (the build is native by design, never emulated).
+      - name: assert native arch
+        run: |
+          [ "$(uname -m)" = "${{ matrix.uname }}" ] || {
+            echo "runner is $(uname -m), expected ${{ matrix.uname }}" \
+                 "— pin the runner set for ${{ matrix.arch }}" >&2
+            exit 1
+          }
+      # No docker daemon is assumed anywhere in this job. On hosted runners
+      # buildx runs its usual docker-container BuildKit; on daemon-less
+      # self-hosted runners (e.g. ARC in kubernetes container mode) set the
+      # BUILDKIT_ENDPOINT repo variable to a rootless buildkitd and the remote
+      # driver is used instead. The endpoint must be a SAME-NODE sidecar
+      # (e.g. tcp://localhost:1234): with a remote driver the build executes
+      # inside buildkitd, so a shared off-node buildkitd would silently decide
+      # the build's architecture regardless of the runner the job landed on.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+        with:
+          driver: ${{ vars.BUILDKIT_ENDPOINT && 'remote' || 'docker-container' }}
+          endpoint: ${{ vars.BUILDKIT_ENDPOINT || '' }}
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The EFA build environment (rdma-core toolchain + aws-efa-installer
+      # userspace), PUSHED per arch: a daemon-less build cannot `load:` an
+      # image locally, so the release Dockerfile pulls it back by reference.
+      # Layer cache keeps the steady-state rebuild cheap — layers only change
+      # when the pinned installer version or the Dockerfile does. Cache
+      # backend: an S3 bucket when the RELEASE_CACHE_S3_BUCKET /
+      # RELEASE_CACHE_S3_REGION repo variables are set (self-hosted runners
+      # whose pod identity grants bucket access; variables keep the bucket
+      # and account out of this public file), else the GHA cache service.
+      # `platforms` is single-arch and matches the asserted runner arch — the
+      # matrix builds natively on two pinned runner sets, never emulates.
+      - name: build + push EFA builder image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          file: ci/Dockerfile.efa-builder
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ env.BUILDER_IMAGE }}:${{ github.ref_name }}-${{ matrix.arch }}
+          # ignore-error on cache-to: the cache is an optimization — a flaky
+          # cache backend (e.g. the GHA cache service during a GitHub
+          # incident) must never fail a release whose image already pushed.
+          cache-from: ${{ vars.RELEASE_CACHE_S3_BUCKET
+            && format('type=s3,region={0},bucket={1},name=efa-builder-{2}', vars.RELEASE_CACHE_S3_REGION, vars.RELEASE_CACHE_S3_BUCKET, matrix.arch)
+            || format('type=gha,scope=efa-builder-{0}', matrix.arch) }}
+          cache-to: ${{ vars.RELEASE_CACHE_S3_BUCKET
+            && format('type=s3,region={0},bucket={1},name=efa-builder-{2},mode=max,ignore-error=true',
+              vars.RELEASE_CACHE_S3_REGION, vars.RELEASE_CACHE_S3_BUCKET, matrix.arch)
+            || format('type=gha,mode=max,scope=efa-builder-{0},ignore-error=true', matrix.arch) }}
+      # Test + compile `--features efa`, stage the EFA runtime closure, and
+      # assemble the distroless runtime image in ONE BuildKit graph
+      # (ci/Dockerfile.release) — no `docker run`, no artifact hand-off. This
+      # is also the release's native test pass on each arch (the push-CI
+      # `rust` job tests default features on amd64 only).
+      - name: build + push arch image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          file: ci/Dockerfile.release
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            BUILDER_IMAGE=${{ env.BUILDER_IMAGE }}:${{ github.ref_name }}-${{ matrix.arch }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}-${{ matrix.arch }}
+
+  # Vulnerability gate BEFORE the manifest list is stitched (same severity and
+  # fixed-only policy as the pre-publish gate this project has always run).
+  scan:
+    needs: build
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}:${{ github.ref_name }}-${{ matrix.arch }}
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          # The arch tags are OCI indexes (buildx attaches a provenance
+          # attestation even to a single-platform push), and Trivy defaults to
+          # the scan host's platform — on the amd64 scan runner the arm64
+          # index has no amd64 child and the pull fails. Pin the platform to
+          # the leg being scanned.
+          TRIVY_PLATFORM: linux/${{ matrix.arch }}
+
+  manifest:
+    needs: scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: stitch multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            --tag "$IMAGE:$GITHUB_REF_NAME" \
+            "$IMAGE:$GITHUB_REF_NAME-amd64" \
+            "$IMAGE:$GITHUB_REF_NAME-arm64"
+
+  chart:
+    needs: manifest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4  # v4.3.1
+      - name: package + push chart
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          # Chart version is the bare X.Y.Z (SemVer, required by Helm);
+          # appVersion is the full git tag, so the chart's default image
+          # reference (`.Values.image.tag | default .Chart.AppVersion`) is
+          # exactly the multi-arch tag this release just pushed.
+          VERSION="${GITHUB_REF_NAME#v}"
+          helm package deploy/helm/pacer \
+            --version "$VERSION" --app-version "$GITHUB_REF_NAME"
+          helm push "pacer-$VERSION.tgz" "$CHART_REPO"
+
+  # Pushing the tag never creates a GitHub Release on its own — that is a
+  # separate object, and every job above only reaches GHCR. Gated on `chart`
+  # (itself gated on `manifest`, on `scan`, on `build`) so a Release is never
+  # visible until every artifact it will point to already is.
+  release:
+    needs: chart
+    runs-on: ubuntu-24.04
+    # The one job in this workflow that writes to the repo rather than to
+    # GHCR: scoped here alone, so the jobs that only ever push packages keep
+    # the workflow-level `contents: read`.
+    permissions:
+      contents: write
+    steps:
+      - name: assemble release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## Artifacts"
+            echo
+            echo '```'
+            echo "docker pull $IMAGE:$GITHUB_REF_NAME"
+            echo "helm pull $CHART_REPO/pacer --version ${GITHUB_REF_NAME#v}"
+            echo '```'
+            echo
+            gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+              -f tag_name="$GITHUB_REF_NAME" --jq .body
+          } > release-notes.md
+      - name: create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md

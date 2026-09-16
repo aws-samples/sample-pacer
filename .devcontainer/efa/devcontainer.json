@@ -1,0 +1,53 @@
+{
+  "$schema": "https://raw.githubusercontent.com/devcontainers/spec/main/schemas/devContainer.schema.json",
+  "name": "PACER (--features efa, full CI parity)",
+
+  // Builds ci/Dockerfile.efa-builder ITSELF rather than a copy of it: that file
+  // is the single source of truth for the EFA userspace version and the pinned
+  // rustc, and the `rust-efa` / `build-binary` / `functional` CI jobs run FROM
+  // the same image. Duplicating it here would create exactly the drift the
+  // comments in that file warn about. Expect a slow first build (~830 MB image,
+  // rdma-core built from source) and native arch only — this repo does not
+  // QEMU-emulate cross-arch builds.
+  "build": {
+    "dockerfile": "../../ci/Dockerfile.efa-builder",
+    "context": "../.."
+  },
+
+  // Volume names differ from the default variant's on purpose: this is a
+  // different base OS (Amazon Linux 2023, not Debian) and sharing one target/
+  // between them just means every switch rebuilds from scratch. CARGO_HOME here
+  // is /root/.cargo — the EFA image bootstraps rustup as root rather than using
+  // the official Rust image's /usr/local/cargo.
+  "containerEnv": {
+    "CARGO_TARGET_DIR": "/build/target"
+  },
+  "mounts": [
+    "source=pacer-devcontainer-efa-target,target=/build/target,type=volume",
+    "source=pacer-devcontainer-efa-registry,target=/root/.cargo/registry,type=volume"
+  ],
+
+  // The builder image is a CI image, so it carries no helm and no cargo-deny.
+  // Same script the default variant bakes in, run once at create time.
+  "postCreateCommand": "${containerWorkspaceFolder}/.devcontainer/install-dev-tools.sh",
+
+  // It COMPILES --features efa; it cannot RUN RDMA. There are no EFA devices in
+  // a laptop, so the transport's runtime behaviour is proven on real hardware —
+  // the same compile-vs-run split CI draws between `rust-efa` and its hardware
+  // jobs.
+  "postAttachCommand": "echo 'EFA devcontainer ready — try: cargo clippy --all-targets --all-features -- -D warnings'",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml"
+      ],
+      "settings": {
+        "rust-analyzer.cargo.targetDir": "/build/target",
+        "rust-analyzer.cargo.features": "all",
+        "rust-analyzer.check.command": "clippy"
+      }
+    }
+  }
+}

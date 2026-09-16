@@ -1,0 +1,60 @@
+# cargo-deny config — supply-chain gate run in CI (ADR-0010; see ci/README.md).
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# RustSec advisories fail the pipeline. Ignores must carry a reason and should
+# be re-checked when the parent dependency updates.
+ignore = [
+    # bincode 1.x is unmaintained; pulled in by foyer-common (serialization of
+    # cache metadata). Re-check on every foyer upgrade — foyer moving to
+    # bincode 2 or another codec removes this.
+    { id = "RUSTSEC-2025-0141", reason = "transitive via foyer; no fix available upstream yet" },
+    # paste is unmaintained (archived); proc-macro used at build time only by
+    # foyer-memory. No runtime exposure.
+    { id = "RUSTSEC-2024-0436", reason = "build-time proc-macro, transitive via foyer" },
+]
+
+[licenses]
+# The project is MIT-0; allow only permissive licenses compatible with that
+# (dependencies may still be Apache-2.0/MIT/BSD/etc.). Anything new
+# (LGPL/MPL/proprietary) must be reviewed, not waved in.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+    "BSL-1.0",
+    "OpenSSL", # ring/aws-lc-sys license stanza
+]
+
+[[licenses.clarify]]
+# ring bundles code under multiple licenses; the crate ships a LICENSE file
+# cargo-deny can't parse. Standard clarification from the cargo-deny book.
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace path deps carry no version; that's the intended pattern here.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# jonhoo/ibverbs is git-pinned (by rev) for its unreleased `efa` feature —
+# efadv SRD bindings not yet on crates.io (ADR-0005/0021, Phase 3 A1). The pin
+# lives in crates/pacer-transport/Cargo.toml; drop this entry once the feature
+# ships to crates.io and the dep moves back to a version req.
+allow-git = ["https://github.com/jonhoo/rust-ibverbs"]

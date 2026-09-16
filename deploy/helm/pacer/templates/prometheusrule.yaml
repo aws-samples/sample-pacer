@@ -1,0 +1,173 @@
+{{- if .Values.monitoring.prometheusRule.enabled }}
+{{- /*
+Alerts on the daemon's own cgroup accounting — the numbers the kernel kills on — plus one on
+the budget it was CONFIGURED with, which is the same comparison its startup check makes.
+
+WHY THESE SERIES AND NOT THE PROCESS ONES. `process_resident_memory_bytes` measures RSS,
+which EXCLUDES page cache, and foyer's disk tier does buffered I/O — so on a large-memory
+node the daemon can look flat to the byte while its cgroup marches to the limit (72.1 GiB of
+`Cached` measured on a p5 serving a 131 GiB checkpoint,
+bench/ladder/results/c4-fanout-depth.md). The kill itself leaves nothing in the log, because
+the kernel kills the container, and both client-side symptoms name something else:
+`IncompleteRead(... more expected)` and `EndpointConnectionError`. Every recorded incident is
+in docs/runbooks/daemon-oom.md; rule 5 of docs/helm/memory-model.md is why nothing else
+warns.
+
+Gated OFF by default because monitoring.coreos.com/v1 is a CRD: on a cluster without the
+Prometheus Operator, rendering this fails the whole install.
+
+TWO EDGE CASES EVERY EXPRESSION HERE SURVIVES WITHOUT A GUARD, and they are the reason the
+ratios are written as bare division rather than wrapped in an `and ... > 0`:
+  * an UNLIMITED cgroup publishes `+Inf` for the limit (crates/pacer-daemon/src/cgroup.rs
+    reports "unset" as infinity rather than 0), so `current / +Inf` is 0 and nothing fires;
+  * a container with no cgroup memory controller publishes 0 for every series, so the ratio
+    is `0 / 0` = NaN, and a NaN comparison in PromQL is false.
+Adding a guard would only give a reader something else to get wrong.
+*/ -}}
+{{- $r := .Values.monitoring.prometheusRule -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "pacer.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pacer.labels" . | nindent 4 }}
+    {{- with $r.labels }}
+    {{- /* A Prometheus Operator selects rules by label; without a match this object is
+           inert, which looks exactly like a healthy install. */}}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $r.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  groups:
+    - name: {{ include "pacer.fullname" . }}.memory
+      rules:
+        # Proximity to the kill, PAGE CACHE INCLUDED. THE series to alert on: it is
+        # `memory.current` over `memory.max`, i.e. exactly the comparison the kernel makes.
+        - alert: PacerDaemonMemoryNearLimit
+          expr: |
+            pacer_cgroup_memory_current_bytes / pacer_cgroup_memory_max_bytes
+              > {{ $r.memoryRatio }}
+          for: {{ $r.memoryFor }}
+          labels:
+            severity: warning
+            component: pacer-daemon
+            {{- with include "pacer.sessionLabels" . }}{{ . | nindent 12 }}{{- end }}
+          annotations:
+            summary: "pacer daemon cgroup memory above {{ $r.memoryRatio }} of its limit on {{ "{{ $labels.instance }}" }}"
+            description: >-
+              {{ "{{ $value | humanizePercentage }}" }} of the container's memory limit is charged to this
+              cgroup, page cache included. RSS will not show this: foyer's disk tier does buffered I/O
+              and page cache is charged to the cgroup that instantiated it. If the daemon is OOMKilled
+              the client sees IncompleteRead or EndpointConnectionError, never a memory error.
+            runbook_url: {{ $r.runbookUrl }}#budget-mismatch
+
+        # ANONYMOUS memory alone crowding the limit. `current - file` is the part no reclaim
+        # can free, so this firing means the page cache has nowhere left to live and the next
+        # buffered write goes straight into the limit — the shape rule 3 of
+        # docs/helm/memory-model.md describes, caught before the page cache pushes it over.
+        # `pacer_cgroup_memory_anon_bytes` reports the same quantity directly; the
+        # subtraction is used because it is derivable on any hierarchy that publishes the
+        # first two series, and because `file` is the term the operator then has to reason
+        # about.
+        - alert: PacerDaemonAnonymousMemoryNearLimit
+          expr: |
+            (pacer_cgroup_memory_current_bytes - pacer_cgroup_memory_file_bytes)
+              / pacer_cgroup_memory_max_bytes > {{ $r.anonRatio }}
+          for: {{ $r.anonFor }}
+          labels:
+            severity: warning
+            component: pacer-daemon
+            {{- with include "pacer.sessionLabels" . }}{{ . | nindent 12 }}{{- end }}
+          annotations:
+            summary: "pacer daemon unreclaimable memory above {{ $r.anonRatio }} of its limit on {{ "{{ $labels.instance }}" }}"
+            description: >-
+              Anonymous (unreclaimable) memory is {{ "{{ $value | humanizePercentage }}" }} of the limit, so
+              there is no headroom left for the page cache foyer's buffered disk tier will instantiate on
+              the next cold pass. A term the chart adds is probably under-sized, or the load is moving
+              more bytes than the limit was sized for.
+            runbook_url: {{ $r.runbookUrl }}#page-cache
+
+        # Reclaim FAILED under the limit. Counted BEFORE any kill and readable by a daemon
+        # still running, so this is the one alert that fires while there is still something to
+        # do about it. No `for:` clause on purpose — a single event is the signal.
+        - alert: PacerDaemonCgroupOom
+          expr: increase(pacer_cgroup_memory_oom_total[{{ $r.oomWindow }}]) > 0
+          labels:
+            severity: critical
+            component: pacer-daemon
+            {{- with include "pacer.sessionLabels" . }}{{ . | nindent 12 }}{{- end }}
+          annotations:
+            summary: "pacer daemon allocation failed under its cgroup limit on {{ "{{ $labels.instance }}" }}"
+            description: >-
+              memory.events oom increased: an allocation failed after reclaim, under this cgroup's own
+              limit. The kill has not necessarily happened yet. Read the three cgroup series together —
+              current, max and file — and follow the decision tree in the runbook.
+            runbook_url: {{ $r.runbookUrl }}
+
+        # A kill that did NOT end the container. `oom_kill` resets with the container's cgroup,
+        # so a surviving daemon reporting an increase is evidence of a task killed inside a pod
+        # that stayed up — which no restart count and no client symptom would show.
+        - alert: PacerDaemonOomKilled
+          expr: increase(pacer_cgroup_memory_oom_kill_total[{{ $r.oomWindow }}]) > 0
+          labels:
+            severity: critical
+            component: pacer-daemon
+            {{- with include "pacer.sessionLabels" . }}{{ . | nindent 12 }}{{- end }}
+          annotations:
+            summary: "pacer daemon OOM killer fired on {{ "{{ $labels.instance }}" }}"
+            description: >-
+              memory.events oom_kill increased: the kernel terminated a task in this cgroup. If the
+              container is still up, nothing in its restart count or its log records this.
+            runbook_url: {{ $r.runbookUrl }}
+
+        # The CONFIGURED budget against the limit — the one comparison none of the four above
+        # can make, because they MEASURE and this DECLARES. `pacer_memory_budget_total_bytes` is
+        # the enforced sum of the counted terms (`pacer_memory_budget_bytes{counted="true"}`,
+        # one series per term), i.e. exactly what the daemon's own startup check compares with
+        # memory.max (crates/pacer-daemon/src/memory_budget.rs). Plotted or alerted against
+        # `pacer_cgroup_memory_max_bytes` it separates "the configuration never fitted" from
+        # "the configuration fitted and something grew", which is what decides whether the fix
+        # is a values key or a code path.
+        #
+        # WHY THIS CAN FIRE AT ALL, given the daemon refuses to start when it is true. Three
+        # ways, and each is invisible otherwise:
+        #   * the limit was lowered UNDER a running pod — a `helm upgrade` that shrinks
+        #     resources.limits.memory rolls the DaemonSet, but a node still draining the old
+        #     pod, or a LimitRange/quota edit, changes memory.max without a restart;
+        #   * `config.memoryCheck: warn` — then the daemon logs the same verdict and starts
+        #     anyway, and this alert is the ONLY thing that says so afterwards;
+        #   * the two sides drifted — the daemon counts a term the chart's `pacer.memoryLimit`
+        #     does not add (or the reverse), which is the asymmetry that module's lockstep test
+        #     exists to prevent at build time and this catches in a live fleet.
+        # The headroom is the SAME fraction the startup check applies, resolved by
+        # pacer.memoryHeadroomFraction; see the note above that helper for why it has to be.
+        #
+        # Both edge cases in this file's header apply unchanged: an unlimited cgroup publishes
+        # +Inf and yields 0, and a container with no memory controller publishes 0 and yields
+        # NaN, which no comparison is true of.
+        - alert: PacerDaemonMemoryBudgetNearLimit
+          expr: |
+            pacer_memory_budget_total_bytes * (1 + {{ include "pacer.memoryHeadroomFraction" . }})
+              / pacer_cgroup_memory_max_bytes > {{ $r.budgetRatio }}
+          for: {{ $r.budgetFor }}
+          labels:
+            severity: warning
+            component: pacer-daemon
+            {{- with include "pacer.sessionLabels" . }}{{ . | nindent 12 }}{{- end }}
+          annotations:
+            summary: "pacer daemon's CONFIGURED memory budget is above {{ $r.budgetRatio }} of its cgroup limit on {{ "{{ $labels.instance }}" }}"
+            description: >-
+              The terms this daemon was configured to hold, plus the
+              {{ include "pacer.memoryHeadroomFraction" . }} headroom its own startup check applies, come to
+              {{ "{{ $value | humanizePercentage }}" }} of the cgroup limit in force. This is a statement about
+              the CONFIGURATION, not a measurement: nothing has necessarily grown, and the pod may be
+              serving perfectly. The daemon REFUSES TO START when this ratio reaches 1, so seeing it at
+              all means either the limit moved under a running pod, or config.memoryCheck is `warn`, or
+              the chart and the daemon disagree about which terms count. Compare
+              pacer_memory_budget_bytes term by term against what pacer.memoryLimit renders.
+            runbook_url: {{ $r.runbookUrl }}#budget-mismatch
+{{- end }}

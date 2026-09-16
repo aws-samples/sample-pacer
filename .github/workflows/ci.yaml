@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege for the whole workflow: nothing here writes to the repo. No job
+# pushes an image (the build step sets `push: false`), no job logs in to a
+# registry, and none touches releases or issues — only `release.yaml` needs
+# `packages: write`. Stated explicitly rather than inherited, because the default
+# for a repository can be read-write for every token (checkov CKV2_GHA_1).
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Every `uses:` below is pinned to an immutable commit SHA, and the trailing
+# comment names the EXACT release that SHA is (`# v4.4.0`, never a floating
+# `# v4`) so a reader can map pin → release without cloning anything. An action
+# tag is mutable: the owner can retarget `v4` at different code after you
+# reviewed it, which is how CVE-2025-30066 (tj-actions/changed-files, March
+# 2025) leaked secrets from ~23k repositories. A SHA cannot be retargeted.
+#
+# A pin must be the COMMIT, never the SHA of an annotated tag OBJECT. Both
+# resolve at run time (codeload serves a tarball for either), so this fails
+# silently in the only way that matters: `github.com/<repo>/commit/<tag-object>`
+# returns 404 and the REST API returns 422, leaving a pin no reviewer and no
+# scanner can resolve. Take the PEELED ref — `refs/tags/vX.Y.Z^{}` when it
+# exists, otherwise `refs/tags/vX.Y.Z`.
+#
+# Auditing a fork needs no Dependabot, Renovate, or any tooling — one command
+# per line answers "is this SHA really that release?":
+#
+#     git ls-remote https://github.com/actions/checkout \
+#         refs/tags/v4.4.0 'refs/tags/v4.4.0^{}'
+#
+# `scripts/ci/verify-action-pins` runs exactly that over both workflow files,
+# peels correctly, and exits non-zero on a mismatch, a vague comment, or a
+# tag-object pin. Bumping a pin = read the release notes, then paste the new
+# tag's peeled SHA and rewrite the comment to the new exact version.
+# Rationale and the threat it answers: threat-model.md, M-019 / T-012.
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      # The one exception to the exact-release rule above, and it cannot be
+      # fixed: dtolnay/rust-toolchain publishes on moving BRANCHES (`stable`),
+      # not version tags, so there is no release for this SHA to name and
+      # nothing for Dependabot to compare it against.
+      #
+      # And the SHA pins LESS than it looks like it does. It freezes the
+      # action's own code; it does NOT freeze Rust. The toolchain comes from the
+      # `toolchain` input, which defaults to `stable` and is resolved on the
+      # runner at job time — so this job compiles with whatever stable Rust
+      # exists the day it runs, and `clippy -D warnings` can go red with no
+      # commit to this repo behind it. That is not hypothetical: the 2026-08-24
+      # run failed on two lints a new stable had just added
+      # (`chunks_exact_to_as_chunks`, `result_large_err`), fixed afterwards in
+      # 46c3fab1 / ffa93322 / be551235.
+      #
+      # Kept floating on purpose — a new lint is worth learning about here
+      # rather than from a contributor's red PR — which makes this the one Rust
+      # surface that drifts: `.devcontainer`'s `FROM rust:<v>` and the two
+      # `ARG RUST_VERSION` pins are all exact. For a reproducible CI instead,
+      # add `toolchain: 1.NN.N` below and bump it deliberately.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # branch `stable` as of 2026-08-18
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        # Default features only. The `efa` feature links libibverbs/libfabric
+        # (installed by the aws-efa-installer, absent on stock GitHub runners),
+        # so `--all-features` is validated in the EFA build image / `make lint`,
+        # not here.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      # Installs helm `latest` (the action's default). That is Helm 4 today, matching the
+      # GitLab `helm` job's `alpine/helm:4`, but the action takes only `latest` or an exact
+      # version — it has no way to say "4.x" — so this is the one helm surface that will
+      # follow upstream across a future major. If Helm 5 lands and this job goes red while
+      # GitLab stays green, that asymmetry is why: pin `with: {version: v4.x.y}` here.
+      #
+      # Note the two unrelated fours: `# v4.3.1` is the version of the ACTION, which has
+      # nothing to do with which Helm it installs. The action's own v5 exists and is not a
+      # Helm-5 thing either.
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4  # v4.3.1
+      - name: lint + template
+        run: |
+          helm lint deploy/helm/pacer
+          helm template pacer deploy/helm/pacer > /dev/null
+          helm template pacer deploy/helm/pacer \
+            --set karpenter.enabled=true \
+            --set karpenter.zoneId=use1-az4 \
+            --set karpenter.clusterName=ci \
+            --set karpenter.role=ci-role \
+            --set efa.enabled=true > /dev/null
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      - name: build image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

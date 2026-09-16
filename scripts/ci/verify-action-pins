@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+#
+# Verify that every GitHub Actions pin in .github/workflows/ really is the
+# release its comment claims.
+#
+# WHY THIS EXISTS. Actions are pinned to immutable commit SHAs, because an
+# action tag is mutable — the owner can retarget `v4` at different code after
+# you reviewed it (CVE-2025-30066, tj-actions/changed-files, March 2025). The
+# cost of that safety is readability: a 40-hex SHA tells a reader nothing, so
+# each pin carries a `# vX.Y.Z` comment naming the exact release. A comment is
+# not checked by anything, so it can be wrong, stale, or vague — and a reviewer
+# auditing a fork has no way to tell without resolving all of them by hand.
+#
+# This script is that check, and it is the whole audit story for a fork with no
+# Dependabot or Renovate: it needs nothing but `git` and network access to
+# github.com, and it exits non-zero if any pin and its comment disagree.
+#
+#   scripts/ci/verify-action-pins            # check every workflow
+#   scripts/ci/verify-action-pins path.yaml  # check one file
+#
+# Deliberately NOT wired into ci.yaml: it reaches the network, so a github.com
+# hiccup would fail an unrelated pull request. Run it when bumping a pin, and
+# in a scheduled job if you want drift detection (a moved tag is a real signal).
+set -euo pipefail
+
+# Every pin lives in one of these; a workflow outside .github/workflows/ is not
+# a thing GitHub runs.
+readonly WORKFLOW_DIR=".github/workflows"
+
+# A pin comment is authoritative only if it names an exact release. A floating
+# major (`# v4`) is what this check exists to stamp out: it resolves to whatever
+# the alias tag points at today, so it cannot detect drift.
+readonly EXACT_VERSION_RE='^v?[0-9]+\.[0-9]+(\.[0-9]+)?$'
+
+# The one legitimate non-version pin: an action published on a moving branch
+# (dtolnay/rust-toolchain@stable) has no release for a SHA to name. Comments of
+# this shape are reported as unverifiable-by-design rather than failing.
+# shellcheck disable=SC2016  # the backticks are regex literals matching the
+# comment's own `branch \`stable\`` quoting, not a command substitution.
+readonly BRANCH_PIN_RE='^branch `[^`]+` as of [0-9]{4}-[0-9]{2}-[0-9]{2}$'
+
+# `uses: owner/repo@<40-hex> # <ref>` — the only pin form this repo allows.
+readonly PIN_RE='^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*([^/[:space:]]+/[^@[:space:]]+)@([0-9a-f]{40})[[:space:]]*#[[:space:]]*(.+)$'
+
+fail_count=0
+manual_count=0
+ok_count=0
+
+# Resolve a tag upstream, printing "<commit> <tag-object-or-empty>".
+# Returns 1 if the tag does not exist.
+#
+# An ANNOTATED tag yields two refs: `refs/tags/X` (the tag object) and
+# `refs/tags/X^{}` (the commit it wraps). Only the commit belongs in a `uses:`
+# pin. A tag-object SHA is a live trap, and this repo shipped two of them: the
+# workflow still runs (codeload serves a tarball for any object) but
+# `github.com/<repo>/commit/<sha>` returns 404 and the REST API returns 422, so
+# neither a reviewer nor a scanner can resolve the pin — which defeats the
+# entire point of pinning. Reported separately from a plain mismatch, because
+# the fix is different: swap in the peeled commit, don't bump the version.
+resolve_tag() {
+  local repo=$1 tag=$2 refs peeled direct
+  refs=$(git ls-remote "https://github.com/$repo" "refs/tags/$tag" "refs/tags/$tag^{}" 2>/dev/null) || return 1
+  [ -n "$refs" ] || return 1
+  peeled=$(printf '%s\n' "$refs" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')
+  direct=$(printf '%s\n' "$refs" | awk '$2 !~ /\^\{\}$/ {print $1; exit}')
+  if [ -n "$peeled" ]; then
+    printf '%s %s\n' "$peeled" "$direct"
+  else
+    printf '%s\n' "$direct"
+  fi
+}
+
+check_file() {
+  local file=$1 line action sha ref resolved commit tag_object
+  while IFS= read -r line; do
+    [[ "$line" =~ $PIN_RE ]] || continue
+    action="${BASH_REMATCH[2]}"
+    sha="${BASH_REMATCH[3]}"
+    ref="${BASH_REMATCH[4]}"
+    ref="${ref%"${ref##*[![:space:]]}"}" # strip trailing whitespace
+
+    if [[ "$ref" =~ $BRANCH_PIN_RE ]]; then
+      printf '  MANUAL  %-32s %s  (%s — no release to verify against)\n' \
+        "$action" "${sha:0:12}" "$ref"
+      manual_count=$((manual_count + 1))
+      continue
+    fi
+
+    if [[ ! "$ref" =~ $EXACT_VERSION_RE ]]; then
+      printf '  FAIL    %-32s %s  comment "%s" is not an exact release\n' \
+        "$action" "${sha:0:12}" "$ref"
+      printf '          a floating major or free-text comment cannot be verified; use vX.Y.Z\n'
+      fail_count=$((fail_count + 1))
+      continue
+    fi
+
+    if ! resolved=$(resolve_tag "$action" "$ref"); then
+      printf '  FAIL    %-32s %s  tag %s does not exist upstream\n' \
+        "$action" "${sha:0:12}" "$ref"
+      fail_count=$((fail_count + 1))
+      continue
+    fi
+    commit="${resolved%% *}"
+    tag_object=""
+    [ "$resolved" = "$commit" ] || tag_object="${resolved##* }"
+
+    if [ -n "$tag_object" ] && [ "$sha" = "$tag_object" ]; then
+      printf '  FAIL    %-32s %s  is the ANNOTATED TAG OBJECT of %s, not a commit\n' \
+        "$action" "${sha:0:12}" "$ref"
+      printf '          github.com/%s/commit/%s -> 404; pin the commit instead:\n' \
+        "$action" "${sha:0:12}"
+      printf '          %s\n' "$commit"
+      fail_count=$((fail_count + 1))
+      continue
+    fi
+
+    if [ "$commit" != "$sha" ]; then
+      printf '  FAIL    %-32s %s  != %s, which is %s\n' \
+        "$action" "${sha:0:12}" "${commit:0:12}" "$ref"
+      printf '          either the pin is not that release, or the tag moved\n'
+      fail_count=$((fail_count + 1))
+      continue
+    fi
+
+    printf '  ok      %-32s %s  %s\n' "$action" "${sha:0:12}" "$ref"
+    ok_count=$((ok_count + 1))
+  done <"$file"
+}
+
+main() {
+  local files=("$@")
+  if [ ${#files[@]} -eq 0 ]; then
+    # A repo with no workflows is a caller error, not a pass.
+    if ! compgen -G "$WORKFLOW_DIR/*.y*ml" >/dev/null; then
+      echo "no workflows found under $WORKFLOW_DIR — run from the repo root" >&2
+      exit 2
+    fi
+    files=("$WORKFLOW_DIR"/*.y*ml)
+  fi
+
+  for file in "${files[@]}"; do
+    echo "$file"
+    check_file "$file"
+  done
+
+  echo
+  printf 'verified %d, manual %d, failed %d\n' "$ok_count" "$manual_count" "$fail_count"
+  [ "$fail_count" -eq 0 ] || exit 1
+}
+
+main "$@"

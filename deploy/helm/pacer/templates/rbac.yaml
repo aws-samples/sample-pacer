@@ -1,0 +1,31 @@
+{{- if .Values.cluster.enabled }}
+# Membership watch: the daemon lists/watches the EndpointSlices of its own
+# peer Service (namespace-scoped, discovery API only — no pod/node access).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "pacer.fullname" . }}-membership
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pacer.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "pacer.fullname" . }}-membership
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pacer.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "pacer.fullname" . }}-membership
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pacer.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

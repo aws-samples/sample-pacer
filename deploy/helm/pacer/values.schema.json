@@ -1,0 +1,383 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PACER Helm chart values",
+  "description": "Validates deploy/helm/pacer/values.yaml and every -f overlay layered on it. additionalProperties is false at every chart-owned object level, so a mistyped key (config.chunkSiz) fails the render instead of being silently ignored. Byte-size strings use the pattern the chart's `pacer.toBytes` helper accepts: an INTEGER followed by Ki/Mi/Gi (k8s quantities) or KiB/MiB/GiB (the daemon's own config dialect), or a bare integer. Ti/T/G/M and fractional values are deliberately REJECTED — toBytes falls through to `int64` on them and silently yields 0, which is how a derived arena or cgroup limit becomes zero. Design notes for every key live in docs/helm/.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image", "ports", "cluster", "config", "resources", "efa", "delivery", "scatter"],
+  "definitions": {
+    "bytes": {
+      "description": "A byte size the chart parses with pacer.toBytes: <integer>[Ki|Mi|Gi|KiB|MiB|GiB], or a bare integer.",
+      "type": ["string", "integer"],
+      "pattern": "^[0-9]+(KiB|MiB|GiB|Ki|Mi|Gi)?$",
+      "minimum": 0
+    },
+    "bytesOrEmpty": {
+      "description": "As `bytes`, but the empty string / null means \"let the daemon or the chart derive it\".",
+      "type": ["string", "integer", "null"],
+      "pattern": "^$|^[0-9]+(KiB|MiB|GiB|Ki|Mi|Gi)?$",
+      "minimum": 0
+    },
+    "intOrEmpty": {
+      "description": "A non-negative integer, or the empty string / null for \"the daemon's own default\".",
+      "type": ["string", "integer", "null"],
+      "pattern": "^$|^[0-9]+$",
+      "minimum": 0
+    },
+    "labelSelector": {
+      "description": "A Kubernetes LabelSelector. Left open: the API server owns its shape.",
+      "type": "object"
+    },
+    "networkPolicyPeer": {
+      "description": "One NetworkPolicyPeer. Two selectors in ONE entry mean AND; two entries mean OR.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "podSelector": { "$ref": "#/definitions/labelSelector" },
+        "namespaceSelector": { "$ref": "#/definitions/labelSelector" },
+        "ipBlock": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cidr": { "type": "string", "pattern": "^[0-9a-fA-F.:]+/[0-9]{1,3}$" },
+            "except": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-fA-F.:]+/[0-9]{1,3}$" } }
+          },
+          "required": ["cidr"]
+        }
+      }
+    },
+    "duration": {
+      "description": "A Prometheus duration: <integer><unit>, unit one of ms s m h d w y.",
+      "type": "string",
+      "pattern": "^[0-9]+(ms|s|m|h|d|w|y)$"
+    },
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  },
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository"],
+      "properties": {
+        "repository": { "description": "Image repository. Default is the public GHCR multi-arch image.", "type": "string", "minLength": 1 },
+        "tag": { "description": "Image tag; empty means Chart.appVersion.", "type": "string" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] },
+        "pullSecrets": { "description": "Names of existing docker-registry secrets. Empty is correct for ECR pulled via the node IAM role.", "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "ports": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["s3", "admin", "peer"],
+      "properties": {
+        "s3": { "description": "S3 API port clients point at.", "type": "integer", "minimum": 1, "maximum": 65535 },
+        "admin": { "description": "Admin port: probes + /metrics.", "type": "integer", "minimum": 1, "maximum": 65535 },
+        "peer": { "description": "Peer gRPC data/control plane.", "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "cluster": {
+      "description": "Cluster cache tier and the EFA-RDMA transport shape. See docs/helm/efa-and-rdma.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "channelCapacity": { "description": "Chunks buffered per peer blob stream. Small on purpose.", "type": "integer", "minimum": 1 },
+        "h2StreamWindow": { "$ref": "#/definitions/bytesOrEmpty" },
+        "h2ConnectionWindow": { "$ref": "#/definitions/bytesOrEmpty" },
+        "peerConnections": { "description": "HTTP/2 connections dialled per peer. Empty = daemon default 1 (one TCP flow, one framing task, per peer). Refused above 32.", "type": ["string", "integer", "null"], "pattern": "^$|^[0-9]+$", "minimum": 1, "maximum": 32 },
+        "replicationR": { "description": "Co-home count R (ADR-0016). Empty = daemon default 2. 1 forces a single-home split.", "type": ["string", "integer", "null"], "pattern": "^$|^[0-9]+$", "minimum": 1 },
+        "localAdmissionThreshold": { "$ref": "#/definitions/intOrEmpty" },
+        "rdmaArenaBytes": { "$ref": "#/definitions/bytesOrEmpty" },
+        "cacheSlabBytes": { "$ref": "#/definitions/bytesOrEmpty" },
+        "rdmaRailWindow": { "$ref": "#/definitions/intOrEmpty" },
+        "rdmaAffinity": { "description": "Empty = on. false reproduces the pre-D5 daemon (a control arm, not a tuning knob).", "type": ["boolean", "string", "null"], "pattern": "^$|^(true|false)$" },
+        "efaRails": { "$ref": "#/definitions/intOrEmpty" },
+        "efaQpsPerRail": { "$ref": "#/definitions/intOrEmpty" }
+      }
+    },
+    "config": {
+      "description": "Rendered into the daemon's config file (ADR-0013). See docs/helm/cache-and-disk-tier.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backendType", "cacheDir", "memCapacity", "diskCapacity", "blockSize", "minObjectSize", "ioEngine", "logLevel"],
+      "properties": {
+        "backendType": { "description": "ADR-0023: chosen explicitly, never sniffed from the bucket name.", "type": "string", "enum": ["express", "standard"] },
+        "s3Endpoint": { "description": "Zonal (Express) or regional endpoint; empty = default resolution.", "type": "string", "pattern": "^$|^https?://[^\\s]+$" },
+        "forcePathStyle": { "type": "boolean" },
+        "awsRegion": { "description": "Empty = ambient resolution. Required in-cluster where pods cannot reach IMDS.", "type": "string", "pattern": "^$|^[a-z]{2}(-[a-z]+)+-[0-9]$" },
+        "bucketMap": { "description": "alias -> real bucket. A MAP, never the daemon's `alias=real,...` env string.", "$ref": "#/definitions/stringMap" },
+        "cacheDir": { "type": "string", "pattern": "^/.+" },
+        "memCapacity": { "$ref": "#/definitions/bytes" },
+        "diskCapacity": { "$ref": "#/definitions/bytes" },
+        "minObjectSize": { "$ref": "#/definitions/bytes" },
+        "maxObjectSize": { "description": "Optional whole-object admission cap (ADR-0015). Unset = unbounded.", "$ref": "#/definitions/bytesOrEmpty" },
+        "chunkSize": { "description": "Unit of placement/fetch/invalidation (ADR-0015). Empty = daemon default 16MiB. Changing it orphans existing entries.", "$ref": "#/definitions/bytesOrEmpty" },
+        "blockSize": { "$ref": "#/definitions/bytes" },
+        "flushBufferSize": { "description": "Empty = daemon auto-sizes to 2x blockSize. Entries larger than this are SILENTLY DROPPED on demotion.", "$ref": "#/definitions/bytesOrEmpty" },
+        "ioEngine": { "type": "string", "enum": ["psync", "uring"] },
+        "uring": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "threads": { "type": "integer", "minimum": 1 },
+            "ioDepth": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "tuning": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "flushers": { "description": "0/empty = foyer's own default (1). Also the number of io_uring shards a sequential read spreads over.", "type": "integer", "minimum": 0 },
+            "reclaimers": { "type": "integer", "minimum": 0 },
+            "submitQueueThreshold": { "description": "Empty = DERIVED as flushers x chunkSize x 4. 0 = foyer's own 16MiB, which silently drops demotions at any production chunk size.", "$ref": "#/definitions/bytesOrEmpty" },
+            "storageRuntimeThreads": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "promotion": { "description": "Empty = on-disk-hit (foyer's behaviour). `never` also gives up single-flight coalescing.", "type": ["string", "null"], "enum": ["", "on-disk-hit", "never", null] },
+        "diskTier": { "description": "ADR-0033. Empty = foyer, i.e. exactly what the daemon did before ADR-0033.", "type": ["string", "null"], "enum": ["", "foyer", "store", null] },
+        "verifyChunkBody": { "type": "boolean" },
+        "conditionalGetFromCache": { "description": "ADR-0039. Whether an `If-Match` GET may be served from cache when the ETag the client named equals the one this node resolved. Default true, because Mountpoint-for-S3 sends `If-Match` on every GET and so measures a 0 % hit rate with it off. A mismatch always passes through — never a 412 — so this can only cost the optimisation. False restores strict conditional semantics, in which the precondition is always judged by S3 against its current state.", "type": "boolean" },
+        "storeReadConcurrency": { "description": "Chunk reads in flight against the ADR-0033 store, node-wide. Empty or 0 = the daemon's measured default (16, the knee: 48.7 GiB/s at depth 16 against 43.1 at 48). `unlimited` is the pre-ceiling behaviour and has to be named, because 0 means 'the default' on every other numeric knob here and a config that wrote 0 meaning 'no limit' would get the opposite.", "type": ["string", "integer", "null"], "pattern": "^$|^unlimited$|^[0-9]+$", "minimum": 0 },
+        "storeReadShape": { "description": "ADR-0033. Empty = two-read, the shape every measurement through 2026-09-10 used. `overlap` issues the header and body reads together; measured a NULL on a p5 (43.03 vs 43.06 GiB/s), kept so the question stays answerable.", "type": ["string", "null"], "enum": ["", "two-read", "overlap", null] },
+        "workerThreads": { "type": "integer", "minimum": 0 },
+        "rdmaWorkerThreads": { "type": "integer", "minimum": 0 },
+        "memoryCheck": { "description": "What the daemon does at startup when the terms pacer.memoryLimit sums do not fit its own cgroup limit. See docs/helm/memory-model.md and crates/pacer-daemon/src/memory_budget.rs.", "type": "string", "enum": ["enforce", "warn"] },
+        "memoryHeadroomFraction": { "description": "Fraction of that limit left for page cache and the delivery working set, the two terms no template can compute. Empty = 0.10, which is an UPPER bound: past ~0.167 the check refuses this chart's own efa+delivery render.", "type": ["string", "number", "null"], "pattern": "^$|^0(\\.[0-9]+)?$" },
+        "logLevel": { "description": "Rendered as RUST_LOG. A targeted directive (`pacer=debug,info`) belongs in extraEnv, not here.", "type": "string", "enum": ["trace", "debug", "info", "warn", "error", "off"] },
+        "logFormat": { "description": "ADR-0036 log ENCODING, not the filter (that is logLevel above). json keeps `kubectl logs | jq` and any log pipeline working; text is for a human tailing a pod.", "type": "string", "enum": ["json", "text"] },
+        "s3MaxConnections": { "description": "ADR-0036: concurrent S3 connections held open. 0 = the daemon default (1024, derived from 8 ranks x 64 pooled connections per node). At the cap the daemon stops ACCEPTING rather than failing a request, so too low reads as slow connects — watch pacer_s3_connections_at_capacity_total. The maximum is a typo guard (an extra zero), not a tuning range: it sits above any node's practical descriptor budget.", "type": "integer", "minimum": 0, "maximum": 65535 },
+        "s3HeaderTimeoutSecs": { "description": "ADR-0036: seconds a connection may go without a complete request head, which hyper re-arms between keep-alive requests and so is also how long an idle connection is kept. 0 = the daemon default (120). Capped at an hour because past that it no longer bounds the slow-header client it exists for.", "type": "integer", "minimum": 0, "maximum": 3600 },
+        "s3IdleTimeoutSecs": { "description": "ADR-0036: seconds a connection may go with no byte moving in EITHER direction — a stalled upload or an unread response, which the header deadline cannot see. Resets on activity, so it never cuts a slow-but-moving transfer. 0 = the daemon default (300). Capped at an hour for the same reason as the header deadline.", "type": "integer", "minimum": 0, "maximum": 3600 },
+        "shutdownDrainTimeoutSecs": { "description": "ADR-0036: seconds in-flight requests may finish after SIGTERM. 0 = the daemon default (20). MUST stay below terminationGracePeriodSeconds or the kubelet SIGKILLs mid-drain — pacer.validateGracePeriod compares against THIS value when it is non-zero. Capped at five minutes: beyond that a node's own rollout stalls longer than the restore the drain protects.", "type": "integer", "minimum": 0, "maximum": 300 }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "description": "false + name: pacer is what every dev/bench overlay needs — a Pod Identity association names exactly one (namespace, serviceAccount) pair.", "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "$ref": "#/definitions/stringMap" }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "internalTrafficPolicy": { "description": "Local = kube-proxy only routes to endpoints on the same node.", "type": "string", "enum": ["Local", "Cluster"] }
+      }
+    },
+    "networkPolicy": {
+      "description": "ADR-0006's authorization boundary. See docs/helm/network-policy.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "clients": { "description": "Who may reach :9000. An EMPTY list DENIES the port; the chart refuses to render it.", "type": "array", "items": { "$ref": "#/definitions/networkPolicyPeer" } },
+        "probeCidrs": { "description": "The only entry that can admit the kubelet's probes. Empty DENIES :9090 and CrashLoops the DaemonSet.", "type": "array", "items": { "type": "string", "pattern": "^[0-9a-fA-F.:]+/[0-9]{1,3}$" } },
+        "metrics": { "description": "Pods allowed to reach :9090 beyond probeCidrs. May be empty.", "type": "array", "items": { "$ref": "#/definitions/networkPolicyPeer" } },
+        "extraIngress": { "description": "Appended verbatim. A NetworkPolicy's rules are a UNION, so this can only widen reachability.", "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hostPath": { "description": "A dedicated SUBDIRECTORY of the NVMe array, never the array root — see docs/helm/cache-and-disk-tier.md for the 2026-08-04 containerd wipe.", "type": "string", "pattern": "^/.+" }
+      }
+    },
+    "resources": {
+      "description": "limits.memory is a BUDGET, not the container's limit: pacer.memoryLimit adds the terms config.memCapacity cannot see. Read docs/helm/memory-model.md before raising memCapacity.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cpu": { "type": ["string", "integer", "number"], "pattern": "^([0-9]+(\\.[0-9]+)?|[0-9]+m)$" },
+            "memory": { "$ref": "#/definitions/bytes" },
+            "ephemeral-storage": { "$ref": "#/definitions/bytes" }
+          }
+        },
+        "limits": {
+          "description": "No cpu key by default: the daemon runs Burstable on purpose (ADR-0035). memory is parsed by pacer.toBytes, so its dialect is stricter than a raw k8s quantity.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["memory"],
+          "properties": {
+            "cpu": { "type": ["string", "integer", "number"], "pattern": "^([0-9]+(\\.[0-9]+)?|[0-9]+m)$" },
+            "memory": { "$ref": "#/definitions/bytes" },
+            "ephemeral-storage": { "$ref": "#/definitions/bytes" }
+          }
+        }
+      }
+    },
+    "nodeSelector": {
+      "description": "Values may be null: pacer.nodeSelector skips null entries, because Helm's `key: null` deletion works only against chart DEFAULTS and not between -f overlays.",
+      "type": "object",
+      "additionalProperties": { "type": ["string", "null"] }
+    },
+    "session": {
+      "description": "Session isolation (ADR-0029). A production install leaves id empty. See docs/helm/scheduling.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "requireClaimedNodes": { "type": "boolean" },
+        "exclusiveNodes": { "type": "boolean" }
+      }
+    },
+    "tolerations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key": { "type": "string" },
+          "operator": { "type": "string", "enum": ["Exists", "Equal"] },
+          "value": { "type": "string" },
+          "effect": { "type": "string", "enum": ["NoSchedule", "PreferNoSchedule", "NoExecute", ""] },
+          "tolerationSeconds": { "type": ["integer", "null"], "minimum": 0 }
+        }
+      }
+    },
+    "priorityClassName": { "description": "system-node-critical by default: a preemption that evicts the cache turns every co-located client's reads into backend round-trips.", "type": "string" },
+    "terminationGracePeriodSeconds": {
+      "description": "Must exceed the daemon's SIGTERM drain deadline (20 s) or the kubelet SIGKILLs mid-drain and the in-flight requests the drain exists to finish are lost anyway. 30 = the drain plus room for listener shutdown and a final metrics scrape. pacer.validateGracePeriod in templates/_validate.tpl enforces the same relationship for a --skip-schema-validation render.",
+      "type": "integer",
+      "exclusiveMinimum": 20
+    },
+    "podDisruptionBudget": {
+      "description": "See docs/helm/scheduling.md#poddisruptionbudget for what it does and does not protect.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "maxUnavailable": { "description": "1 matches the DaemonSet's own updateStrategy: a cache-tier restart is a cold cache on that node.", "type": ["integer", "string"], "pattern": "^([0-9]|[1-9][0-9]|100)%$", "minimum": 1 },
+        "annotations": { "$ref": "#/definitions/stringMap" }
+      }
+    },
+    "monitoring": {
+      "description": "See docs/helm/monitoring.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prometheusRule": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "description": "Off by default: monitoring.coreos.com/v1 may not be installed, and a chart that renders a CRD nobody registered fails the whole install.", "type": "boolean" },
+            "labels": { "description": "Merged onto the PrometheusRule's metadata. A Prometheus Operator ruleSelector usually needs one.", "$ref": "#/definitions/stringMap" },
+            "annotations": { "$ref": "#/definitions/stringMap" },
+            "runbookUrl": { "description": "Emitted as the runbook_url annotation on every alert, with a per-alert #anchor appended.", "type": "string", "minLength": 1 },
+            "memoryRatio": { "description": "current/max above this fires PacerDaemonMemoryNearLimit.", "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+            "memoryFor": { "$ref": "#/definitions/duration" },
+            "anonRatio": { "description": "(current - file)/max above this fires PacerDaemonAnonymousMemoryNearLimit: anonymous memory alone is crowding the limit, so no page-cache reclaim can save the pod.", "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+            "anonFor": { "$ref": "#/definitions/duration" },
+            "oomWindow": { "description": "increase() range for the two OOM counters. Not a `for:` duration — a single reclaim failure must page immediately.", "$ref": "#/definitions/duration" },
+            "budgetRatio": { "description": "CONFIGURED budget total x (1 + config.memoryHeadroomFraction) over the cgroup limit above this fires PacerDaemonMemoryBudgetNearLimit. A statement about the configuration, not a measurement: at 1.0 the daemon refuses to start, so the useful range is just below it.", "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+            "budgetFor": { "$ref": "#/definitions/duration" }
+          }
+        }
+      }
+    },
+    "allocator": {
+      "description": "glibc bounds, rendered as MALLOC_* env because the daemon does not own those names. See docs/helm/memory-model.md#rule-4--the-allocator-floor-which-is-a-term-and-not-a-leak.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "arenaMax": { "description": "0/empty = glibc's own 8 x ncores (1536 arenas on a p5.48xlarge), each retaining its own free lists.", "$ref": "#/definitions/intOrEmpty" },
+        "trimThreshold": { "description": "Empty = glibc's dynamic behaviour. Off by default: setting it pins the mmap threshold, putting every 16 MiB chunk body through an mmap/munmap pair for an unmeasured cost.", "$ref": "#/definitions/bytesOrEmpty" }
+      }
+    },
+    "extraEnv": {
+      "description": "Appended LAST, so it wins over everything the chart renders. PACER_* knobs belong in `config` (checksummed into a pod roll), not here. Left open: this is a passthrough of Kubernetes EnvVar.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": { "name": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "devMode": {
+      "description": "Never enable in a real deployment. See docs/helm/scheduling.md#devmode.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": { "description": "Empty = the release image, which is the only default that can work: the pushed binary needs glibc and, under --features efa, libibverbs.", "type": "string" }
+      }
+    },
+    "efa": {
+      "description": "Phase 3 EFA-RDMA path. See docs/helm/efa-and-rdma.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "pinnedPoolReservation"],
+      "properties": {
+        "enabled": { "description": "Requests an EFA device, which makes the pod unschedulable on non-EFA nodes — which is why it cannot be a universal chart default.", "type": "boolean" },
+        "resourceName": { "type": "string", "minLength": 1 },
+        "count": { "type": "integer", "minimum": 1 },
+        "ipcLock": { "type": "boolean" },
+        "shareHostDevices": { "description": "Mounts /dev/infiniband instead of requesting a unit (ADR-0030 point 9). NOT sufficient by itself — the device cgroup still denies the open.", "type": "boolean" },
+        "privileged": { "description": "The supported production mechanism for reaching a device the pod was not allocated. Off by default: a chart must never silently escalate its own privileges.", "type": "boolean" },
+        "hugepages": { "description": "Empty/0 = no hugepages request. Setting it also turns ADR-0028's cache slab on, so it must cover rdmaArenaBytes + 256 x chunkSize + the slab.", "$ref": "#/definitions/bytesOrEmpty" },
+        "hugepageSizeMib": { "description": "Hugepage SIZE in MiB, deciding both the pod resource name (hugepages-2Mi / hugepages-1Gi) and the daemon's rdma-arena-page-mib. Only 2 and 1024 are encodable by MAP_HUGE_SHIFT; ArenaPages::from_mib turns anything else into BASE pages while the pod still holds the reservation, so the enum is what keeps that silent downgrade unreachable. The node must reserve THIS size at boot.", "enum": [2, 1024] },
+        "pinnedPoolReservation": { "description": "The two registered arenas, ADDED to the container memory limit. Must cover cluster.rdmaArenaBytes + 256 x config.chunkSize.", "$ref": "#/definitions/bytes" }
+      }
+    },
+    "delivery": {
+      "description": "Delivery into client-supplied memory (ADR-0026/0027/0030). See docs/helm/delivery.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "pinnedReservation"],
+      "properties": {
+        "enabled": { "description": "ON by default. A client that sends no x-pacer-target header is served exactly as before, so this cannot change an existing workload; the cost is the memory limit, since pinnedReservation and the derived working set are ADDED to it. Set false to get those bytes back.", "type": "boolean" },
+        "sharedShm": { "description": "ON with `enabled`, and the volume is mounted only when BOTH are: without the node's own tmpfs a shm: target can never resolve a client's segment, leaving only nic:.", "type": "boolean" },
+        "shmHostPath": { "description": "hostPath, never an emptyDir — an emptyDir is created per POD and can never be shared with the client.", "type": "string", "pattern": "^/.+" },
+        "shmDir": { "description": "Where shm:/name resolves inside the daemon. Empty = /dev/shm. The mount path follows this value, so the two cannot drift.", "type": ["string", "null"], "pattern": "^$|^/.+" },
+        "maxTargetBytes": { "description": "Per-request ceiling. 4Gi rather than the daemon's 1GiB because a 70B embedding is one 1.957 GiB tensor. Above pinnedBytesMax it FAILS the render.", "$ref": "#/definitions/bytesOrEmpty" },
+        "pinnedBytesMax": { "description": "Node-wide ceiling on concurrently pinned client memory. Empty = daemon default 8Gi.", "$ref": "#/definitions/bytesOrEmpty" },
+        "remoteWrite": { "description": "Let a chunk holder RDMA-WRITE directly into the reading client's registered memory. Off by default so the fallback path is the default path — the off path is exactly the on path's per-chunk fallback.", "type": "boolean" },
+        "parallelism": { "description": "Windows delivered concurrently per GET. Empty = daemon default 64. NOT config.fillParallelism.", "$ref": "#/definitions/intOrEmpty" },
+        "pinnedReservation": { "description": "Client-pinned pages ADDED to the container memory limit. Below pinnedBytesMax it FAILS the render.", "$ref": "#/definitions/bytes" },
+        "workingSetReservation": { "description": "The delivery path's OWN in-flight bodies. Empty = DERIVED as parallelism x chunkSize, which is a FLOOR and not the measured working set. 0 = add nothing (a control arm).", "$ref": "#/definitions/bytesOrEmpty" }
+      }
+    },
+    "scatter": {
+      "description": "Write scatter (ADR-0032). See docs/helm/write-scatter.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "description": "THREE-state. null (default) = on for `standard`, off for `express`. An explicit true on express FAILS the render. Truthiness mirrors the daemon: only 1/true/on/yes count.", "type": ["boolean", "string", "integer", "null"], "pattern": "^$|^([Tt]rue|[Ff]alse|[Oo]n|[Oo]ff|[Yy]es|[Nn]o|1|0)$", "minimum": 0, "maximum": 1 },
+        "stagingBytes": { "description": "Bytes this node holds for OTHER nodes between their UploadPart and the coordinator's commit. Empty = daemon default 2GiB, which the chart then emits explicitly so budget and enforcement cannot drift.", "$ref": "#/definitions/bytesOrEmpty" },
+        "stagingTtlSecs": { "$ref": "#/definitions/intOrEmpty" },
+        "windowsInFlight": { "description": "A real node-wide byte bound (x chunkSize) as of ebe07c07. Empty/0 = daemon default 16. Not a throughput lever: 16 -> 32 measured flat.", "$ref": "#/definitions/intOrEmpty" },
+        "coordinatorConcurrency": { "description": "nil, \"\" and 0 all mean ONE PUT — a concurrency of zero is not a control arm, it is a term of zero multiplying the footprint away. coordinatorReservation: 0 is the control arm.", "$ref": "#/definitions/intOrEmpty" },
+        "coordinatorObjectBytes": { "description": "Empty = fall back to windowsInFlight x chunkSize, which since ebe07c07 is what the semaphore actually bounds.", "$ref": "#/definitions/bytesOrEmpty" },
+        "coordinatorReservation": { "description": "State the coordinator's footprint yourself. 0 = add nothing, i.e. the pre-2026-08-27 arithmetic, for a control arm.", "$ref": "#/definitions/bytesOrEmpty" },
+        "minObjectBytes": { "description": "Empty = daemon default 128MiB. Confines the composite-ETag change to objects big enough for a parallel upload to pay for it.", "$ref": "#/definitions/bytesOrEmpty" },
+        "saturatedCooldownSecs": { "$ref": "#/definitions/intOrEmpty" }
+      }
+    },
+    "karpenter": {
+      "description": "Requires Karpenter v1 CRDs. See docs/helm/scheduling.md#karpenter.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "zoneId": { "description": "AZ ID, NOT an AZ name — names shuffle per account, the bucket lives in an ID (use1-az4, aps1-az2).", "type": "string", "pattern": "^$|^[a-z]{3,5}[0-9]-az[0-9]+$" },
+        "amiFamily": { "type": "string", "enum": ["AL2023", "AL2", "Bottlerocket", "Ubuntu", "Custom"] },
+        "clusterName": { "type": "string" },
+        "role": { "type": "string" },
+        "instanceFamilies": { "description": "Nitro v4+ only (ADR-0004): g5/c5n would silently degrade to gRPC.", "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    }
+  }
+}

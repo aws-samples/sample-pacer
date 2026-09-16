@@ -77,7 +77,7 @@ jobs:
     # see the buildkitd sidecar's unix socket; the steps must run directly in
     # the runner container, where the socket and its env are mounted.
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # Fail fast if the scheduler put this job on the wrong architecture — an
       # unpinned self-hosted pool with mixed nodes would otherwise ship a
       # cross-labeled binary (the build is native by design, never emulated).
@@ -96,11 +96,11 @@ jobs:
       # (e.g. tcp://localhost:1234): with a remote driver the build executes
       # inside buildkitd, so a shared off-node buildkitd would silently decide
       # the build's architecture regardless of the runner the job landed on.
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
         with:
           driver: ${{ vars.BUILDKIT_ENDPOINT && 'remote' || 'docker-container' }}
           endpoint: ${{ vars.BUILDKIT_ENDPOINT || '' }}
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -117,7 +117,7 @@ jobs:
       # `platforms` is single-arch and matches the asserted runner arch — the
       # matrix builds natively on two pinned runner sets, never emulates.
       - name: build + push EFA builder image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
           file: ci/Dockerfile.efa-builder
@@ -140,7 +140,7 @@ jobs:
       # is also the release's native test pass on each arch (the push-CI
       # `rust` job tests default features on amd64 only).
       - name: build + push arch image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
           file: ci/Dockerfile.release
@@ -180,7 +180,7 @@ jobs:
     needs: scan
     runs-on: ubuntu-24.04
     steps:
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -196,8 +196,8 @@ jobs:
     needs: manifest
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4  # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
       - name: package + push chart
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" \

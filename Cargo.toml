@@ -74,7 +74,7 @@ hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 tonic = "0.12"
 tonic-build = "0.12"
-prost = "0.13"
+prost = "0.14"
 protoc-bin-vendored = "3"
 bytes = "1"
 # `mmap`/`munmap` for the EFA arena's own hugepage mapping (ADR-0024) and for

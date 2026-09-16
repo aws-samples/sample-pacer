@@ -1,0 +1,232 @@
+# syntax=docker/dockerfile:1
+# EFA build environment for the daemon's `--features efa` path (Phase 3 A2,
+# planning/11 item #4). CI builds this once per arch and pushes it; the
+# `rust-efa`, `build-binary`, and `functional` jobs run FROM it.
+#
+# Why a dedicated image (not dnf install in each job): building `--features efa`
+# links the git-pinned jonhoo/ibverbs, whose `ibverbs-sys` build.rs VENDORS
+# rdma-core and builds it from source (cmake + bindgen) and emits `-libverbs
+# -lefa`. So the build env needs a C/cmake/libclang toolchain AND the EFA
+# userspace libraries present — none of which ship in a bare Rust image.
+# The resulting `pacer-daemon` binary also *dynamically* links libefa.so.1 /
+# libibverbs.so.1, so it needs those libs merely to load (the runtime probe
+# handles device absence, not library absence) — which is why `functional`,
+# which boots the raw binary, runs FROM here too.
+#
+# This image is the SINGLE SOURCE OF TRUTH for the EFA userspace version. The
+# runtime image copies out only the .so subset the binary's `ldd` actually
+# resolves (see Dockerfile.runtime + the ldd tripwire in build-binary), so the
+# shipped image stays minimal even though this build image is fat.
+#
+# Base: Amazon Linux 2023, not Debian. Two reasons: (1) bosco/non-ecr-docker-
+# image (internal security review) requires images pulled from an internal-or-
+# ECR-Public source, and there is no ECR Public mirror of Docker Hub's `rust`
+# image family's OS base beyond `library/rust` itself, which IS mirrored — but
+# (2) the runtime stage (Dockerfile.runtime) has no ECR Public distroless
+# equivalent at all (confirmed: gcr.io/distroless has no public.ecr.aws
+# mirror), so the runtime moved to AL2023-minimal instead. Builder and runtime
+# must share ONE glibc family or the binary's dynamic symbol versions won't
+# resolve at load time — so the builder moved to AL2023 too, matching the
+# pattern awslabs/mountpoint-s3 uses for the same class of problem (a Rust
+# binary linking native C libs, shipped as a container image).
+#
+# Pinned to an IMMUTABLE dated release, not the floating `:2023` tag, which AL
+# updates in place (unreproducible builds). BUMP THIS IN LOCKSTEP with the
+# runtime pin in Dockerfile.runtime / ci/Dockerfile.release: the binary must be
+# linked against the same glibc it runs on. At this pin builder and -minimal both
+# carry glibc 2.34-231.amzn2023.0.5 on amd64 and arm64 — and so did the pin
+# before it, so this bump moves no ABI.
+#
+# Read that off the candidate BEFORE bumping, rather than waiting for a pipeline
+# to fail at load time. The base image's own package list has it, from the
+# registry manifest, so nothing has to run and no cross-arch image is emulated:
+#   trivy image --platform linux/<arch> --scanners vuln --ignore-unfixed \
+#     --list-all-pkgs -f json public.ecr.aws/amazonlinux/amazonlinux:<tag>
+# over the four images this set pins — (bare, -minimal) x (amd64, arm64) — and
+# the same output answers the question a bump is usually FOR, since an empty
+# HIGH/CRITICAL list under `--ignore-unfixed` is exactly the `scan-image` gate.
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260914.0
+# checkov:skip=CKV_DOCKER_2:A builder image is never run as a service — it is the
+# `FROM` of a build stage and its containers exist only for the length of a
+# `cargo build`. There is nothing for a HEALTHCHECK to report to.
+# checkov:skip=CKV_DOCKER_3:This image's whole job is to install RPMs, the
+# aws-efa-installer and a Rust toolchain, which needs root. It ships no service
+# and is never deployed; the images built FROM it drop to USER 65532:65532, which
+# is the user that matters. Adding an unprivileged USER here would break the
+# builder without changing what runs in the cluster.
+
+# --- build toolchain for ibverbs-sys ---
+# ibverbs-sys VENDORS rdma-core and builds it with cmake, then runs bindgen over
+# its headers. Needs: cmake + a C toolchain (build rdma-core), libclang
+# (bindgen), pkg-config, and rdma-core's own deps — libnl3 headers and python3
+# (its cmake build shells out to python). Keep the dnf cache: the aws-efa-
+# installer (next RUN) runs its OWN dnf for third-party deps, which fails if we
+# purge the cache first. Cleanup happens after the installer.
+# --allowerasing: the AL2023 base image ships curl-minimal, which conflicts
+# with the full curl package pulled in transitively here. util-linux: provides
+# `getopt`, which efa_installer.sh shells out to for arg parsing and which
+# AL2023-minimal does not carry by default (unlike Debian's util-linux-derived
+# base).
+RUN dnf install -y --allowerasing \
+        cmake clang clang-devel pkgconf-pkg-config \
+        libnl3-devel python3 \
+        gcc gcc-c++ \
+        curl ca-certificates tar gzip util-linux
+
+# --- Rust toolchain (rustup) ---
+# No official Rust image for Amazon Linux, so bootstrap the same way
+# awslabs/mountpoint-s3's dev-container does: rustup over dnf-installed system
+# deps. Pinned to the same version the rest of the workspace builds with
+# (previously carried implicitly by the `rust:1.96-bookworm` tag).
+ARG RUST_VERSION=1.96.0
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup component add rustfmt clippy
+
+# --- test runner + linker (quality item L2) ----------------------------------
+# Two tools every job that runs FROM this image uses, baked here rather than
+# downloaded per job: `.gitlab-ci.yml`'s cache is `policy: pull` on branches, so
+# a `before_script` download is paid by every pipeline on every arch, and an
+# unpinned one is a supply-chain hole in the build environment of a shipped
+# binary. Both are single static binaries fetched by release URL and checked
+# against a recorded sha256 — the same contract `.ecr-login` and the
+# aws-efa-installer above follow, one step stricter.
+#
+# cargo-nextest: `cargo test` runs one test BINARY at a time (parallel only
+# WITHIN a binary), and this workspace has one that is minutes of tests alone
+# (crates/pacer-daemon/tests/daemon.rs), so everything else waits behind it. nextest
+# runs every test in its own process across all binaries at once: measured warm in
+# a 16-vCPU build pod on 2026-09-08, 368 tests, 48.8 s -> 26.8 s (1.82x). It also
+# emits JUnit, which is what puts failing test NAMES in the pipeline UI instead of
+# only in a job log. It does NOT run doctests — this workspace has zero Rust
+# doctests (all 10 fenced doc blocks are ```text/```c), and the `--doc` line in
+# `.gitlab-ci.yml` stays as the tripwire for the first real one.
+#
+# mold: the linker. NOT because GNU ld was in the way — rustc 1.96 already
+# defaults to its own bundled rust-lld on x86_64-unknown-linux-gnu, which is
+# 1.5x cheaper than bfd — but because mold beats THAT: 47.9 s vs 72.4 s of CPU
+# for one warm workspace relink of all 23 test binaries (medians of 7 and 8
+# alternating samples, no overlap between the distributions; ci/README.md has the
+# table and the wall-clock caveat). Selected per job by RUSTFLAGS, not by a
+# committed `.cargo/config.toml` — see ci/README.md for why that distinction is
+# load-bearing.
+#
+# Pinned versions, one `case` on the arch because this image is built natively for
+# both (ADR-0009) and each release ships a per-arch tarball with its own digest.
+# The musl build of nextest is deliberate: it is static, so one binary works on
+# this AL2023 image and on anything else that ever consumes it.
+#
+# The RUN body carries NO comments on purpose: this image is built by kaniko, not
+# BuildKit, and a `#` line inside a backslash-continued instruction depends on the
+# parser stripping it. Keeping the prose out here removes that dependency.
+#
+# The three asserts at the end are what make a bad version bump fail HERE instead
+# of in a job. `/usr/local/libexec/mold/ld` is a relative symlink to
+# `../../bin/mold` inside the tarball, and it is the path RUSTFLAGS names via gcc's
+# `-B` prefix: if a future release moves it, the link silently falls back to GNU ld
+# and every job simply gets slower, with no error anywhere.
+ARG CARGO_NEXTEST_VERSION=0.9.143
+ARG MOLD_VERSION=2.42.0
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64) \
+        mold_arch=x86_64; \
+        mold_sha=f5ed2f6e31d1ada4f07fe766fe0de7a73104d1c5cdc59086fcecc16a43720b6d; \
+        nextest_triple=x86_64-unknown-linux-musl; \
+        nextest_sha=6d891c18105ec2d33f6e441a4f92b7ccab47ba263e22055c8bb66884243f3389 ;; \
+      aarch64) \
+        mold_arch=aarch64; \
+        mold_sha=3c9a0a3624aac8a2007569ae50c33b3129a0f0ae8bcc974aeee2f8939d295190; \
+        nextest_triple=aarch64-unknown-linux-musl; \
+        nextest_sha=0560ce0ce017f368c54b5db86588370fc03b470985490fa81200e62a657dda05 ;; \
+      *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-${mold_arch}-linux.tar.gz" \
+        -o /tmp/mold.tar.gz; \
+    echo "${mold_sha}  /tmp/mold.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/mold.tar.gz --strip-components=1 -C /usr/local; \
+    rm -f /tmp/mold.tar.gz; \
+    curl -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${CARGO_NEXTEST_VERSION}/cargo-nextest-${CARGO_NEXTEST_VERSION}-${nextest_triple}.tar.gz" \
+        -o /tmp/nextest.tar.gz; \
+    echo "${nextest_sha}  /tmp/nextest.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/nextest.tar.gz -C /usr/local/bin cargo-nextest; \
+    rm -f /tmp/nextest.tar.gz; \
+    mold --version; \
+    test -x /usr/local/libexec/mold/ld; \
+    cargo nextest --version
+
+# --- compilation cache (quality item L4) --------------------------------------
+# sccache, as `RUSTC_WRAPPER`. It caches the OUTPUT of each rustc/cc invocation
+# keyed by a hash of (compiler binary, arguments, preprocessed inputs,
+# environment), so a job that starts with an empty `target/` re-invokes rustc for
+# every unit and each one becomes a cache READ instead of a compile. That is the
+# lever `.gitlab-ci.yml`'s cache notes point at: at these blob sizes the check
+# stage spends 66 s compressing and 10 s uploading a multi-GB `target/`, and the
+# way to remove the archive is a compilation cache, not a faster zip.
+#
+# Measured here, warm, in a 16-vCPU build pod on 2026-09-08 —
+# `cargo check --locked -p pacer-cache --all-targets`, 125 executed compiler
+# invocations, sccache 0.17.0 against a LOCAL disk backend (the S3 backend
+# differs only in transport): 10.0 s with no wrapper and a fresh `target/`
+# against 4.0 s with a warm cache and the same fresh `target/` — 2.5x, at 100 %
+# hit rate on all 123 cacheable units. A COLD cache costs +1.5 s on the same
+# work (11.5 s vs 10.0 s), which is the wrapper's own overhead. ci/README.md's
+# "sccache (L4)" section has the whole table and the two key-sensitivity traps.
+#
+# OFF unless a bucket is named. Nothing in this image turns it on: `RUSTC_WRAPPER`
+# is set per job by `.gitlab-ci.yml` (gated on `SCCACHE_BUCKET`) and per pod by
+# `scripts/dev/build-pod` (gated on `BUILD_POD_SCCACHE_BUCKET`), so baking the
+# binary changes no build until an owner creates the bucket and sets the variable.
+#
+# Its OWN `RUN`, not folded into the one above: kaniko caches per layer, so
+# bumping this pin re-downloads sccache alone rather than mold and nextest too.
+# Same contract as those — release tarball by URL, digest-verified, static musl
+# build so it does not depend on this image's glibc, and one `case` on the arch
+# because the image is built natively for both (ADR-0009). The RUN body carries
+# no comments for the same kaniko-parser reason stated above.
+ARG SCCACHE_VERSION=0.17.0
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64) \
+        sccache_triple=x86_64-unknown-linux-musl; \
+        sccache_sha=67c4a96dd237c1f518f6b36083f270f9976d516f1e57fce891755ea782e50006 ;; \
+      aarch64) \
+        sccache_triple=aarch64-unknown-linux-musl; \
+        sccache_sha=821a86343191aa1cbab74bd42f9e93c9a63bf85e4742945f40d3ae84193c1c77 ;; \
+      *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${sccache_triple}.tar.gz" \
+        -o /tmp/sccache.tar.gz; \
+    echo "${sccache_sha}  /tmp/sccache.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/sccache.tar.gz --strip-components=1 -C /usr/local/bin \
+        "sccache-v${SCCACHE_VERSION}-${sccache_triple}/sccache"; \
+    rm -f /tmp/sccache.tar.gz; \
+    sccache --version
+
+# --- EFA userspace (libibverbs, libefa, librdmacm, libnl with ldconfig wired) ---
+# Pinned installer version — bumping it is a deliberate PR, guarded by the ldd
+# "not found" tripwire in the build-binary job. Keep in sync with the version in
+# spike/efa/Dockerfile (the spike stays self-contained for fast standalone
+# iteration; this comment is the drift check). --skip-kmod: userspace only, the
+# kernel module comes from the host EKS AMI. -y --no-verify: no prompt/reboot
+# check. Not --minimal: the full userspace under /opt/amazon/efa + /usr is what
+# we link and later copy out. The installer detects Amazon Linux natively (it
+# is AWS's own tarball, first-class-tested on AL2/AL2023 EKS AMIs).
+ARG EFA_INSTALLER_VERSION=1.49.0
+RUN curl -fsSL "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" \
+       -o /tmp/efa.tar.gz \
+    && tar -xzf /tmp/efa.tar.gz -C /tmp \
+    && cd /tmp/aws-efa-installer \
+    && ./efa_installer.sh -y --skip-kmod --no-verify \
+    && ldconfig \
+    && rm -rf /tmp/efa.tar.gz /tmp/aws-efa-installer
+
+# libefa/libfabric land under /opt/amazon/efa; make them discoverable to the
+# linker (build time) and loader (running the freshly built binary here, e.g.
+# the functional smoke). lib64, not lib: AL2023 is an RPM/FHS layout (64-bit
+# libs in lib64), unlike Debian's arch-triplet /lib layout the Docker-Hub-based
+# image used.
+ENV PKG_CONFIG_PATH=/opt/amazon/efa/lib64/pkgconfig \
+    LD_LIBRARY_PATH=/opt/amazon/efa/lib64 \
+    LIBRARY_PATH=/opt/amazon/efa/lib64

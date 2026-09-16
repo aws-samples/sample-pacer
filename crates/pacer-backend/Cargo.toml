@@ -1,0 +1,28 @@
+[package]
+name = "pacer-backend"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aws-sdk-s3 backend wrapper: S3 Express session auth, endpoint config"
+
+[dependencies]
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# The retrying chunk read: its bytes, its error type, and the sleep between
+# attempts.
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# `#[tokio::test(start_paused = true)]`. The backoff ladder is part of what the
+# retry tests assert, and a paused clock lets them assert it without spending the
+# wall time — `full` does not include `test-util`.
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

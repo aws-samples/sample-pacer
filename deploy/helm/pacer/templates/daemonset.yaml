@@ -1,0 +1,409 @@
+{{- /* Hugepage budget check (arenas + ADR-0028 slab). Invoked here because this
+       template is always rendered; emits nothing unless it fails. */ -}}
+{{- include "pacer.validateHugepages" . -}}
+{{- /* Can the daemon actually OPEN the fabric it is configured to reach? Same
+       always-rendered reasoning; emits nothing unless it fails. */ -}}
+{{- include "pacer.validateEfaAccess" . -}}
+{{- /* ADR-0032's scatter is Standard-only; catch the Express ask here rather than
+       as a CrashLoop five minutes into `helm --wait`. */ -}}
+{{- include "pacer.validateScatter" . -}}
+{{- /* ADR-0026's two quotas and the cgroup reservation that has to cover them; a
+       mismatch degrades every large target to a body read instead of erroring. */ -}}
+{{- include "pacer.validateDelivery" . -}}
+{{- /* The cross-field minimums values.schema.json cannot express (limits.memory vs
+       memCapacity, pinnedPoolReservation vs both arenas, the two foyer buffers vs
+       chunkSize, the grace period vs the drain deadline). See templates/_validate.tpl. */ -}}
+{{- include "pacer.validate" . -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "pacer.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pacer.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "pacer.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Cache-tier restart = cold cache on that node; roll one at a time.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "pacer.selectorLabels" . | nindent 8 }}
+        {{- with include "pacer.sessionLabels" . }}{{ . | nindent 8 }}{{- end }}
+      annotations:
+        # Roll pods when the config file changes: the daemon reads it once at
+        # startup (no hot reload — ADR-0013), so a ConfigMap edit needs a
+        # rollout to take effect.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      # No `hostIPC`. It was renderable until 2026-09-08, for cross-container CUDA IPC
+      # under ADR-0027's `cuda-ipc:` scheme; that scheme is removed and the daemon shares
+      # no namespace with the host. Nothing in the delivery path needs one — a `nic:`
+      # token names memory over the fabric, not through a namespace (ADR-0030).
+      # Must EXCEED the daemon's SIGTERM drain deadline (20 s), or the kubelet SIGKILLs
+      # the container mid-drain and the in-flight requests the drain exists to finish are
+      # lost anyway — the rollout pays the latency and buys nothing. 30 s = that deadline
+      # plus room for the listeners to close and one last metrics scrape. Raise both
+      # together; pacer.validateGracePeriod fails the render if this one alone moves.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      serviceAccountName: {{ include "pacer.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- /* Null-skipping + the owning-session key live in pacer.nodeSelector;
+             see the helper for why each is there. */}}
+      {{- with include "pacer.nodeSelector" . }}
+      nodeSelector:
+        {{- . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.session.exclusiveNodes }}
+      affinity:
+        # One pacer daemon per node, across ALL releases (values.yaml
+        # `session.exclusiveNodes`). The selector matches app.kubernetes.io/NAME —
+        # the chart name, identical in every release — not the per-release
+        # `instance`, so a second session's release cannot co-schedule here. Two
+        # daemons on one node would share this node's hostPath cache dir and
+        # compete for its EFA devices; the interloper stays Pending instead.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: {{ include "pacer.name" . }}
+              topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # The image runs as nonroot (uid 65532) but the hostPath NVMe dir is
+      # created root-owned; hand it over before the daemon starts.
+      initContainers:
+        - name: chown-cache
+          image: busybox:1.36
+          command: ["chown", "-R", "65532:65532", "/cache"]
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+      containers:
+        - name: pacer-daemon
+          {{- if .Values.devMode.enabled }}
+          # Dev loop (scripts/dev): shell image + supervisor; the binary is
+          # cross-compiled locally and pushed with `pacer-dev push` — no image
+          # rebuild. The pod is NotReady until the first push.
+          # Defaults to the release image rather than a shell image, because the
+          # pushed binary needs glibc and (under --features efa) libibverbs — see
+          # `devMode.image` in values.yaml for the restart loop that taught us.
+          image: {{ .Values.devMode.image | default (printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion)) | quote }}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              DIR=/pacer-dev
+              BIN=$DIR/pacer-daemon
+              NEXT=$DIR/pacer-daemon.next
+              echo "pacer dev supervisor: waiting for pushes at $NEXT"
+              while true; do
+                if [ -f "$NEXT" ]; then
+                  mv -f "$NEXT" "$BIN" && chmod +x "$BIN"
+                  echo "supervisor: swapped in new binary"
+                fi
+                if [ -x "$BIN" ]; then
+                  "$BIN" &
+                  pid=$!
+                  while kill -0 "$pid" 2>/dev/null; do
+                    if [ -f "$NEXT" ]; then
+                      echo "supervisor: new push; stopping daemon (pid $pid)"
+                      kill "$pid"
+                      break
+                    fi
+                    sleep 1
+                  done
+                  wait "$pid" 2>/dev/null
+                  echo "supervisor: daemon exited ($?)"
+                else
+                  sleep 2
+                fi
+              done
+          {{- else }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- end }}
+          ports:
+            - name: s3
+              containerPort: {{ .Values.ports.s3 }}
+            - name: admin
+              containerPort: {{ .Values.ports.admin }}
+            - name: peer
+              containerPort: {{ .Values.ports.peer }}
+          env:
+            # Everything tunable now lives in the mounted config file (ADR-0013);
+            # env carries only per-pod values (downward API) and a few things
+            # that can't sit in a shared ConfigMap. Any PACER_* here still
+            # overrides the file.
+            - name: PACER_CONFIG
+              value: /etc/pacer/config.yaml
+            # Set EXPLICITLY, even though the ConfigMap already carries `cache.dir`,
+            # because the shipped image bakes `ENV PACER_CACHE_DIR=/tmp/pacer-cache` for
+            # local runs (ci/Dockerfile.release, Dockerfile.runtime, Dockerfile) and env
+            # beats the file in the daemon's own resolution order (`CACHE_DIR.resolve`,
+            # crates/pacer-daemon/src/config.rs). Without this line the image's default
+            # wins: the daemon writes its disk tier into the container's writable layer
+            # while the hostPath NVMe volume mounted right here at `config.cacheDir` goes
+            # untouched — measured 2026-08-23 on a GPU test cluster, where a pod that mounted
+            # /var/cache/pacer logged `dir: "/tmp/pacer-cache"`.
+            - name: PACER_CACHE_DIR
+              value: {{ .Values.config.cacheDir | quote }}
+            # No NVIDIA_VISIBLE_DEVICES/NVIDIA_DRIVER_CAPABILITIES: the daemon links no
+            # CUDA and imports no device handle since ADR-0027's scheme was removed. A
+            # delivery into HBM is the CLIENT's registration (ADR-0030), so the GPUs need
+            # not be visible here at all — see values.yaml `delivery`.
+            {{- if .Values.config.awsRegion }}
+            # Pods can't reach IMDS (hop limit 1); the SDK needs the region.
+            - name: AWS_REGION
+              value: {{ .Values.config.awsRegion | quote }}
+            {{- end }}
+            {{- if .Values.cluster.enabled }}
+            # Cluster tier (Phase 2). PACER_NODE_NAME (downward API) is the
+            # switch: set → ring + peer gRPC; membership from the peer
+            # Service's EndpointSlices. These are per-pod, so they stay env
+            # even though the rest of the cluster block is in the file.
+            - name: PACER_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: PACER_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: PACER_PEER_SERVICE
+              value: {{ include "pacer.fullname" . }}-peer
+            {{- end }}
+            - name: RUST_LOG
+              value: {{ .Values.config.logLevel | quote }}
+            {{- if .Values.devMode.enabled }}
+            # busybox has no CA bundle; rustls needs one for S3 TLS. Mount the
+            # host's /etc/pki at the same path — the bundle is a symlink to an
+            # absolute path inside it (AL2023).
+            - name: SSL_CERT_FILE
+              value: /etc/pki/tls/certs/ca-bundle.crt
+            {{- end }}
+            {{- with .Values.allocator.arenaMax }}
+            # glibc's per-thread arena cap (values.yaml `allocator.arenaMax`). Unset,
+            # glibc's limit is 8 x ncores — 1536 arenas on a p5.48xlarge — and each one
+            # retains its own free lists, which is the memory floor planning/17's
+            # requester-OOM defect resolves to. Rendered here rather than in the
+            # ConfigMap because the daemon does not own this name; being in the pod
+            # TEMPLATE is what makes a change to it roll the DaemonSet.
+            - name: MALLOC_ARENA_MAX
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.allocator.trimThreshold }}
+            # Return freed memory above this many bytes (values.yaml
+            # `allocator.trimThreshold`, off by default — setting it also pins glibc's
+            # mmap threshold, which puts every 16 MiB chunk body through an
+            # mmap/munmap pair on the hot path for an unmeasured cost).
+            - name: MALLOC_TRIM_THRESHOLD_
+              value: {{ include "pacer.toBytes" . | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            # Deliberately last, so an operator can override anything above it —
+            # including the two MALLOC_* entries, which is how a control arm turns one
+            # back to glibc's default without editing the chart.
+            #
+            # This exists for variables the daemon does not own and therefore cannot put
+            # in its config file, and for which the chart has no first-class key. NOT a
+            # home for PACER_* knobs — those belong in `config`, which is checksummed
+            # into a pod roll (ADR-0013). Everything here IS in the pod template, so a
+            # change to it rolls the DaemonSet on its own; only a `valueFrom` reference
+            # can hide a change from the controller.
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if not .Values.devMode.enabled }}
+          # Boot budget, and it is load-bearing for RDMA: the daemon registers its
+          # RDMA arenas (ADR-0024) BEFORE it binds the admin listener, so /healthz
+          # does not answer until that finishes — and `ibv_reg_mr` pins and
+          # page-tables every byte, measured at ~2.5 GiB/s on p5.48xlarge (37 GiB
+          # over 64 MRs took ~15 s). Without a startupProbe, kubelet's liveness
+          # probe kills the container after initialDelay + 3 x period ~= 35 s, so
+          # any arena past ~80 GiB CrashLoops forever with no hint as to why
+          # (observed 2026-08-19 at efa.pinnedPoolReservation=260Gi). A
+          # startupProbe suspends liveness until it first succeeds, so the budget
+          # below — 5 s x 60 = 5 minutes, ~750 GiB of registration — is what makes
+          # a large arena deployable at all. Raise failureThreshold, not the
+          # liveness delays: liveness must stay tight once the daemon IS serving.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 5
+            failureThreshold: 60
+          # No liveness in dev mode: the supervisor idles with no daemon (and
+          # no /healthz) until the first push, and kubelet would kill the pod.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            # Not hostNetwork. IPC_LOCK (memlock for memory registration) is its
+            # own opt-in — the RDMA transport itself registers fine on 4 KiB
+            # pages without it (planning/11 #7).
+            {{- if .Values.efa.privileged }}
+            # The ONLY way a container reaches a device it was not ALLOCATED.
+            # `efa.shareHostDevices` mounts /dev/infiniband, which makes the
+            # rails visible — but a hostPath device node gets no device-cgroup
+            # rule, so `ibv_open_device` returns EPERM on every one of them and
+            # the daemon falls back to gRPC while reporting 32 rails placed
+            # (measured 2026-08-24 on a p5: `Operation not permitted` opening
+            # uverbs0, with 32 units free on the node). Requesting a unit is
+            # what normally grants the rule, and that is exactly what ADR-0030
+            # point 9 forbids the daemon from doing.
+            privileged: true
+            {{- else }}
+            allowPrivilegeEscalation: false
+            {{- end }}
+            {{- if .Values.efa.ipcLock }}
+            capabilities:
+              add: ["IPC_LOCK"]
+            {{- end }}
+          resources:
+            requests:
+              {{- toYaml .Values.resources.requests | nindent 14 }}
+            limits:
+              {{- range $k, $v := .Values.resources.limits }}
+              {{- if ne $k "memory" }}
+              {{ $k }}: {{ $v }}
+              {{- end }}
+              {{- end }}
+              # Container memory limit MUST cover the pinned RDMA buffer pools
+              # too (invisible to config.memCapacity) or the pod OOMKills under
+              # seed load — planning/16 §4.5. pacer.memoryLimit adds the pinned
+              # pool total when efa.enabled, else emits resources.limits.memory
+              # unchanged.
+              memory: {{ include "pacer.memoryLimit" . }}
+              {{- if and .Values.efa.enabled (not .Values.efa.shareHostDevices) }}
+              # Requesting the EFA resource is what makes Karpenter attach an
+              # EFA interface; it's all the RDMA transport needs.
+              #
+              # Suppressed by efa.shareHostDevices, which reaches the same device
+              # through a hostPath instead: on a one-interface node this request
+              # takes the ONLY unit and leaves the delivery client — or a tenant's
+              # NCCL job — unschedulable (ADR-0030 point 9). Karpenter still needs
+              # SOMETHING to request one at launch, but that something is never
+              # the daemon.
+              {{ .Values.efa.resourceName }}: {{ .Values.efa.count }}
+              {{- end }}
+              {{- if .Values.efa.hugepages }}
+              # Opt-in, independent of efa.enabled: only request on nodes that
+              # pre-reserve this page size at boot, else Karpenter won't launch.
+              # The NAME comes from efa.hugepageSizeMib so it cannot disagree with
+              # the `rdma-arena-page-mib` the ConfigMap derives from the same value.
+              {{ include "pacer.hugepageResource" . }}: {{ .Values.efa.hugepages }}
+              {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pacer
+              readOnly: true
+            - name: cache
+              mountPath: {{ .Values.config.cacheDir }}
+            {{- if .Values.efa.shareHostDevices }}
+            # The uverbs character devices, mounted rather than requested
+            # (ADR-0030 point 9). This is the whole of what the device plugin
+            # grants that the transport needs: ibverbs enumerates through
+            # /sys/class/infiniband*, which every pod already sees, and then opens
+            # /dev/infiniband/uverbsN — which without this mount is absent, so
+            # ibv_get_device_list finds nothing.
+            - name: infiniband
+              mountPath: /dev/infiniband
+            {{- end }}
+            {{- if and .Values.delivery.enabled .Values.delivery.sharedShm }}
+            # Client-memory delivery (ADR-0026): the NODE's tmpfs, where a client's
+            # shm segments live. It has to be a hostPath — an `emptyDir` (even
+            # `medium: Memory`) is created per POD and can never be shared with the
+            # client, so a delivery target would always look absent and every GET
+            # naming one would get a 4xx. The client pod must mount the SAME host
+            # path at the same place.
+            #
+            # The mount path FOLLOWS `shmDir`, because that is the directory the
+            # daemon resolves `shm:/<name>` under: mounting the segments anywhere
+            # else makes every target look absent. This is also what lets the
+            # segments be hugepage-backed — point both at a hugetlbfs mount
+            # (/dev/hugepages) and registration goes from 12-14 GB/s to 239-433
+            # (ADR-0028's reg-timing spike) with no protocol change, because the
+            # daemon opens a path and never calls shm_open.
+            - name: shared-shm
+              mountPath: {{ .Values.delivery.shmDir | default "/dev/shm" }}
+            {{- end }}
+            {{- if .Values.devMode.enabled }}
+            - name: dev-bin
+              mountPath: /pacer-dev
+            - name: host-pki
+              mountPath: /etc/pki
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "pacer.fullname" . }}-config
+            items:
+              - key: config.yaml
+                path: config.yaml
+        - name: cache
+          hostPath:
+            # instanceStorePolicy: RAID0 mounts the NVMe array here.
+            path: {{ .Values.cache.hostPath }}
+            type: DirectoryOrCreate
+        {{- if .Values.efa.shareHostDevices }}
+        - name: infiniband
+          hostPath:
+            # `Directory`, not `DirectoryOrCreate`: an empty directory conjured on
+            # a node with no EFA ENI would let the daemon start and then find no
+            # device, which is a silent fallback to gRPC. Failing to mount says so.
+            path: /dev/infiniband
+            type: Directory
+        {{- end }}
+        {{- /*
+             Both conditions, not `sharedShm` alone: it now defaults TRUE alongside
+             `delivery.enabled`, so an operator who turns delivery off would otherwise still
+             get a hostPath mount of the node's tmpfs that nothing can ever read.
+        */}}
+        {{- if and .Values.delivery.enabled .Values.delivery.sharedShm }}
+        - name: shared-shm
+          hostPath:
+            # Default /dev/shm: on every distro this daemon runs on that is already
+            # a tmpfs sized ~half of RAM, so segments are RAM-backed with no extra
+            # plumbing. Point it at a dedicated host tmpfs instead if you would
+            # rather not share the node's default one — or at /dev/hugepages (with
+            # `shmDir` matching) for hugepage-backed client segments, which is the
+            # cheapest thing that moves per-request registration.
+            path: {{ .Values.delivery.shmHostPath }}
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if .Values.devMode.enabled }}
+        - name: dev-bin
+          emptyDir: {}
+        - name: host-pki
+          hostPath:
+            path: /etc/pki
+            type: Directory
+        {{- end }}

@@ -1,0 +1,56 @@
+[package]
+name = "pacer-client"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Client half of ADR-0030: register your own memory, publish a NIC token, answer announces"
+
+[lib]
+# `rlib` for spike/efa's token-client (which is this library's hardware test), `cdylib`
+# for the loaders: `clients/python/pacer_nic.py` ctypes-loads the shared object, because a
+# checkpoint loader is Python and a token cannot be produced without ibverbs.
+name = "pacer_client"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+# Everything that touches hardware. Off by default so `cargo check --all-targets` on a
+# machine with no libefa still parses this crate (the same contract pacer-transport's
+# `efa` feature has), and so the token renderer — the half with a wire format to keep —
+# is compiled and TESTED in every build.
+efa = ["dep:ibverbs", "dep:libc", "ibverbs/efa"]
+
+[dependencies]
+# The announce decoder and the token types, so this crate cannot drift from the daemon
+# that writes into it: one definition of the wire format, used from both ends. Needs no
+# `efa` feature of its own — `pacer_transport::announce` and `::token` sit outside that
+# gate precisely so non-Rust and non-hardware builds can name them.
+pacer-transport.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# A subscriber, because this crate's most useful log line has no other way out: the caller
+# is a Python process that ctypes-loaded a shared object, so there is no host application to
+# install one. `endpoint::bring_up` records WHICH device a rail opened, and getting that
+# wrong on a GPU window costs 6.95x (Track H) — a diagnosis that must not depend on the
+# embedder. Off unless `RUST_LOG` asks (see `ffi::install_logging`).
+tracing-subscriber.workspace = true
+# Same git rev as pacer-transport and spike/efa — see that crate's note. A client
+# registering memory on its own protection domain is the whole of ADR-0030, and
+# `register_dmabuf` (GPU windows) plus `create_address_handle` (answering announces) are
+# the two calls that make it possible.
+ibverbs = { git = "https://github.com/jonhoo/rust-ibverbs", rev = "d9a5c01fa8096f516b08a126738d4f1107812f61", optional = true }
+# `mmap`/`munmap` for a host window, and `dlopen`/`dlsym` for the CUDA driver (a GPU
+# window is allocated through libcuda, which is never linked — see `cuda.rs`).
+libc = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The parser this crate's tokens have to satisfy. A dev-dependency rather than a shared
+# module because the grammar's owner is the DAEMON (it is what a client must speak), and a
+# round-trip test against the real parser is the only kind that cannot pass while the two
+# disagree. Acyclic: pacer-daemon does not depend on this crate.
+pacer-daemon = { path = "../pacer-daemon" }
+
+[lints]
+workspace = true

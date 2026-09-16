@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1
+# Release build for GitHub Actions (.github/workflows/release.yaml): test,
+# compile `--features efa`, stage the EFA runtime closure, and assemble the
+# distroless runtime image in ONE BuildKit graph. Nothing here needs a docker
+# daemon or a `docker run` — the whole build is executed by BuildKit — so it
+# runs identically on GitHub-hosted runners and on daemon-less self-hosted
+# runners (e.g. ARC in kubernetes container mode fronting a rootless
+# buildkitd; see the workflow's BUILDKIT_ENDPOINT note).
+#
+# BUILDER_IMAGE is the per-arch EFA build environment (rdma-core toolchain +
+# aws-efa-installer userspace) built from ci/Dockerfile.efa-builder by the
+# preceding workflow step. The build is NATIVE per arch by construction: this
+# graph executes wherever BuildKit runs, so the workflow asserts the runner
+# (and any sidecar buildkitd on the same node) matches the target arch.
+#
+# Keep the runtime stage (ENV/ENTRYPOINT) in sync with ./Dockerfile (local
+# build) and ./Dockerfile.runtime (the internal CI assemble path).
+ARG BUILDER_IMAGE
+# checkov:skip=CKV_DOCKER_7:The base is an ARG the release workflow substitutes
+# with a digest-or-SHA-tagged builder it just built (never `:latest`); checkov
+# reads the unresolved `${BUILDER_IMAGE}` as an untagged image. A default here
+# would be worse than none — it would either name a private registry the public
+# build cannot reach, or silently build against a stale builder when the workflow
+# forgets to pass the argument.
+FROM ${BUILDER_IMAGE} AS build
+WORKDIR /src
+# The full tree (minus .dockerignore), not just crates/: `cargo test` here is
+# the release's native test pass on each arch — the push-CI `rust` job tests
+# default features on amd64 only — and it must see exactly what CI tests.
+COPY . .
+RUN cargo test --workspace --release --features efa
+RUN cargo build --release -p pacer-daemon --features efa
+# Stage the EFA userspace runtime closure (linked libs + dlopen'd provider
+# plugin + /etc/libibverbs.d) for the distroless base; the script's asserts
+# are the drift tripwire against installer bumps.
+RUN ci/stage-efa-libs.sh target/release/pacer-daemon /efa-rootfs
+
+# AL2023-minimal, not gcr.io/distroless: no ECR Public mirror of distroless
+# exists (confirmed), and BUILDER_IMAGE (built from ci/Dockerfile.efa-builder)
+# is AL2023 too — build and runtime must share one glibc family or the
+# binary's dynamic symbol versions won't resolve at load time.
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260914.0-minimal
+# checkov:skip=CKV_DOCKER_2:Health is checked by Kubernetes, not by Docker — the
+# chart's livenessProbe/readinessProbe hit /healthz and /readyz, and kubelet
+# ignores HEALTHCHECK. Adding one would require a shell and an HTTP client in an
+# -minimal image that deliberately has neither.
+# UID/GID 65532 is a hard contract with deploy/helm/pacer (the DaemonSet's init
+# chown) and the bench Job manifests (runAsUser: 65532) — it must match exactly
+# what the old gcr.io/distroless/*:nonroot tag baked in. AL2023-minimal has no
+# useradd/shadow-utils, so add the passwd/group entries directly, the same way
+# distroless itself fakes a "nonroot" user.
+RUN echo 'pacer:x:65532:65532:pacer:/nonexistent:/sbin/nologin' >> /etc/passwd \
+ && echo 'pacer:x:65532:' >> /etc/group
+COPY --from=build /efa-rootfs/ /
+COPY --from=build /src/target/release/pacer-daemon /usr/local/bin/pacer-daemon
+# Cache dir is a hostPath mount in-cluster; this default serves local runs.
+ENV PACER_CACHE_DIR=/tmp/pacer-cache
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/pacer-daemon"]

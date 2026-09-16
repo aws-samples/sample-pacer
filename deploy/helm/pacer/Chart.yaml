@@ -1,0 +1,18 @@
+apiVersion: v2
+name: pacer
+description: >-
+  Node-local S3-compatible caching proxy for EKS. Caches S3 Express One Zone
+  objects on local NVMe, with peer-to-peer misses served over EFA RDMA.
+type: application
+version: 0.1.0
+# v-PREFIXED on purpose: this is the default image tag
+# (`.Values.image.tag | default .Chart.AppVersion`), and the release workflow
+# pushes images tagged with the full git tag (`v0.1.0`). The published chart
+# gets both fields overridden from the tag at package time
+# (.github/workflows/release.yaml); this in-repo value only serves
+# install-from-source, and must point at a tag that exists on GHCR.
+appVersion: "v0.1.0"
+kubeVersion: ">=1.26.0-0" # internalTrafficPolicy: Local GA
+home: https://github.com/aws-samples/sample-pacer
+sources:
+  - https://github.com/aws-samples/sample-pacer

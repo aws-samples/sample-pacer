@@ -1,0 +1,459 @@
+{{- /*
+Daemon config file (ADR-0013), mounted at /etc/pacer/config.yaml. This is the
+middle precedence layer: built-in defaults < this file < PACER_* env vars. Only
+release-wide values live here; per-pod inputs (node name, namespace) stay env
+(downward API) in the DaemonSet. The daemon reads it once at startup — the
+checksum annotation on the DaemonSet rolls pods when this changes.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pacer.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pacer.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    listen-addr: "0.0.0.0:{{ .Values.ports.s3 }}"
+    admin-addr: "0.0.0.0:{{ .Values.ports.admin }}"
+    {{- with .Values.config.logFormat }}
+    log:
+      # json (default) or text — ADR-0036. The FILTER is RUST_LOG (config.logLevel).
+      format: {{ . | quote }}
+    {{- end }}
+    {{- $listen := dict }}
+    {{- with .Values.config.s3MaxConnections }}{{ $_ := set $listen "max" . }}{{ end }}
+    {{- with .Values.config.s3HeaderTimeoutSecs }}{{ $_ := set $listen "header" . }}{{ end }}
+    {{- with .Values.config.s3IdleTimeoutSecs }}{{ $_ := set $listen "idle" . }}{{ end }}
+    {{- if $listen }}
+    # S3 listener bounds (ADR-0036). Each is omitted when left at 0, so the daemon
+    # default applies and every knob stays movable alone in a benchmark arm. The
+    # connection cap backpressures at the ACCEPT queue — a client at the ceiling
+    # sees a slow connect, never an error — so it is invisible without
+    # pacer_s3_connections_active / pacer_s3_connections_at_capacity_total.
+    listen:
+      {{- with $listen.max }}
+      max-connections: {{ . }}
+      {{- end }}
+      {{- with $listen.header }}
+      # Also the keep-alive idle bound: hyper re-arms this timer between requests
+      # on one connection. Long by default (120 s) because a loader pauses between
+      # batches and reconnect churn costs ephemeral ports.
+      header-timeout-secs: {{ . }}
+      {{- end }}
+      {{- with $listen.idle }}
+      # No-progress deadline at the socket, for what the header timeout cannot see:
+      # a stalled request body, a response nobody reads. Resets on every byte, so a
+      # slow-but-moving multi-GiB GET never trips it.
+      idle-timeout-secs: {{ . }}
+      {{- end }}
+    {{- end }}
+    {{- with .Values.config.shutdownDrainTimeoutSecs }}
+    # Seconds in-flight requests may finish after SIGTERM (ADR-0036). MUST stay
+    # below terminationGracePeriodSeconds, or the kubelet SIGKILLs the process in
+    # the middle of its own drain. 0/unset → the daemon default (20 s against a
+    # 30 s grace period). A DaemonSet rolling update depends on this.
+    shutdown:
+      drain-timeout-secs: {{ . }}
+    {{- end }}
+    cache:
+      dir: {{ .Values.config.cacheDir | quote }}
+      mem-capacity: {{ .Values.config.memCapacity | quote }}
+      disk-capacity: {{ .Values.config.diskCapacity | quote }}
+      block-size: {{ .Values.config.blockSize | quote }}
+      {{- with .Values.config.flushBufferSize }}
+      flush-buffer-size: {{ . | quote }}
+      {{- end }}
+      io-engine: {{ .Values.config.ioEngine | quote }}
+      {{- with .Values.config.uring }}
+      uring:
+        threads: {{ .threads }}
+        io-depth: {{ .ioDepth }}
+      {{- end }}
+      {{- $t := .Values.config.tuning | default dict }}
+      {{- $submitq := include "pacer.submitQueueThreshold" . }}
+      {{- if or $t.flushers $t.reclaimers $submitq $t.storageRuntimeThreads }}
+      {{- with $t }}
+      # foyer storage-engine tuning. A 0 still means "keep foyer's own default", so
+      # a knob left at 0 is simply not emitted and each one stays movable alone in a
+      # benchmark arm. The block itself is now always present, because
+      # submit-queue-threshold is derived rather than defaulted to foyer's 16 MiB —
+      # foyer's value silently drops demotions at any production chunk size
+      # (bench/ladder/results/c4-foyer-readpath.md), which is not a default worth
+      # preserving for the sake of not rolling pods.
+      tuning:
+        {{- with .flushers }}
+        # Blocks the disk tier flushes into concurrently — and therefore how many
+        # io_uring shards a SEQUENTIAL read spreads over, which is the part that is
+        # not obvious. One flusher appends everything into one block until it
+        # fills, foyer opens one file per block, and it picks the io_uring worker
+        # for a read by `partition.id() % uring.threads` — so with the default 1,
+        # 64 consecutive 16-MiB chunks share a block and read back through ONE
+        # shard, serializing their page-cache memcpys however many threads exist.
+        # That is why uring.threads 4 -> 32 bought only +16 %.
+        flushers: {{ . }}
+        {{- end }}
+        {{- with .reclaimers }}
+        # Concurrent block reclaimers. Keep in step with flushers: one reclaimer
+        # against N writers is what runs the engine out of clean blocks.
+        reclaimers: {{ . }}
+        {{- end }}
+        {{- with $submitq }}
+        # In-flight DRAM→NVMe write budget, DERIVED (pacer.submitQueueThreshold) as
+        # `flushers x chunkSize x 4` unless the operator names a value. An enqueue
+        # arriving when this much is already unwritten is SILENTLY DROPPED (foyer
+        # counts storage_queue_channel_overflow, the chunk never reaches disk, and a
+        # later read misses to a peer or the backend). foyer's own default is 16 MiB —
+        # ONE chunk entry — which is why it is derived here and not defaulted:
+        # sizing it took the drop count from 4229/2244 to exactly 0, twice
+        # (bench/ladder/results/c4-foyer-readpath.md). `0` restores foyer's 16 MiB.
+        submit-queue-threshold: {{ . | quote }}
+        {{- end }}
+        {{- with .storageRuntimeThreads }}
+        # Worker threads for a runtime dedicated to the disk tier. Unset/0 shares
+        # the main runtime (foyer's default), which puts every entry's XxHash64
+        # and decode copy — 6.5 ms per 16-MiB chunk — on the same threads as the
+        # proxy, against RDMA completion pumps that already burn ~14 cores.
+        storage-runtime-threads: {{ . }}
+        {{- end }}
+      {{- end }}
+      {{- end }}
+    runtime:
+      worker-threads: {{ .Values.config.workerThreads | default 0 }}
+      rdma-worker-threads: {{ .Values.config.rdmaWorkerThreads | default 0 }}
+    memory:
+      # The daemon re-derives pacer.memoryLimit's own sum at startup and compares it
+      # with the cgroup limit the kubelet applied (memory_budget.rs). `enforce` refuses
+      # to start rather than being OOMKilled later; `warn` logs and continues.
+      check: {{ .Values.config.memoryCheck | default "enforce" | quote }}
+      {{- with .Values.config.memoryHeadroomFraction }}
+      # Fraction of the limit left for page cache and the delivery working set. Unset →
+      # 0.10; raising it past ~0.167 refuses this chart's own efa+delivery render.
+      headroom-fraction: {{ . | quote }}
+      {{- end }}
+    policy:
+      min-object-size: {{ .Values.config.minObjectSize | quote }}
+      {{- with .Values.config.maxObjectSize }}
+      # Optional whole-object admission cap (ADR-0015). Unset → unbounded (the
+      # default): the chunked cache stores an object of any size as chunk-size
+      # pieces (per-read memory bounded to fill_parallelism × chunk-size), so
+      # this is a policy valve, not a disk-persistence limit — decoupled from
+      # block-size. Set a value only to proxy pathologically large objects
+      # through uncached.
+      max-object-size: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.config.chunkSize }}
+      # Cluster cache chunk size (ADR-0015). Embedded in every chunk key, so
+      # changing it is a cache-flush event — pin per cluster, never mix across a
+      # rolling update. Unset → the daemon default (16 MiB).
+      chunk-size: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.config.promotion }}
+      # Whether a chunk read promotes a disk hit into the RAM tier. `on-disk-hit`
+      # (unset) is foyer's own behaviour: its `get` is `get_or_fetch` underneath
+      # and inserts the loaded value at the HOT end of the LRU. `never` serves the
+      # hit and drops it. On a one-pass checkpoint sweep the RAM tier hit 5.3 %, so
+      # the promotion mostly evicts fresh fill data that then has to be written
+      # down — but `never` also gives up foyer's single-flight coalescing of
+      # concurrent misses for one key, so it is a workload choice, not an upgrade.
+      promotion: {{ . | quote }}
+      {{- end }}
+      # Which implementation holds chunk BODIES on disk (ADR-0033, defaulted by
+      # ADR-0038). `foyer` is an entry per chunk, which costs a fresh page-aligned
+      # 16 MiB allocation, one io op for the whole entry, an XxHash64 over every
+      # byte and a decode copy — measured at 40-75 ms for a 16 MiB entry the device
+      # serves in 1.335 ms (bench/ladder/results/nvme-device-truth.md). `store` is
+      # one `pread` into a registered frame, and measured 1.633x foyer on one node
+      # while foyer served 0.005 % of its bytes from the drives at all
+      # (bench/ladder/results/mountpoint-vs-pacer.md).
+      #
+      # ALWAYS RENDERED, and resolved by `pacer.diskTier` rather than by whether
+      # the value is set: the default is `store` wherever a slab is derived and
+      # `foyer` where none is, because the store's O_DIRECT read needs a
+      # page-aligned frame and silently reads BUFFERED without one. The daemon
+      # refuses store-with-no-slab outright, so an unconditional `store` here would
+      # make the chart's own defaults (efa.enabled: false) fail to start.
+      #
+      # Object headers stay in foyer either way. `promotion` above applies only to
+      # `foyer` — the store IS the tier, so it has nothing to promote into.
+      #
+      # ⚠ Not a hot flip: the two keep chunk bodies in different files, so
+      # switching leaves the other's bytes behind as garbage until they are
+      # evicted or the dir is wiped. Correct either way (an invalidation clears
+      # both), but a switched node starts cold for chunks.
+      #
+      # ⚠ A `store` node must size diskCapacity to the WHOLE working set: foyer's
+      # effective capacity was memCapacity + diskCapacity (a chunk lived in RAM and
+      # demoted), the store has only diskCapacity (ADR-0033 § Consequences).
+      disk-tier: {{ include "pacer.diskTier" . | quote }}
+      {{- with .Values.config.storeReadConcurrency }}
+      # Chunk reads in flight against the store, node-wide — and the direction is the
+      # opposite of the intuition. The array saturates at ~4 concurrent 16 MiB reads,
+      # because max_hw_sectors_kb is 128 so ONE pread is already ~128 device requests
+      # fanned across the stripe. Past that knee, width is queueing and nothing else:
+      #
+      #   depth   4     8    16    24    32    48    64
+      #   GiB/s  42.3  47.4 48.7  48.2  45.7  43.1  43.4
+      #   svc ms  1.5   2.6  5.1   7.7  10.8  16.9  22.3
+      #
+      # So this is a ceiling that RAISES throughput (+11.9 % at 16 over the 48 an
+      # unbounded daemon reaches), and it is the ONLY place the total is bounded:
+      # fillParallelism is per client GET and delivery.parallelism is per delivery
+      # request, so N concurrent requests multiply. A measured arm ran ~59 in flight,
+      # which is where the 40-43.8 ms per-hit service times in
+      # bench/ladder/results/c5-dcp-store-odirect.md came from — queued, not slow.
+      #
+      # `unlimited` restores the pre-ceiling behaviour; 0 means the built-in default.
+      store-read-concurrency: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.config.storeReadShape }}
+      # Whether a hit's 4 KiB header read is issued BEFORE the 16 MiB body read
+      # (`two-read`) or beside it (`overlap`).
+      #
+      # MEASURED NULL: 43.029 vs 43.055 GiB/s at depth 48 on a p5. It is here because
+      # the question had been argued both ways — the arm that appeared to refute it
+      # merged the two reads into one of 16 MiB + 4 KiB, which is stripe-MISALIGNED, so
+      # it measured two opposite effects as one +2.7 % number
+      # (bench/ladder/results/c5-dcp-store-single-read.md). `overlap` moves the
+      # dependency alone and leaves every offset and length where they are.
+      store-read-shape: {{ . | quote }}
+      {{- end }}
+      {{- if not .Values.config.conditionalGetFromCache }}
+      # ADR-0039, and rendered only when it is turned OFF: `true` is the daemon's own
+      # default, so emitting it would be a second spelling of the same thing.
+      #
+      # OFF restores the pre-ADR-0039 behaviour — every GET carrying `If-Match`
+      # bypasses the cache unconditionally. That is strict conditional semantics
+      # (the precondition is always judged by S3 against its current state) at the
+      # cost of the cache being unreachable for any client that always sends the
+      # header. Mountpoint-for-S3 is one, and measured 0 % hits because of it.
+      conditional-get-from-cache: false
+      {{- end }}
+      {{- if .Values.config.verifyChunkBody }}
+      # Verify a chunk body's CRC32 on every read from the ADR-0033 store. OFF by
+      # default, deliberately: a full pass over a 16 MiB chunk is ~1.1 ms against
+      # the 1.335 ms the device takes to read it, so it is a ~45 % throughput tax
+      # to re-check what NVMe end-to-end protection already covers and what the
+      # client's delivery digest checks again end to end.
+      #
+      # What is checked REGARDLESS is the slot's KEY, which is the failure this
+      # daemon's own bookkeeping can cause (an index naming a slot that holds
+      # another key's bytes). That check is never optional. See ADR-0033
+      # § Integrity for the full trade.
+      verify-chunk-body: true
+      {{- end }}
+    backend:
+      # express (S3 Express One Zone, same-AZ) | standard (S3 Standard regional,
+      # cross-AZ). ADR-0023: explicit, never sniffed from the bucket name.
+      backend-type: {{ .Values.config.backendType | default "express" | quote }}
+      endpoint: {{ .Values.config.s3Endpoint | quote }}
+      force-path-style: {{ .Values.config.forcePathStyle | default false }}
+    {{- with .Values.config.bucketMap }}
+    bucket-map:
+      {{- range $alias, $real := . }}
+      {{ $alias }}: {{ $real | quote }}
+      {{- end }}
+    {{- end }}
+    {{- if .Values.cluster.enabled }}
+    cluster:
+      peer-listen-addr: "0.0.0.0:{{ .Values.ports.peer }}"
+      channel-capacity: {{ .Values.cluster.channelCapacity | default 8 }}
+      {{- with .Values.cluster.h2StreamWindow }}
+      # HTTP/2 per-stream receive window on the peer plane, both directions. Unset →
+      # hyper's own default, which is 1 MiB inbound to a server and 2 MiB inbound to a
+      # client — asymmetric, and the server side is what a 16 MiB StoreChunk crosses.
+      h2-stream-window: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.cluster.h2ConnectionWindow }}
+      # HTTP/2 per-CONNECTION receive window. Channels are cached per peer and multiplex,
+      # so this is a per-peer total shared by every concurrent RPC — the one a StoreChunk
+      # fan-out to a single owner actually contends on. Unset → hyper's 1 MiB (server) /
+      # 5 MiB (client). Raising it raises what one peer can make this node buffer before
+      # the application reads it, which the ADR-0032 staging budget cannot refuse.
+      h2-connection-window: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.cluster.peerConnections }}
+      # HTTP/2 connections dialled per peer. Unset → 1, i.e. the single cached channel this
+      # has always been: one TCP flow and one framing task for every concurrent RPC to that
+      # peer, which is a ceiling EC2's 5 Gbps single-flow cap sits right on top of. Refused
+      # above 32 — every connection is a socket on both ends, times the peer count.
+      peer-connections: {{ . | int }}
+      {{- end }}
+      {{- with .Values.cluster.replicationR }}
+      # Co-home count R (ADR-0016). Unset → the daemon default (2). Pin to 1 for
+      # a clean single-home ownership split (e.g. the A4 peer-plane benchmark):
+      # with R ≥ 2 in a small ring every key homes on the local node, so a
+      # cross-node fetch never crosses the peer plane.
+      replication-r: {{ . }}
+      {{- end }}
+      {{- with .Values.cluster.rdmaArenaBytes }}
+      # Requester-side RDMA arena bytes (ADR-0024) = the node's
+      # concurrent-peer-fetch capacity on the zero-copy path, since ranges =
+      # bytes ÷ chunk-size and a range stays leased until the client drains the
+      # served bytes. Unset → transport default (4Gi). Keep
+      # efa.pinnedPoolReservation in step: this + (256 × chunk-size).
+      rdma-arena-bytes: {{ . | quote }}
+      {{- end }}
+      {{- with include "pacer.cacheSlabBytes" . }}
+      # ADR-0028: the cache's RAM tier AS a registered slab of chunk-sized frames
+      # — cached chunks are RDMA-postable in place, so a serve skips the staging
+      # copy (holder_copy measured 0.348 -> exactly 0.000 CPU-s/GiB).
+      #
+      # ON BY DEFAULT wherever efa.hugepages is set, DERIVED as
+      # `config.memCapacity + 256 x config.chunkSize` — see pacer.cacheSlabBytes for
+      # why hugepages are the gate (registration is per page AND per rail, so a
+      # base-page slab of this size would trip the startup probe) and why 256 is the
+      # measured in-flight headroom rather than a guess. Set cluster.cacheSlabBytes to
+      # override, including to a small value for a control arm.
+      #
+      # pacer_cache_slab_heap_fallbacks_total is the runtime signal that it is
+      # undersized; ~0 is the only acceptable reading. The cgroup limit already
+      # includes this (pacer.memoryLimit), once, not per rail.
+      cache-slab-bytes: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.cluster.rdmaRailWindow }}
+      # WRITEs one rail may have on the wire at once (planning/19 D5.1). Unset/0 =
+      # unbounded, which is what every arm through D5 step 0 measured: a rail's
+      # depth is then whatever serve admission × the requester's round-robin
+      # happens to produce, an emergent number nobody chose. The transport-only
+      # bench keeps an explicit window per rail and swept it — window shape mattered
+      # there (1 beat 64 at 32 rails into host memory) — so this exists to be swept
+      # here too. Watch pacer_rdma_rail{metric="writes_in_flight"}: pinned at this
+      # value means the window binds; well below means something upstream does.
+      rdma-rail-window: {{ . }}
+      {{- end }}
+      {{- if hasKey .Values.cluster "rdmaAffinity" }}
+      {{- if not (eq (toString .Values.cluster.rdmaAffinity) "") }}
+      # Place each rail's completion reaper + RDMA arenas on that rail's own NIC
+      # NUMA node (planning/19 D5 step 0). Unset → on, which is the discipline the
+      # ~58 GiB/s transport-only bar was measured with; `false` reproduces the
+      # pre-D5 daemon exactly, which is the control arm for that comparison and
+      # the escape hatch on a host where pinning misbehaves.
+      rdma-affinity: {{ .Values.cluster.rdmaAffinity }}
+      {{- end }}
+      {{- end }}
+      {{- if .Values.efa.hugepages }}
+      # The pod requests hugepages of exactly this size (efa.hugepageSizeMib decides
+      # both this line and the `hugepages-2Mi`/`hugepages-1Gi` resource name via
+      # `pacer.hugepageResource`), so tell the daemon to map its arenas from that
+      # pool. Derived from the SAME value rather than being its own knob: an arena
+      # mapping a size the pod never requested fails ENOMEM (planning/18 harness
+      # note) and would degrade to 4 KiB pages, silently wasting the reservation.
+      # NOT a throughput setting — page size buys registration cost and translation
+      # footprint, not bandwidth.
+      rdma-arena-page-mib: {{ .Values.efa.hugepageSizeMib | default 2 | int }}
+      {{- end }}
+      {{- with .Values.cluster.efaRails }}
+      # EFA rails to bring up (A5 multi-rail). Unset/0 = all devices on the
+      # node; 1 reproduces the pre-A5 single-rail transport.
+      efa-rails: {{ . }}
+      {{- end }}
+      {{- with .Values.cluster.efaQpsPerRail }}
+      # SRD queue pairs per rail (A5 multi-QP). Unset/1 = one QP per rail
+      # (pre-multi-QP behavior); raise it (2/4/8) so the holder round-robins
+      # its WRITEs across enough QPs to fill a rail a single SRD QP cannot
+      # saturate. The extra QPs share the rail's PD/CQ/pump.
+      efa-qps-per-rail: {{ . }}
+      {{- end }}
+      {{- with .Values.cluster.localAdmissionThreshold }}
+      # Requester-local admission threshold (ADR-0016 layer 1). Unset → daemon
+      # default (2). Set very high to effectively disable local admission so a
+      # transport benchmark keeps crossing the peer plane instead of serving hot
+      # keys from a locally-admitted copy after a couple of hits.
+      local-admission-threshold: {{ . }}
+      {{- end }}
+    {{- end }}
+    {{- if .Values.delivery.enabled }}
+    # Delivery into client-supplied memory (ADR-0026, planning/19 Track C). A
+    # cooperating client names a shm segment it owns and the daemon delivers into
+    # it, answering with a header-only 200; clients that send no
+    # `x-pacer-target` header are unaffected, which is why this ships ON. It does
+    # mean the daemon maps and PINS memory a client named, so the cost of the
+    # default is not behavioural: delivery.pinnedReservation and the derived
+    # working set are ADDED to the container memory limit (pacer.memoryLimit),
+    # which is what `delivery.enabled: false` gets back.
+    delivery:
+      enabled: true
+      {{- with .Values.delivery.shmDir }}
+      # Where `shm:/name` resolves. Default /dev/shm, which is where shm_open
+      # puts POSIX segments — override only if the tmpfs the client and the
+      # daemon share is mounted elsewhere.
+      shm-dir: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.delivery.maxTargetBytes }}
+      # Per-request ceiling on client memory one GET may pin. Over it, the read
+      # is served as a body instead (never failed), so this bounds a client's
+      # mistake rather than its workload.
+      max-target-bytes: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.delivery.parallelism }}
+      # Windows filled concurrently per delivered GET. Unset → the daemon default
+      # (64). Distinct from policy.fill-parallelism on purpose: that one bounds an
+      # ordered body stream; these are disjoint destinations with no ordering
+      # constraint, and one checkpoint GET is thousands of them.
+      parallelism: {{ . }}
+      {{- end }}
+      {{- with .Values.delivery.pinnedBytesMax }}
+      # Node-wide ceiling on concurrently pinned client memory. Independent of
+      # cluster.rdmaArenaBytes — those pages are the daemon's, these are
+      # clients' — and both have to fit the node, so raise
+      # delivery.pinnedReservation with it.
+      pinned-bytes-max: {{ . | quote }}
+      {{- end }}
+      {{- if .Values.delivery.remoteWrite }}
+      # planning/19 C3: a remote chunk bound for a CLIENT-registered window (`nic:`,
+      # ADR-0030) is written by its HOLDER directly, instead of arriving on the
+      # reading node and being written on from there. Off by default as the arm's
+      # control — both paths deliver the same bytes with the same integrity
+      # guarantee, since a holder that cannot reach the client streams instead.
+      # No effect on `shm:` targets, where the daemon registered the window and
+      # holders have always written into it directly.
+      remote-write: true
+      {{- end }}
+    {{- end }}
+    {{- if include "pacer.scatterConfigured" . }}
+    # Write scatter (ADR-0032, planning/24): a PUT of a new key is decomposed onto
+    # the chunk grid, each chunk's home uploads its own part and caches it, and
+    # CompleteMultipartUpload is the single durability fence before the client's 200.
+    # Standard backends only — pacer.validateScatter refuses the Express render, and
+    # the daemon refuses it at startup.
+    #
+    # `enabled` is emitted EXPLICITLY, in both directions, and the false case is the
+    # load-bearing one: the daemon applies the same backend-scoped default when the file
+    # says nothing (config.rs), so omitting the block on a Standard backend would turn the
+    # scatter back on and overrule an operator who asked for it off. The block is skipped
+    # entirely only for Express-with-the-knob-unset, where the default does not apply and
+    # every existing release must keep rendering a byte-identical ConfigMap.
+    scatter:
+      enabled: {{ ternary "true" "false" (ne (include "pacer.scatterEnabled" .) "") }}
+      {{- if include "pacer.scatterEnabled" . }}
+      # Emitted even when the operator left it empty, because pacer.memoryLimit had
+      # to budget for a specific number and this is how the daemon is held to the
+      # same one. See pacer.scatterStagingBytes.
+      staging-bytes: {{ include "pacer.scatterStagingBytes" . | quote }}
+      {{- with .Values.scatter.stagingTtlSecs }}
+      # Seconds a staged chunk may sit before the reaper returns its budget — the
+      # backstop for a coordinator that died between an owner's upload and its
+      # commit. Unset/0 → the daemon default (900).
+      staging-ttl-secs: {{ . }}
+      {{- end }}
+      {{- with .Values.scatter.windowsInFlight }}
+      # Coordinator windows in flight; bounds its own footprint to this x chunkSize
+      # and backpressures the client's socket. Unset/0 → the daemon default (16),
+      # which is the figure pacer.memoryLimit assumes when this is empty.
+      windows-in-flight: {{ . }}
+      {{- end }}
+      {{- with .Values.scatter.minObjectBytes }}
+      # Smallest object to scatter. Unset → the daemon default (128MiB). Confines the
+      # composite-ETag change to objects big enough for a parallel upload to pay for
+      # it; NOT config.minObjectSize, which decides what is cacheable.
+      min-object-bytes: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.scatter.saturatedCooldownSecs }}
+      # Seconds a coordinator stops offering to an owner that refused for load. An
+      # owner can only refuse AFTER gRPC delivered the window, so this turns one
+      # wasted transfer per window into one per peer. Unset/0 → the default (5).
+      saturated-cooldown-secs: {{ . }}
+      {{- end }}
+      {{- end }}
+    {{- end }}

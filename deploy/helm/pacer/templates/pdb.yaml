@@ -1,0 +1,44 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- /*
+A PodDisruptionBudget for a DaemonSet, which is a less obvious object than it looks.
+
+WHAT IT ADDS over the RollingUpdate strategy already in daemonset.yaml. That strategy
+bounds the CONTROLLER's own rollout to one pod at a time, because a cache-tier restart is a
+cold cache on that node. It says nothing about disruptions the controller does not own:
+node consolidation, a Karpenter drain, a cluster upgrade, an operator's own eviction. This
+extends the same one-at-a-time guarantee to anything that goes through the EVICTION API, so
+a consolidation event cannot take several cache nodes at once and drop every client on them
+onto the backend simultaneously.
+
+WHAT IT DOES NOT COVER: `kubectl drain --ignore-daemonsets` — the documented way to drain a
+node that runs DaemonSets — does not evict DaemonSet pods at all, so no PDB constrains that
+path.
+
+THE SELECTOR IS PER-RELEASE (pacer.selectorLabels = chart name + release instance), which
+matters here because `session.exclusiveNodes` deliberately leaves a SECOND release's pod
+Pending on a claimed node. That interloper carries a different
+`app.kubernetes.io/instance`, so it cannot consume this release's budget. This release's OWN
+Pending pod does: at maxUnavailable 1 with one pod already unavailable, every further
+eviction blocks until it recovers. That is the intended reading — the healthy remainder IS
+the fleet — and it is the reason a deliberately-partially-Pending bench fleet should set
+`enabled: false`.
+
+policy/v1 (Kubernetes 1.21+). See docs/helm/scheduling.md#poddisruptionbudget.
+*/ -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pacer.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pacer.labels" . | nindent 4 }}
+  {{- with .Values.podDisruptionBudget.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "pacer.selectorLabels" . | nindent 6 }}
+{{- end }}

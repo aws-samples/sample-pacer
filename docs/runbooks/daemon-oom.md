@@ -77,7 +77,7 @@ Four on the daemon, four on a client. The class column drives § 3.
 | 5 | 2026-08-24 | `c5-safetensors-8b.md` (70B integrity) | 1 × p5.48xlarge | **client pinned memory** | The loader pod was OOM-killed: `pacer_nic._verify` copied a whole **4.4 GiB span per concurrent shard** on top of a 64 GiB pinned window. Fix: stream read-back in 64 MiB pieces; client pod memory is `C5_MEMORY` (default `32Gi`). |
 | 6 | 2026-08-24 | `c5-multirail.md` (70B striped) | 1 × p5.48xlarge, 4 rails, HBM window | **client pinned memory** (residual, cause unknown) | A 70B integrity arm OOM-killed a 32 GiB client pod **even with both verification paths bounded to 64 MiB pieces**. Fix: client pod raised to **96 GiB + 6 workers**. Explicitly unresolved — "what consumes the difference is not yet known, and nothing here samples the *client's* RSS". |
 | 7 | 2026-08-26 | `c4-foyer-readpath.md` (70B DCP warm pass) | 1 × p5.48xlarge | **client host memory** | DCP holds the whole destination state dict (~131 GiB) against `dcp.sh`'s `24Gi` default, so the warm pass is OOMKilled (exit 137) ~8 s in and the only upstream symptom is "the arm did not complete". Fix: **`LADDER_DCP_BENCH_MEMORY` is mandatory on a 70B arm** (docs use `200Gi`). |
-| 8 | 2026-08-25 | `vllm-load-gate.md`, restated in `vllm-placement.md` | 1 × p5.48xlarge spot, TP=8, 131 GiB checkpoint | **client host memory** (third-party loader) | **Run:ai's distributed mode OOM-killed a 192 GiB pod** — `RUNAI_STREAMER_MEMORY_LIMIT` defaults to unlimited with distributed streaming on. Deliberately NOT capped (that would handicap the vendor arm); the pod is sized instead — **`C5_VLLM_MEMORY=768Gi` is mandatory for any Run:ai `DIST=1` arm**, and the driver's own default derives `32Gi` at TP=8, which is the trap. |
+| 8 | 2026-08-25 | `vllm-load-gate.md`, restated in `vllm-placement.md` | 1 × p5.48xlarge spot, TP=8, 131 GiB checkpoint | **client host memory** (comparison loader, not PACER) | A third-party loader's **distributed mode OOM-killed a 192 GiB pod**: its own streamer memory cap defaults to unlimited once distributed streaming is on. Deliberately NOT capped, because capping it would handicap the arm it exists to measure — the pod is sized instead, and **`C5_VLLM_MEMORY=768Gi` is mandatory for any distributed comparison arm**. The trap is that the driver's derived default is `32Gi` at TP=8. |
 
 ### A ninth occurrence that is exit 137 and NOT an OOM
 
@@ -161,7 +161,7 @@ chart. Check the **client pod's** own limit and the harness variable that sets i
 |---|---|---|
 | `pacer_st_bench` / the NIC loader (C5 arms) | `C5_MEMORY` (default `32Gi`) | incidents 5 and 6. A 70B integrity arm needs ~96 GiB even with verification bounded to 64 MiB pieces. |
 | the DCP bench pod | `LADDER_DCP_BENCH_MEMORY` (`dcp.sh` default `24Gi`) | incident 7. **Mandatory** on a 70B arm; DCP holds the whole ~131 GiB destination state dict. Docs use `200Gi`. |
-| the vLLM pod | `C5_VLLM_MEMORY` | incident 8. **Mandatory** for any Run:ai `DIST=1` arm — `768Gi`. The driver's derived default is `32Gi` at TP=8. |
+| the vLLM pod | `C5_VLLM_MEMORY` | incident 8. **Mandatory** for any distributed comparison arm (`DIST=1`) — `768Gi`. The driver's derived default is `32Gi` at TP=8. |
 
 Two daemon-side keys bound what a client can make the *daemon* pin, and they are checked at
 render time: `delivery.maxTargetBytes` (per request) must not exceed

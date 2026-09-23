@@ -282,7 +282,7 @@ Raise the memory limit, or shrink the tier, until the base leaves real slack.
 
 The daemon runs **Burstable** by design: a CPU request, no CPU limit. The reasoning, the
 numbers behind it and the conditions under which an operator should override it are in
-ADR-0035 and summarised in
+[ADR-0035](../adr/0035-daemon-resources-and-qos-class.md) and summarised in
 [scheduling.md](scheduling.md#cpu-qos-and-why-there-is-no-cpu-limit).
 
 ## See also
@@ -295,7 +295,7 @@ ADR-0035 and summarised in
 * [efa-and-rdma.md](efa-and-rdma.md) — the arenas and ADR-0028's slab.
 * [delivery.md](delivery.md), [write-scatter.md](write-scatter.md) — the other two
   invisible footprints.
-* `planning/adr/0024-registered-arena-rdma-buffers.md`,
-  `planning/adr/0028-cache-ram-tier-is-the-registered-arena.md`,
-  `planning/adr/0032-write-scatter-populates-the-cache.md`,
-  `planning/adr/0033-chunk-store-owns-the-disk-tier.md`.
+* [`docs/adr/0024-registered-arena-rdma-buffers.md`](../adr/0024-registered-arena-rdma-buffers.md),
+  [`docs/adr/0028-cache-ram-tier-is-the-registered-arena.md`](../adr/0028-cache-ram-tier-is-the-registered-arena.md),
+  [`docs/adr/0032-write-scatter-populates-the-cache.md`](../adr/0032-write-scatter-populates-the-cache.md),
+  [`docs/adr/0033-chunk-store-owns-the-disk-tier.md`](../adr/0033-chunk-store-owns-the-disk-tier.md).

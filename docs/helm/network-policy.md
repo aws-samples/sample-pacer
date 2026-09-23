@@ -4,7 +4,7 @@
 
 # Who may reach the daemon — ADR-0006's authorization boundary
 
-ADR-0006 re-signs every request with
+[ADR-0006](../adr/0006-strip-and-resign-auth.md) re-signs every request with
 the NODE's IAM identity, so **reaching `:9000` IS the authorization to spend it**. That
 makes this block the client-side security model, not a hardening extra — and it is why the
 policy ships ON (`networkPolicy.enabled: true`).
@@ -113,4 +113,4 @@ spelled out instead:
 
 * [`README.md`](../../README.md) § "Securing access — reachability *is* authorization".
 * `threat-model.md` — M-001, T-002, T-003, T-008.
-* ADR-0006.
+* [ADR-0006](../adr/0006-strip-and-resign-auth.md).

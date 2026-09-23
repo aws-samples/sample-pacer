@@ -62,7 +62,7 @@ round-trips.
 
 The daemon ships **Burstable**: `resources.requests.cpu` is set, `resources.limits` carries
 **memory only**. That is a decision with a record —
-ADR-0035 — not an omission.
+[ADR-0035](../adr/0035-daemon-resources-and-qos-class.md) — not an omission.
 The short form:
 
 * **CFS throttling is the wrong failure mode for this daemon.** ADR-0025 gives every EFA
@@ -143,7 +143,7 @@ need a manual roll.
 
 ## `serviceAccount`
 
-Backend auth is EKS Pod Identity (ADR-0006):
+Backend auth is EKS Pod Identity ([ADR-0006](../adr/0006-strip-and-resign-auth.md)):
 associate this ServiceAccount with the role holding `s3express:CreateSession` on the bucket
 ARN, cluster-side —
 
@@ -192,7 +192,7 @@ invariants (single AZ-ID, Nitro v4+, RAID0, EFA).
 shuffle per-account; the bucket lives in an AZ ID.
 
 `instanceFamilies` lists families with Nitro v4+ (RDMA READ capable —
-ADR-0004). g5/c5n are deliberately
+[ADR-0004](../adr/0004-nitro-v4-plus-nodepool.md)). g5/c5n are deliberately
 absent: no RDMA, they'd silently degrade to gRPC.
 
 ## The image
@@ -211,7 +211,7 @@ nonroot but the hostPath dir is created root-owned.
 ## See also
 
 * ADR-0029,
-  ADR-0035.
+  [ADR-0035](../adr/0035-daemon-resources-and-qos-class.md).
 * `scripts/dev/README-session.md` — the cluster
   protocol these knobs implement.
 * [memory-model.md](memory-model.md) — `resources.limits.memory` is a budget, not the limit.

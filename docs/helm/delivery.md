@@ -144,6 +144,6 @@ Only computed when `delivery.enabled`: with ADR-0026 off no client names a targe
 
 - [memory-model.md](memory-model.md) — how the arenas, the ADR-0028 slab, the write-scatter staging budget and this section's two reservations all add up against `resources.limits.memory`.
 - [efa-and-rdma.md](efa-and-rdma.md) — the peer plane `remoteWrite`'s holder-direct writes depend on, and the one every GPU delivery now goes through.
-- ADR-0026 — Client-supplied target memory
-- ADR-0027 — GPU memory delivery targets
-- ADR-0030 — Delivery registration belongs to the memory owner
+- [ADR-0026 — Client-supplied target memory](../adr/0026-client-supplied-target-memory.md)
+- [ADR-0027 — GPU memory delivery targets](../adr/0027-gpu-memory-delivery-targets.md)
+- [ADR-0030 — Delivery registration belongs to the memory owner](../adr/0030-delivery-registration-belongs-to-the-memory-owner.md)

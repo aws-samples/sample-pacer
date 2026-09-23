@@ -216,7 +216,7 @@ from outside:
   `resources.requests.memory` toward the tier size on a node you control.
 * **`priorityClassName`** is `system-node-critical` by default. If an overlay lowered it, a
   preemption can take the cache out from under every client on the node.
-* **No CPU limit** is deliberate (ADR-0035):
+* **No CPU limit** is deliberate ([ADR-0035](../adr/0035-daemon-resources-and-qos-class.md)):
   CFS throttling stalls the whole cgroup for the rest of a 100 ms period, and ADR-0025 gives
   every EFA rail a pinned OS thread whose fd wakeup cannot afford that. If an overlay set
   `resources.limits.cpu`, remove it before chasing anything else.

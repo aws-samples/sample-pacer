@@ -390,6 +390,17 @@ where
 /// [`poll_until`] with an explicit budget, for the effects that cross a real socket
 /// and so want [`PATIENCE`] rather than [`SETTLE_BUDGET`].
 ///
+/// `awaited` is interpolated into the panic message on purpose, and callers build it from
+/// whatever identifies the condition — commonly a `NodeId`'s name. That draws a
+/// `rust/cleartext-logging` alert from CodeQL's default setup, **dismissed as a false
+/// positive** (alert #1, 2026-09-23) rather than worked around: `NodeId` exposes `name()`
+/// (the Kubernetes node name, which is also the ring's ownership hash input) and `addr()`
+/// (the pod IP), and the heuristic reads those field names as a person's name and postal
+/// address. Nothing sensitive reaches here — and naming the condition is the whole reason
+/// this helper exists, since the `sleep`-then-assert it replaced reported a timeout with
+/// no indication of *what* had not happened. If the alert reappears, re-read this rather
+/// than making the message less useful.
+///
 /// # Panics
 ///
 /// If `ready` has not reported true within `budget`.

@@ -10,16 +10,16 @@
 `cluster.enabled` (default **true**) turns on the Phase 2 cluster cache tier: a
 rendezvous-hash ring over the DaemonSet, membership from the headless peer Service's
 EndpointSlices, peer blob fetch over gRPC
-(ADR-0008,
-ADR-0012). Disabled = a
+([ADR-0008](../adr/0008-grpc-first-build-order.md),
+[ADR-0012](../adr/0012-owner-read-through-cluster-fill.md)). Disabled = a
 fleet of independent Phase 1 nodes.
 
 `cluster.channelCapacity` (default **8**) is the number of chunks buffered per peer blob
-stream (ADR-0013). Small
+stream ([ADR-0013](../adr/0013-yaml-config-file-layered-over-env.md)). Small
 on purpose: the stream itself is the backpressure.
 
 `cluster.replicationR` is the co-home count R
-(ADR-0016). Empty → the daemon default
+([ADR-0016](../adr/0016-multi-copy-replication.md)). Empty → the daemon default
 (2). Set to 1 to force a single-home ownership split — with R ≥ 2 in a small ring every key
 homes on the local node, so a cross-node fetch never crosses the peer plane, which is why
 the A4 peer-plane benchmark pins it to 1.
@@ -44,9 +44,9 @@ stays `false` because `enabled: true` requests an EFA device, which makes the po
 UNSCHEDULABLE on non-EFA nodes (dev, plain installs, CI): EFA is hardware-gated, so it
 can't be a universal chart default. The daemon probes for EFA at startup and speaks
 gRPC-only where it's absent regardless
-(ADR-0018), and every
+([ADR-0018](../adr/0018-holder-driven-rdma-write-data-plane.md)), and every
 RDMA error falls back to gRPC per-peer
-(ADR-0003) —
+([ADR-0003](../adr/0003-efa-rdma-cross-node-reads-only-grpc-fallback.md)) —
 the fallback path is the product for non-EFA nodes forever (ADR-0008).
 
 **The three knobs are deliberately independent** — enabling the RDMA transport does NOT
@@ -61,7 +61,7 @@ finding #7):
   `planning/18-p5-bandwidth-investigation.md`
   measured page size as irrelevant to bandwidth. What it buys is a cheap registration and
   a small NIC translation footprint for one arena spanning tens of GiB
-  (ADR-0024 point 3). Keep it
+  ([ADR-0024](../adr/0024-registered-arena-rdma-buffers.md) point 3). Keep it
   off unless the node pre-reserves 2Mi pages at boot: a `hugepages-2Mi` *request* on a
   node with zero reserved makes Karpenter refuse to launch (the fresh AMI pre-allocates
   none, and Karpenter also needs a NodeOverlay declaring the capacity plus the NodeOverlay
@@ -96,7 +96,7 @@ first, then set this value to match it.
 
 `efa.shareHostDevices` hostPath-mounts `/dev/infiniband` instead of asking the device
 plugin for `vpc.amazonaws.com/efa`
-(ADR-0030
+([ADR-0030](../adr/0030-delivery-registration-belongs-to-the-memory-owner.md)
 point 9). Pair it with `ipcLock`, since nothing else grants memlock either way.
 
 Why it exists: one device serves many protection domains and queue pairs at once, so the
@@ -236,7 +236,7 @@ value means the window binds; well below means something upstream does.
 
 `cluster.rdmaAffinity` pins each rail's RDMA completion reaper — and registers its arenas —
 on that rail's own NIC NUMA node (planning/19 D5,
-ADR-0025). Empty → on.
+[ADR-0025](../adr/0025-rail-numa-placement-and-pinned-reapers.md)). Empty → on.
 Set to `false` ONLY to reproduce the pre-D5 daemon: it is the control arm for the
 ~58-vs-15.7 GiB/s comparison, not a tuning knob. Placement is best-effort either way (a
 host whose sysfs topology is unreadable simply runs unplaced), and the daemon logs which of
@@ -275,10 +275,10 @@ serving.
 * [delivery.md](delivery.md) — the client-side registered memory ADR-0030 inverts.
 * [cache-and-disk-tier.md](cache-and-disk-tier.md) — `chunkSize`, which sizes the holder
   arena and the slab.
-* ADRs 0018,
-  0021,
-  0022,
-  0024,
-  0025,
-  0028,
-  0030.
+* ADRs [0018](../adr/0018-holder-driven-rdma-write-data-plane.md),
+  [0021](../adr/0021-efadv-ibverbs-not-libfabric.md),
+  [0022](../adr/0022-gpudirect-hbm-target-and-multi-rail-efa.md),
+  [0024](../adr/0024-registered-arena-rdma-buffers.md),
+  [0025](../adr/0025-rail-numa-placement-and-pinned-reapers.md),
+  [0028](../adr/0028-cache-ram-tier-is-the-registered-arena.md),
+  [0030](../adr/0030-delivery-registration-belongs-to-the-memory-owner.md).

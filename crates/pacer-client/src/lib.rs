@@ -2,7 +2,7 @@
 //! announces — so a daemon can WRITE an S3 object straight into it.
 //!
 //! Everything the daemon needs for token delivery has existed since
-//! [ADR-0030](../../../planning/adr/0030-delivery-registration-belongs-to-the-memory-owner.md)
+//! [ADR-0030](../../../docs/adr/0030-delivery-registration-belongs-to-the-memory-owner.md)
 //! landed, and it is proven on hardware (`bench/ladder/results/c2-token-gate.md`: an object
 //! written into a client's H100 window, byte-verified). What did not exist was a
 //! *counterparty a real loader can be*. The only token producer was `spike/efa`'s
@@ -42,7 +42,7 @@
 //!
 //! Not a transport: it posts no send and no WRITE. Not a ring member: a delivery client is
 //! deliberately not required to be one (ADR-0030 point 6), so nothing here links gRPC or
-//! joins a cluster. Not the publication route either — [ADR-0031](../../../planning/adr/0031-nixl-publish-as-a-backend-plugin.md)
+//! joins a cluster. Not the publication route either — [ADR-0031](../../../docs/adr/0031-nixl-publish-as-a-backend-plugin.md)
 //! makes the shipping client half a NIXL backend plugin in C++; that plugin does what
 //! [`ffi`] does, against the same [`token`] grammar and the same
 //! [`pacer_transport::announce`] format, which is why both of those live outside the `efa`

@@ -376,5 +376,5 @@ is where they watch it.
 
 * [memory-model.md](memory-model.md) — the memory sizing rule, including the
   rule 3 page-cache guidance referenced above.
-* ADR-0032: A write populates the cache, and each chunk's home uploads its own part
+* [ADR-0032: A write populates the cache, and each chunk's home uploads its own part](../adr/0032-write-scatter-populates-the-cache.md)
 * planning/24-write-path.md

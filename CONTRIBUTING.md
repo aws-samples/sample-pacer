@@ -115,13 +115,22 @@ Documentation style follows the
 
 ### Design-record references (`ADR-nnnn`, `planning/…`, `spike/…`)
 
-Comments throughout the code cite design records — `ADR-0016`, `planning/15`,
-`spike/efa`, and similar. These are the project's internal architecture-decision records
-and research notes; they are **not published in this repository** (yet), so the
-references don't resolve here. They are kept in the code on purpose: they mark *which
-decision* a constraint or constant came from, and they resolve for the maintainers when
-tracing a design question. Treat them as provenance pointers, and feel free to ask about
-any of them in an issue.
+Comments throughout the code cite design records. Two kinds, and they resolve differently:
+
+- **`ADR-nnnn` — published, in [`docs/adr/`](docs/adr/README.md).** The decision behind a
+  constraint, a constant or a default, with the reasoning and the consequences. If a comment
+  cites `ADR-0016`, that record is in this repository and worth reading. Note the
+  [provenance rule on their figures](docs/adr/README.md#the-figures-in-these-records-are-not-benchmarks):
+  measurements inside an ADR are development-phase experiment records, not benchmarks, and
+  the numbers meant for quoting are in [`docs/benchmarks/`](docs/benchmarks/README.md).
+- **`planning/…` and `spike/…` — not published.** Research notes, phase plans and hardware
+  spikes, kept in the project's internal repository. Those references do not resolve here.
+  They are left in the code on purpose: they mark *which* investigation a constraint came
+  from, and they resolve for the maintainers when tracing a design question. Treat them as
+  provenance pointers, and feel free to ask about any of them in an issue.
+
+One ADR is deliberately absent — ADR-0029 decides a convention for the project's own
+multi-session development cluster, and the tooling it governs does not ship.
 
 
 ## Finding contributions to work on

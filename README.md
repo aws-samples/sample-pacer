@@ -361,6 +361,7 @@ make image      # self-contained local image build
 | [crates/pacer-proto](crates/pacer-proto) | Peer protobufs: handshake, blob fetch, invalidate, directory, scatter |
 | [deploy/helm/pacer](deploy/helm/pacer) | The chart: DaemonSet, node-local Service, NetworkPolicy, optional Karpenter nodepool, EFA and delivery overlays |
 | [deploy/grafana](deploy/grafana) | Dashboard JSON model + import notes |
+| [docs/adr](docs/adr/README.md) | Architecture Decision Records — one per locked decision, with the reasoning and what it cost |
 | [docs/helm](docs/helm/README.md) | Why each chart default is what it is, with its measurement |
 | [docs/benchmarks](docs/benchmarks/README.md) | Published measurements, method, reproduction scripts |
 | [docs/runbooks](docs/runbooks/daemon-oom.md) | Operational runbooks |

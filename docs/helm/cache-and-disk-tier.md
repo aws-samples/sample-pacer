@@ -5,7 +5,7 @@
 ## Config-file precedence (ADR-0013)
 
 `config:` is rendered into a ConfigMap (`templates/configmap.yaml`) mounted at
-`/etc/pacer/config.yaml` (ADR-0013).
+`/etc/pacer/config.yaml` ([ADR-0013](../adr/0013-yaml-config-file-layered-over-env.md)).
 Precedence: built-in defaults < this file < `PACER_*` env. A ConfigMap edit rolls the
 DaemonSet via a checksum annotation.
 
@@ -17,11 +17,11 @@ startup — the checksum annotation on the DaemonSet is what rolls pods when thi
 ## Backend shape (ADR-0023) and bucket aliasing
 
 - **`backendType`** (default `express`) — `"express"` (S3 Express One Zone directory
-  bucket, same-AZ — the ADR-0002
+  bucket, same-AZ — the [ADR-0002](../adr/0002-s3-express-one-zone-same-az-backend.md)
   default) or `"standard"` (S3 Standard regional bucket, cross-AZ, full functional
   parity). Chosen explicitly, not sniffed from the bucket name. Standard drops the
   Express same-AZ latency weld (parity is functional, not performance-equivalent — see
-  ADR-0023 /
+  [ADR-0023](../adr/0023-pluggable-s3-backend-type-express-or-standard.md) /
   the D2 benchmark).
 
 - **`s3Endpoint`** — zonal endpoint of the S3 Express directory bucket's AZ (same AZ as
@@ -80,7 +80,7 @@ startup — the checksum annotation on the DaemonSet is what rolls pods when thi
   without going through the chunked cache.
 
 - **`maxObjectSize`** — optional whole-object admission cap
-  (ADR-0015). Unset (the default) →
+  ([ADR-0015](../adr/0015-chunk-granular-caching.md)). Unset (the default) →
   unbounded: the chunked cache stores an object of any size as chunk-size pieces
   distributed across the ring — the whole point of chunking is a checkpoint far larger
   than any node's RAM. Set a value only as an operator safety valve to proxy
@@ -265,8 +265,8 @@ concurrent misses for one key, so it is a workload choice, not an upgrade.
 ## Which implementation owns the disk tier (ADR-0033)
 
 **`diskTier`** — which implementation holds chunk bodies on disk
-(ADR-0033, defaulted by
-ADR-0038): `"foyer"`
+([ADR-0033](../adr/0033-chunk-store-owns-the-disk-tier.md), defaulted by
+[ADR-0038](../adr/0038-chunk-store-is-the-default-disk-tier.md)): `"foyer"`
 (an entry per chunk) or `"store"` (one `pread` into a registered frame).
 
 **Empty → DERIVED, and the condition matters:** `"store"` wherever an ADR-0028 cache slab
@@ -321,7 +321,7 @@ either way (an invalidation clears both), but a switched node starts cold for ch
 
 **`conditionalGetFromCache`** (default `true`) — whether a GET carrying `If-Match` may be
 served from the cache when the ETag the client named equals the one this node resolved
-(ADR-0039).
+([ADR-0039](../adr/0039-if-match-may-be-served-from-cache.md)).
 
 **Why it defaults on:** Mountpoint-for-S3 puts `If-Match` on **every** GET it issues, so with
 this off its measured hit rate against PACER is **0 %** and 100 % of its reads bypass —
@@ -387,7 +387,7 @@ full trade.
   ADR-0028 slab add up against the container's memory limit.
 - [`efa-and-rdma.md`](efa-and-rdma.md) — the RDMA serve-path runtime that
   `rdmaWorkerThreads` isolates from the main one.
-- ADR-0013 — YAML config file layered over env
-- ADR-0015 — Chunk-granular caching
-- ADR-0023 — Pluggable S3 backend type (Express or Standard)
-- ADR-0033 — Chunk store owns the disk tier
+- [ADR-0013 — YAML config file layered over env](../adr/0013-yaml-config-file-layered-over-env.md)
+- [ADR-0015 — Chunk-granular caching](../adr/0015-chunk-granular-caching.md)
+- [ADR-0023 — Pluggable S3 backend type (Express or Standard)](../adr/0023-pluggable-s3-backend-type-express-or-standard.md)
+- [ADR-0033 — Chunk store owns the disk tier](../adr/0033-chunk-store-owns-the-disk-tier.md)

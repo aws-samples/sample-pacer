@@ -1,4 +1,5 @@
-//! Resolving one chunk, and the guard that stops two resolutions racing.
+//! Resolving one chunk, and the single flight that stops two resolutions doing
+//! the same backend read (ADR-0040).
 //!
 //! [`FillCtx`] is everything a single chunk resolution needs, shared (via `Arc`)
 //! across the read path's bounded look-ahead pipeline so each in-flight
@@ -10,16 +11,34 @@
 //! (ADR-0028), and a backend read retries under [`pacer_backend::retry`] because
 //! by then the client's `200` has already gone out.
 //!
-//! **The invariant this module owns: at most one fill per chunk key node-wide,
-//! and a claim that is always released.** [`FillGuard`] holds the key in the
-//! shared `filling` set and frees it in `Drop` — which is why it exists at all: a
-//! manual `.remove()` is skipped by exactly the two things that happen most (a
-//! client that disconnects mid-stream, an early `?`), and the key then stayed
-//! claimed for the daemon's lifetime with no metric to show it. The peer server's
-//! read-through claims through this same type ([`crate::peer`]), so the two fill
-//! paths cannot disagree about who holds a key.
+//! # The two invariants, and why they are not the same one
+//!
+//! **At most one fill per chunk key node-wide, and a claim that is always
+//! released.** [`FillGuard`] holds the key in the shared [`FillRegistry`] and
+//! frees it in `Drop` — which is why it exists at all: a manual `.remove()` is
+//! skipped by exactly the two things that happen most (a client that disconnects
+//! mid-stream, an early `?`), and the key then stayed claimed for the daemon's
+//! lifetime with no metric to show it. The peer server's read-through claims
+//! through this same type ([`crate::peer`]), so the two fill paths cannot
+//! disagree about who holds a key.
+//!
+//! **At most one backend read per chunk key node-wide** (ADR-0040) is a
+//! *different* claim, and until that ADR only the first one held. The guard used
+//! to be taken *after* the backend read, from inside `maybe_fill`, so N clients
+//! arriving on one cold chunk each issued their own ranged GET and then N-1 of
+//! them found the key claimed and skipped the insert: the writes were deduped,
+//! the reads were not. Now the home's read claims *first*
+//! ([`FillCtx::fetch_owned`]), and a second arrival is handed the leader's bytes
+//! rather than a second GET.
+//!
+//! The registry entry is a three-state [`FillState`] rather than a bare key
+//! because a second arrival has to be able to tell three situations apart: bytes
+//! are coming (wait), bytes are already here (take them), and nothing will ever
+//! be published (fetch your own). The third is what keeps this change small: the
+//! peer server's read-through and the layer-1 admit still claim exclusively, so
+//! they behave exactly as they did and nothing waits on them.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
@@ -32,6 +51,7 @@ use pacer_ring::directory::Tier;
 use pacer_transport::TransportError;
 use prometheus::{IntCounter, IntGauge};
 use s3s::{s3_error, S3Result};
+use tokio::sync::broadcast;
 use tracing::{trace, warn};
 
 use crate::cachefill::ChunkFill;
@@ -62,9 +82,13 @@ pub(super) struct FillCtx {
     /// Where a cached chunk's bytes go (ADR-0028), cloned from the proxy so this
     /// path and the peer server's read-through cannot disagree.
     pub(super) fill: ChunkFill,
-    /// Per-chunk-key fill guard, shared with the peer server (one fill per key
+    /// Per-chunk-key fill claims, shared with the peer server (one fill per key
     /// node-wide).
-    pub(super) filling: Arc<Mutex<HashSet<String>>>,
+    pub(super) filling: FillRegistry,
+    /// Whether a home's missed chunk read joins an in-flight read of the same key
+    /// instead of issuing its own (ADR-0040). Cloned from the proxy; `false` is the
+    /// pre-ADR-0040 path, byte for byte.
+    pub(super) coalesce: bool,
     /// How hard each chunk's backend read tries, cloned from the proxy.
     pub(super) read_retry: RetryPolicy,
     pub(super) object_key: String,
@@ -116,7 +140,8 @@ impl PacerProxy {
             cluster: self.cluster.clone(),
             metrics: self.metrics.clone(),
             fill: self.fill.clone(),
-            filling: Arc::clone(&self.filling),
+            filling: self.filling.clone(),
+            coalesce: self.fill_coalesce,
             read_retry: self.read_retry,
             object_key,
             bucket,
@@ -130,10 +155,215 @@ impl PacerProxy {
     }
 }
 
-/// RAII slot in the node-wide fill-dedup set (`filling`, shared by
-/// `maybe_admit_local`, `maybe_fill` and the peer server's own read-through
-/// fill): while a guard for `key` is alive, [`FillCtx::try_begin_fill`] on the
-/// same key returns `None`, so at most one fill per key runs at a time
+/// Published fills one waiter may fall behind before the value is lost.
+///
+/// One, because a leader sends exactly once: every waiter holds a receiver taken
+/// before that send, and the value's whole lifetime is the one slot. `broadcast`
+/// rejects a capacity of zero, and anything above one would only reserve room for
+/// a second send that cannot happen.
+const FILL_BROADCAST_CAPACITY: usize = 1;
+
+/// What one claimed chunk key is doing, and therefore what a second arrival
+/// should do about it.
+///
+/// The distinction that matters is between the last variant and the other two: a
+/// claim that will never publish anything must not be waited on, or a request
+/// would block on a fill whose bytes it is never going to see.
+enum FillState {
+    /// A leader is reading this chunk from the backend and will publish the bytes
+    /// to this channel. Subscribe and wait.
+    Fetching(broadcast::Sender<Bytes>),
+    /// The leader has published and has not yet finished inserting. Its bytes are
+    /// parked here so an arrival inside that window is served immediately instead
+    /// of subscribing to a channel that has already been sent to — `broadcast`
+    /// buffers nothing for a receiver that did not exist at send time, so without
+    /// this the request would wait and then fall back for no reason.
+    Filled(Bytes),
+    /// Claimed to serialise a *write* only: the peer server's read-through
+    /// ([`crate::peer`]) and the layer-1 admit of peer-fetched bytes
+    /// ([`FillCtx::maybe_admit_local`]) both already hold their bytes, so there is
+    /// no backend read to share. A second arrival fetches its own, exactly as it
+    /// did before ADR-0040.
+    Exclusive,
+}
+
+/// The node-wide record of which chunk keys are being filled right now, and by
+/// whom (ADR-0040). Cheap to clone — every fill path holds one, and the proxy
+/// hands the same registry to the peer server so the two cannot disagree.
+///
+/// `std::sync::Mutex`, not tokio's, and that is a property rather than a
+/// preference: every critical section here is one hash lookup with no `.await`
+/// inside it. A waiter receives its `broadcast::Receiver` from `claim_fill` and
+/// does its waiting *after* the lock is released, so the lock is never held
+/// across a suspension point.
+///
+/// Every method but [`Self::new`] is `pub(crate)` or private — this type is `pub`
+/// only because `main` hands one from the proxy to the peer server — so the doc
+/// above names `claim_fill` in plain backticks rather than linking it: a public
+/// item may not intra-doc-link a private one (`rustdoc::private_intra_doc_links`,
+/// fatal under the workspace's `-D warnings`).
+#[derive(Clone, Default)]
+pub struct FillRegistry {
+    /// One entry per claimed key; absent means nobody is filling it.
+    claims: Arc<Mutex<HashMap<String, FillState>>>,
+}
+
+/// What a would-be filler of one chunk key got when it asked
+/// ([`FillRegistry::claim_fill`]).
+pub(crate) enum FillClaim {
+    /// Nobody else was filling this key. This caller leads: read the backend,
+    /// publish, insert.
+    Lead(FillGuard),
+    /// A leader is mid-read. Await these bytes instead of issuing a second GET.
+    Follow(broadcast::Receiver<Bytes>),
+    /// A leader already published, and this caller landed before the claim was
+    /// released. Take the bytes; there is nothing to wait for.
+    Ready(Bytes),
+    /// The key is claimed by a path that publishes nothing ([`FillState::Exclusive`]).
+    /// Fetch your own bytes, exactly as every caller did before ADR-0040.
+    Busy,
+}
+
+impl FillRegistry {
+    /// An empty registry. One per daemon, shared by every fill path.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claim `key` for a **publishing** fill, or report who already holds it.
+    ///
+    /// The whole of ADR-0040's single flight is this one lookup: whoever finds the
+    /// key absent leads and everyone else is routed to the leader's bytes. Raises
+    /// [`Metrics::fill_inflight`] on a successful claim, like the exclusive path,
+    /// so the gauge keeps counting every claim however it was taken.
+    pub(crate) fn claim_fill(&self, metrics: &Metrics, key: &str) -> FillClaim {
+        let mut claims = self.claims.lock().unwrap();
+        match claims.get(key) {
+            Some(FillState::Fetching(tx)) => return FillClaim::Follow(tx.subscribe()),
+            Some(FillState::Filled(bytes)) => return FillClaim::Ready(bytes.clone()),
+            Some(FillState::Exclusive) => return FillClaim::Busy,
+            None => {}
+        }
+        // The receiver `channel` hands back is dropped immediately: waiters get
+        // their own through `subscribe`, and a leader with no waiters must not be
+        // kept from finishing by a receiver nobody is polling.
+        let (tx, _rx) = broadcast::channel(FILL_BROADCAST_CAPACITY);
+        claims.insert(key.to_owned(), FillState::Fetching(tx));
+        drop(claims);
+        FillClaim::Lead(FillGuard::new(self, key, metrics))
+    }
+
+    /// Claim `key` for exclusion only — no bytes will be published, so a second
+    /// arrival is told to fetch its own ([`FillClaim::Busy`]). `false` if the key
+    /// is already claimed by anyone, on any path.
+    ///
+    /// This is the pre-ADR-0040 claim, unchanged in meaning, and it is what the
+    /// peer server's read-through and the layer-1 admit still take: both already
+    /// hold the bytes they are about to insert, so there is no read to share and
+    /// making a waiter block on them would only couple one request's latency to
+    /// another's for nothing.
+    fn claim_exclusive(&self, key: &str) -> bool {
+        let mut claims = self.claims.lock().unwrap();
+        if claims.contains_key(key) {
+            return false;
+        }
+        claims.insert(key.to_owned(), FillState::Exclusive);
+        true
+    }
+
+    /// Hand `bytes` to every waiter on `key`, and leave them in the claim for
+    /// anyone who arrives before it is released.
+    ///
+    /// A `send` with no live receiver is not a failure — it is the ordinary case
+    /// of a fill nobody else asked for — so its `Err` is dropped. That is exactly
+    /// why the bytes are also parked in the entry: `broadcast` keeps nothing for a
+    /// receiver created after the send, and the window between this call and
+    /// [`Self::release`] is real (a `put_chunk` wide).
+    fn publish(&self, key: &str, bytes: &Bytes) {
+        let mut claims = self.claims.lock().unwrap();
+        let Some(state) = claims.get_mut(key) else {
+            return;
+        };
+        // `&*state`: `send` needs only a shared borrow, which ends with this block
+        // and so leaves the entry free to be replaced on the next line.
+        if let FillState::Fetching(tx) = &*state {
+            let _ = tx.send(bytes.clone());
+        } else {
+            return;
+        }
+        *state = FillState::Filled(bytes.clone());
+    }
+
+    /// Drop `key`'s claim. Reached from [`FillGuard::drop`] alone, which is what
+    /// makes "always released" true on every path — including a future dropped
+    /// mid-fill, where nothing else would have run.
+    fn release(&self, key: &str) {
+        self.claims.lock().unwrap().remove(key);
+    }
+
+    /// Whether `key` is claimed by anyone right now. Tests only — `peer.rs`'s as well
+    /// as this module's, hence `pub(crate)`: the fill paths learn this from the claim
+    /// they took, never by asking.
+    #[cfg(test)]
+    pub(crate) fn is_claimed(&self, key: &str) -> bool {
+        self.claims.lock().unwrap().contains_key(key)
+    }
+
+    /// How many keys are claimed right now. Tests only, for the same reason.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.claims.lock().unwrap().len()
+    }
+}
+
+/// Await the bytes a leader promised, or `None` if it never delivered them.
+///
+/// `None` covers every way a leader can fail to publish — its read errored, or
+/// its future was dropped when the client that triggered it disconnected — because
+/// both reach a waiter identically: [`FillGuard::drop`] releases the claim, the
+/// last `Sender` goes with it, and the channel closes. The caller's answer to all
+/// of them is the same and is exactly the pre-ADR-0040 behaviour: fetch your own.
+///
+/// `Lagged` cannot occur against a single send into a one-slot channel, and is
+/// folded into the same fallback rather than given a branch that no run reaches.
+async fn await_published_fill(
+    mut waiter: broadcast::Receiver<Bytes>,
+    waiters: &IntGauge,
+) -> Option<Bytes> {
+    let _parked = WaiterTicket::new(waiters);
+    waiter.recv().await.ok()
+}
+
+/// Holds `pacer_fill_waiters` up for exactly as long as one request is parked on
+/// another's fill — including when that request is cancelled mid-wait.
+///
+/// A `Drop` guard rather than an `inc()`/`dec()` pair around the `.await`, for the
+/// same reason [`FillGuard`] is one: `chunked_body`'s pipeline drops a chunk
+/// resolution's future outright when its client disconnects, so a `dec()` written
+/// after the await is precisely the line that never runs. A gauge that can only go
+/// up is worse than no gauge, because it reads as the incident it is meant to
+/// detect.
+struct WaiterTicket(IntGauge);
+
+impl WaiterTicket {
+    /// Raise the gauge, and hand back the ticket that lowers it.
+    fn new(gauge: &IntGauge) -> Self {
+        gauge.inc();
+        Self(gauge.clone())
+    }
+}
+
+impl Drop for WaiterTicket {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
+/// RAII slot in the node-wide [`FillRegistry`] (shared by `maybe_admit_local`,
+/// `maybe_fill`, [`FillCtx::fetch_owned`]'s leader and the peer server's own
+/// read-through fill): while a guard for `key` is alive, a second claim on the
+/// same key cannot lead, so at most one fill per key runs at a time
 /// (ADR-0016/0017).
 ///
 /// **Why this replaces a bare `HashSet::insert`/`.remove()` pair.**
@@ -146,8 +376,8 @@ impl PacerProxy {
 /// be filled again until the daemon restarted. `Drop` cannot be skipped by a
 /// dropped future or an early return, so the key is always released.
 pub(crate) struct FillGuard {
-    /// The shared set this guard holds one key in.
-    filling: Arc<Mutex<HashSet<String>>>,
+    /// The shared registry this guard holds one key in.
+    registry: FillRegistry,
     /// The claimed key, owned so `Drop` needs no borrow.
     key: String,
     /// Set by [`Self::complete`] once the fill finished on its own (success or
@@ -162,49 +392,52 @@ pub(crate) struct FillGuard {
 }
 
 impl FillGuard {
-    /// Claim `key`'s slot in `filling`, or return `None` if another fill for
-    /// it is already in flight — the set's whole purpose, one fill per key
-    /// node-wide. Raises `inflight` by one on success.
-    #[must_use]
-    fn try_begin(
-        filling: &Arc<Mutex<HashSet<String>>>,
-        key: &str,
-        inflight: &IntGauge,
-        abandoned: &IntCounter,
-    ) -> Option<Self> {
-        if !filling.lock().unwrap().insert(key.to_owned()) {
-            return None;
-        }
-        inflight.inc();
-        Some(Self {
-            filling: Arc::clone(filling),
+    /// Wrap an already-taken claim on `key`, raising `inflight` by one.
+    ///
+    /// Private, and takes no decision: whoever calls it has just won the claim in
+    /// the registry, and the only way to reach one of those is through
+    /// [`FillRegistry::claim_fill`] or [`Self::for_fill`]. Splitting the claim from
+    /// the guard is what lets the two claim *kinds* share one release path.
+    fn new(registry: &FillRegistry, key: &str, metrics: &Metrics) -> Self {
+        metrics.fill_inflight.inc();
+        Self {
+            registry: registry.clone(),
             key: key.to_owned(),
             completed: false,
-            inflight: inflight.clone(),
-            abandoned: abandoned.clone(),
-        })
+            inflight: metrics.fill_inflight.clone(),
+            abandoned: metrics.fill_abandoned.clone(),
+        }
     }
 
-    /// Claim `key`'s slot with the two series every fill path shares — the form
-    /// both callers use, so neither can wire its guard to a different pair.
+    /// Claim `key` **exclusively** — no bytes published — or `None` if another
+    /// fill for it is already in flight. The pre-ADR-0040 claim, and still the
+    /// right one for a caller that already holds its bytes.
     ///
-    /// The `filling` set is node-wide and the claim is path-agnostic on purpose: a
+    /// The registry is node-wide and this claim is path-agnostic on purpose: a
     /// client GET's fill and the peer server's read-through fill of the same chunk
     /// key are the same work, and the second must skip rather than duplicate the
-    /// backend read (ADR-0016/0017). Both therefore claim through here, and both
-    /// count into `pacer_fill_inflight` / `pacer_fill_abandoned_total`.
+    /// insert (ADR-0016/0017). Both therefore claim through here, and both count
+    /// into `pacer_fill_inflight` / `pacer_fill_abandoned_total`.
     #[must_use]
-    pub(crate) fn for_fill(
-        filling: &Arc<Mutex<HashSet<String>>>,
-        metrics: &Metrics,
-        key: &str,
-    ) -> Option<Self> {
-        Self::try_begin(
-            filling,
-            key,
-            &metrics.fill_inflight,
-            &metrics.fill_abandoned,
-        )
+    pub(crate) fn for_fill(registry: &FillRegistry, metrics: &Metrics, key: &str) -> Option<Self> {
+        if !registry.claim_exclusive(key) {
+            return None;
+        }
+        Some(Self::new(registry, key, metrics))
+    }
+
+    /// Hand the leader's freshly-read bytes to everyone waiting on this key, and
+    /// park them in the claim for anyone who arrives before it is released
+    /// (ADR-0040). A no-op on an exclusive claim, which publishes nothing.
+    ///
+    /// Separate from [`Self::complete`] rather than folded into it, because the two
+    /// answer different questions and the order matters: waiters are released as
+    /// soon as the bytes exist, while `complete` means the *whole* fill — insert
+    /// included — finished, and merging them would make
+    /// [`Metrics::fill_abandoned`] stop counting a fill abandoned between the
+    /// publish and the insert.
+    pub(crate) fn publish(&self, bytes: &Bytes) {
+        self.registry.publish(&self.key, bytes);
     }
 
     /// Mark the fill as having finished on its own rather than been cut short
@@ -216,7 +449,11 @@ impl FillGuard {
 
 impl Drop for FillGuard {
     fn drop(&mut self) {
-        self.filling.lock().unwrap().remove(&self.key);
+        // Releasing the entry also drops the last `broadcast::Sender` for it, which
+        // is what wakes a waiter whose leader never published: the channel closes
+        // and `await_published_fill` returns `None`. So a leader whose future was
+        // dropped mid-read costs its followers one wake-up, not a hang.
+        self.registry.release(&self.key);
         self.inflight.dec();
         if !self.completed {
             self.abandoned.inc();
@@ -225,9 +462,9 @@ impl Drop for FillGuard {
 }
 
 impl FillCtx {
-    /// Claim `chunk_key`'s slot in the node-wide fill-dedup set, or `None` if
-    /// another fill for it is already running. See [`FillGuard`] for why this
-    /// replaces the bare `HashSet::insert` the fill sites used to do directly.
+    /// Claim `chunk_key` exclusively, or `None` if another fill for it is already
+    /// running. See [`FillGuard`] for why this replaces the bare `HashSet::insert`
+    /// the fill sites used to do directly.
     #[must_use]
     fn try_begin_fill(&self, chunk_key: &str) -> Option<FillGuard> {
         FillGuard::for_fill(&self.filling, &self.metrics, chunk_key)
@@ -257,7 +494,7 @@ impl FillCtx {
         let owns = self.owns_chunk(&chunk_key);
         trace!(chunk_key = %chunk_key, owns, local_node = ?self.cluster.as_ref().map(|c| c.local_node.as_str()), "resolve_chunk ownership decision");
         if owns {
-            return self.fetch_from_backend(idx, &chunk_key, self.admit).await;
+            return self.fetch_owned(idx, &chunk_key).await;
         }
         // Not a home: fetch from a peer. On success, layer 1 (ADR-0016) may
         // admit a local copy once the chunk proves hot. A peer failure falls
@@ -267,6 +504,99 @@ impl FillCtx {
             return Ok(bytes);
         }
         self.fetch_from_backend(idx, &chunk_key, false).await
+    }
+
+    /// The home's own read of a missed chunk, under ADR-0040's single flight: one
+    /// backend read per chunk key node-wide, with every other request for the same
+    /// key served from it.
+    ///
+    /// Reached for a chunk this node co-homes and for **every** chunk on a
+    /// single-node daemon, which is the shape the fan-in actually has — N ranks of
+    /// one job loading one checkpoint through one daemon.
+    ///
+    /// The two non-leading fallbacks are deliberately the *same* call the whole
+    /// path used to make, `self.admit` and all: a claim held by a non-publishing
+    /// path, and a leader that delivered nothing, both leave this request exactly
+    /// where it was before this ADR. So the mechanism can remove a backend read and
+    /// cannot add one.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::fetch_from_backend`] fails with — this adds no failure of
+    /// its own, because a waiter that is let down falls back rather than erroring.
+    pub(super) async fn fetch_owned(&self, idx: u64, chunk_key: &str) -> S3Result<Bytes> {
+        if !self.coalesce {
+            return self.fetch_from_backend(idx, chunk_key, self.admit).await;
+        }
+        match self.filling.claim_fill(&self.metrics, chunk_key) {
+            FillClaim::Lead(guard) => self.fetch_leading(idx, chunk_key, guard).await,
+            FillClaim::Ready(bytes) => {
+                self.note_coalesced(&bytes);
+                Ok(bytes)
+            }
+            FillClaim::Follow(waiter) => {
+                match await_published_fill(waiter, &self.metrics.fill_coalesce.waiters).await {
+                    Some(bytes) => {
+                        self.note_coalesced(&bytes);
+                        Ok(bytes)
+                    }
+                    None => {
+                        self.metrics.fill_coalesce.fallbacks.inc();
+                        self.fetch_from_backend(idx, chunk_key, self.admit).await
+                    }
+                }
+            }
+            FillClaim::Busy => self.fetch_from_backend(idx, chunk_key, self.admit).await,
+        }
+    }
+
+    /// Lead one chunk's fill: read it from the backend, hand the bytes to every
+    /// request that asked for the same chunk while the read was in flight, then
+    /// insert.
+    ///
+    /// **Publish before the insert**, on purpose. A waiter needs the bytes, not a
+    /// cache entry, and `put_chunk` is a device write that can be slow or fail —
+    /// making waiters wait for it would spend the latency this exists to save, and
+    /// a failed insert would strand them for nothing.
+    ///
+    /// **The published value is the backend's `Bytes`, never `cached_bytes`'
+    /// output.** On an ADR-0028 node that output is a registered slab frame, and
+    /// handing N waiters a refcount on one frame would pin it until the slowest of
+    /// them finished streaming — the frame pool is bounded and sized for the
+    /// resident set, not for readers in flight.
+    ///
+    /// `!admit` (a `no-store` read, ADR-0012) still leads and still publishes: it
+    /// populates nothing, which is what that decision requires, and a read that is
+    /// already served from the cache when the chunk happens to be there cannot
+    /// object to being served from a read that is already in flight.
+    ///
+    /// # Errors
+    ///
+    /// The backend read's, unchanged — see [`Self::fetch_from_backend`].
+    async fn fetch_leading(
+        &self,
+        idx: u64,
+        chunk_key: &str,
+        mut guard: FillGuard,
+    ) -> S3Result<Bytes> {
+        let body = self.read_backend_chunk(idx, chunk_key).await?;
+        guard.publish(&body);
+        if self.admit {
+            self.insert_filled(chunk_key, &body).await;
+        }
+        guard.complete();
+        Ok(body)
+    }
+
+    /// Count one read served from another request's in-flight fill (ADR-0040) —
+    /// the pair of series that makes the mechanism visible at all.
+    ///
+    /// The byte counter is the one to read: it is backend traffic this node did
+    /// **not** issue, which is the whole claim, and `fill_coalesced_total` alone
+    /// cannot say it because chunks differ in size (ADR-0015 clamps the last one).
+    fn note_coalesced(&self, bytes: &Bytes) {
+        self.metrics.fill_coalesce.served.inc();
+        self.metrics.fill_coalesce.bytes.inc_by(bytes.len() as u64);
     }
 
     /// Whether this node is one of `chunk_key`'s R co-homes (ADR-0016 layer 2)
@@ -424,6 +754,27 @@ impl FillCtx {
         chunk_key: &str,
         fill: bool,
     ) -> S3Result<Bytes> {
+        let body = self.read_backend_chunk(idx, chunk_key).await?;
+        if fill {
+            self.maybe_fill(chunk_key, &body).await;
+        }
+        Ok(body)
+    }
+
+    /// The backend ranged GET alone — bounds, retry and its two counters — with no
+    /// fill of any kind.
+    ///
+    /// Split from [`Self::fetch_from_backend`] for ADR-0040's leader, which holds
+    /// the key's claim for the whole read and must therefore **not** go through
+    /// [`Self::maybe_fill`]: that claims exclusively, would be refused by the
+    /// leader's own live guard, and would silently skip the insert. A fill path that
+    /// looks like it cached the chunk and did not is the failure this split exists
+    /// to make unreachable.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::fetch_from_backend`] — this is where those errors are produced.
+    async fn read_backend_chunk(&self, idx: u64, chunk_key: &str) -> S3Result<Bytes> {
         let bounds = self
             .chunk
             .chunk_bounds(idx, self.object_len)
@@ -441,9 +792,6 @@ impl FillCtx {
             .await
             .map_err(|e| self.note_read_failure(chunk_key, &e))?;
         self.note_read_retries(got.attempts);
-        if fill {
-            self.maybe_fill(chunk_key, &got.body).await;
-        }
         Ok(got.body)
     }
 
@@ -510,6 +858,18 @@ impl FillCtx {
         let Some(mut guard) = self.try_begin_fill(chunk_key) else {
             return;
         };
+        self.insert_filled(chunk_key, data).await;
+        guard.complete();
+    }
+
+    /// Put a fetched chunk in the tier, count it, and record this node as a holder
+    /// — everything [`Self::maybe_fill`] does once its claim is won.
+    ///
+    /// Reached by two callers holding two *kinds* of claim: `maybe_fill`'s exclusive
+    /// one, and ADR-0040's leader, which took a publishing claim before its read.
+    /// Neither may claim again from in here, which is why the claim is the caller's
+    /// and this function takes none.
+    async fn insert_filled(&self, chunk_key: &str, data: &Bytes) {
         // `cached_bytes`, not `data.clone()`: this is the OWNER's copy, the one
         // peers fetch from, so it is exactly the chunk whose serve ADR-0028
         // wants to post without staging. On a build or node with no slab this is
@@ -524,7 +884,6 @@ impl FillCtx {
         self.metrics.fills_completed.inc();
         self.metrics.bytes_filled.inc_by(data.len() as u64);
         self.announce_local_admit(chunk_key);
-        guard.complete();
     }
 
     /// Record this node as a holder of `chunk_key` in its own directory shard
@@ -626,34 +985,34 @@ mod tests {
         assert!(got.is_empty());
     }
 
-    /// Fresh, unregistered gauge/counter pair for a [`FillGuard`] test — a
-    /// bare [`Registry`](prometheus::Registry) is deliberately not involved,
-    /// since these tests only need the atomics themselves.
-    fn fill_metrics() -> (IntGauge, IntCounter) {
-        (
-            IntGauge::new("test_pacer_fill_inflight", "test").unwrap(),
-            IntCounter::new("test_pacer_fill_abandoned_total", "test").unwrap(),
-        )
+    /// A chunk key of the shape the fill paths claim — one object, chunk 0.
+    const A_CHUNK_KEY: &str = "bucket/obj#16777216:0";
+
+    /// The daemon's real metrics, because [`FillGuard`] carries the registered
+    /// `fill_inflight`/`fill_abandoned` pair rather than bare atomics: a fresh
+    /// registry per test keeps the counters independent, which is all these need.
+    fn fill_metrics() -> Metrics {
+        Metrics::new().expect("metrics registry")
     }
 
     #[test]
     fn fill_guard_second_claim_of_a_live_key_is_refused() {
-        let filling: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let (inflight, abandoned) = fill_metrics();
+        let registry = FillRegistry::new();
+        let metrics = fill_metrics();
 
-        let first = FillGuard::try_begin(&filling, "obj#16777216:0", &inflight, &abandoned)
+        let first = FillGuard::for_fill(&registry, &metrics, A_CHUNK_KEY)
             .expect("claiming a fresh key must succeed");
-        assert_eq!(inflight.get(), 1);
+        assert_eq!(metrics.fill_inflight.get(), 1);
         assert!(
-            FillGuard::try_begin(&filling, "obj#16777216:0", &inflight, &abandoned).is_none(),
+            FillGuard::for_fill(&registry, &metrics, A_CHUNK_KEY).is_none(),
             "a second claim of the same key while the first guard is alive must be refused"
         );
 
         drop(first);
-        assert!(filling.lock().unwrap().is_empty());
-        assert_eq!(inflight.get(), 0);
+        assert_eq!(registry.len(), 0);
+        assert_eq!(metrics.fill_inflight.get(), 0);
         assert_eq!(
-            abandoned.get(),
+            metrics.fill_abandoned.get(),
             1,
             "dropping without complete() must count as abandoned"
         );
@@ -661,17 +1020,17 @@ mod tests {
 
     #[test]
     fn fill_guard_complete_suppresses_the_abandoned_counter() {
-        let filling: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let (inflight, abandoned) = fill_metrics();
+        let registry = FillRegistry::new();
+        let metrics = fill_metrics();
 
-        let mut guard = FillGuard::try_begin(&filling, "obj#16777216:1", &inflight, &abandoned)
+        let mut guard = FillGuard::for_fill(&registry, &metrics, A_CHUNK_KEY)
             .expect("claiming a fresh key must succeed");
         guard.complete();
         drop(guard);
 
-        assert!(filling.lock().unwrap().is_empty());
+        assert_eq!(registry.len(), 0);
         assert_eq!(
-            abandoned.get(),
+            metrics.fill_abandoned.get(),
             0,
             "a fill that completed normally must not count as abandoned"
         );
@@ -684,27 +1043,20 @@ mod tests {
         // never reaching the code that would have removed the key. Aborting a
         // spawned task drops its future the same way — mid-poll, with no
         // chance to run anything past the last `.await` point.
-        let filling: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let (inflight, abandoned) = fill_metrics();
-        let filling_task = Arc::clone(&filling);
-        let inflight_task = inflight.clone();
-        let abandoned_task = abandoned.clone();
+        let registry = FillRegistry::new();
+        let metrics = fill_metrics();
+        let (registry_task, metrics_task) = (registry.clone(), metrics.clone());
 
         let handle = tokio::spawn(async move {
-            let _guard = FillGuard::try_begin(
-                &filling_task,
-                "obj#16777216:2",
-                &inflight_task,
-                &abandoned_task,
-            )
-            .expect("claiming a fresh key must succeed");
+            let _guard = FillGuard::for_fill(&registry_task, &metrics_task, A_CHUNK_KEY)
+                .expect("claiming a fresh key must succeed");
             // Never calls `complete()` — stands in for a fill whose backend
             // read or `put_chunk` is still in flight when the client goes away.
             std::future::pending::<()>().await;
         });
 
         // Wait for the spawned task to actually claim the slot before cancelling it.
-        while filling.lock().unwrap().is_empty() {
+        while registry.len() == 0 {
             tokio::task::yield_now().await;
         }
 
@@ -716,14 +1068,157 @@ mod tests {
         );
 
         assert!(
-            filling.lock().unwrap().is_empty(),
+            !registry.is_claimed(A_CHUNK_KEY),
             "FillGuard::drop must free the key even when its future is dropped mid-poll"
         );
-        assert_eq!(inflight.get(), 0);
+        assert_eq!(metrics.fill_inflight.get(), 0);
         assert_eq!(
-            abandoned.get(),
+            metrics.fill_abandoned.get(),
             1,
             "a cancelled fill must be counted as abandoned"
+        );
+    }
+
+    /// ADR-0040's whole point, at the registry level: the second arrival on a key
+    /// somebody is already reading gets *those* bytes, not a claim of its own.
+    #[tokio::test]
+    async fn a_second_arrival_is_handed_the_leaders_bytes() {
+        let registry = FillRegistry::new();
+        let metrics = fill_metrics();
+
+        let FillClaim::Lead(mut leader) = registry.claim_fill(&metrics, A_CHUNK_KEY) else {
+            panic!("the first claim of a free key must lead");
+        };
+        let FillClaim::Follow(waiter) = registry.claim_fill(&metrics, A_CHUNK_KEY) else {
+            panic!("a claim taken while a leader is fetching must follow it");
+        };
+
+        let filled = Bytes::from_static(b"the leader's chunk");
+        leader.publish(&filled);
+        leader.complete();
+
+        assert_eq!(
+            await_published_fill(waiter, &metrics.fill_coalesce.waiters).await,
+            Some(filled),
+            "the follower must receive exactly the bytes the leader published"
+        );
+        assert_eq!(
+            metrics.fill_coalesce.waiters.get(),
+            0,
+            "the waiter gauge must come back down once the wait ends"
+        );
+    }
+
+    /// The window this design exists to close: a request that arrives *after* the
+    /// publish but before the insert finishes must take the parked bytes rather
+    /// than subscribe to a channel that has already been sent to — `broadcast`
+    /// buffers nothing for a receiver created after the fact, so the naive shape
+    /// makes this caller wait for the full `put_chunk` and then fall back.
+    #[tokio::test]
+    async fn bytes_published_before_the_claim_is_released_are_taken_without_waiting() {
+        let registry = FillRegistry::new();
+        let metrics = fill_metrics();
+
+        let FillClaim::Lead(leader) = registry.claim_fill(&metrics, A_CHUNK_KEY) else {
+            panic!("the first claim of a free key must lead");
+        };
+        let filled = Bytes::from_static(b"published, not yet inserted");
+        leader.publish(&filled);
+
+        match registry.claim_fill(&metrics, A_CHUNK_KEY) {
+            FillClaim::Ready(bytes) => assert_eq!(bytes, filled),
+            _ => panic!("an arrival after the publish must be served without waiting"),
+        }
+    }
+
+    /// A leader that never publishes — its read failed, or its client went away and
+    /// took the future with it — must *wake* its followers rather than strand them.
+    /// They then fetch their own, which is what every request did before ADR-0040.
+    #[tokio::test]
+    async fn a_leader_that_publishes_nothing_wakes_its_follower_empty_handed() {
+        let registry = FillRegistry::new();
+        let metrics = fill_metrics();
+
+        let FillClaim::Lead(leader) = registry.claim_fill(&metrics, A_CHUNK_KEY) else {
+            panic!("the first claim of a free key must lead");
+        };
+        let FillClaim::Follow(waiter) = registry.claim_fill(&metrics, A_CHUNK_KEY) else {
+            panic!("a claim taken while a leader is fetching must follow it");
+        };
+
+        drop(leader);
+        assert_eq!(
+            await_published_fill(waiter, &metrics.fill_coalesce.waiters).await,
+            None,
+            "a dropped leader must close the channel instead of hanging its follower"
+        );
+        assert_eq!(
+            metrics.fill_coalesce.waiters.get(),
+            0,
+            "and the gauge must come down on the empty-handed path too"
+        );
+        assert!(
+            !registry.is_claimed(A_CHUNK_KEY),
+            "and it must leave the key free for the follower's own fill"
+        );
+    }
+
+    /// An exclusive claim publishes nothing, so a second arrival must be told to
+    /// fetch its own rather than wait for bytes that will never come. This is what
+    /// keeps the peer server's read-through and the layer-1 admit behaving exactly
+    /// as they did.
+    #[test]
+    fn an_exclusive_claim_is_never_waited_on() {
+        let registry = FillRegistry::new();
+        let metrics = fill_metrics();
+
+        let _exclusive = FillGuard::for_fill(&registry, &metrics, A_CHUNK_KEY)
+            .expect("claiming a fresh key must succeed");
+        assert!(
+            matches!(registry.claim_fill(&metrics, A_CHUNK_KEY), FillClaim::Busy),
+            "a publishing claim must not wait on a holder that publishes nothing"
+        );
+    }
+
+    /// Publishing on an exclusive claim is a no-op rather than a panic or a state
+    /// change: `publish` is on [`FillGuard`], which both claim kinds hand out, and a
+    /// future caller wiring it to the wrong one should lose the optimisation, not
+    /// corrupt the entry.
+    #[test]
+    fn publishing_on_an_exclusive_claim_changes_nothing() {
+        let registry = FillRegistry::new();
+        let metrics = fill_metrics();
+
+        let exclusive = FillGuard::for_fill(&registry, &metrics, A_CHUNK_KEY)
+            .expect("claiming a fresh key must succeed");
+        exclusive.publish(&Bytes::from_static(b"nobody asked for these"));
+        assert!(
+            matches!(registry.claim_fill(&metrics, A_CHUNK_KEY), FillClaim::Busy),
+            "an exclusive claim must stay exclusive"
+        );
+    }
+
+    /// The claim is per key, so two different chunks never serialise against each
+    /// other — the property that keeps one GET's `fill_parallelism` chunks
+    /// concurrent.
+    #[test]
+    fn claims_on_different_keys_are_independent() {
+        let registry = FillRegistry::new();
+        let metrics = fill_metrics();
+
+        // Both claims are *bound*, not matched in place: a `FillClaim::Lead` holds the
+        // guard, and a temporary would release the key at the end of its statement — which
+        // is exactly what the occupancy assertion below would then fail to see.
+        let _first = registry.claim_fill(&metrics, A_CHUNK_KEY);
+        let second = registry.claim_fill(&metrics, "bucket/obj#16777216:1");
+        assert!(
+            matches!(second, FillClaim::Lead(_)),
+            "a different chunk of the same object must lead its own fill"
+        );
+        assert_eq!(
+            registry.len(),
+            2,
+            "two keys claimed at once is what keeps one GET's chunks concurrent"
         );
     }
 }

@@ -229,6 +229,17 @@ data:
       # header. Mountpoint-for-S3 is one, and measured 0 % hits because of it.
       conditional-get-from-cache: false
       {{- end }}
+      {{- if not .Values.config.fillCoalesce }}
+      # ADR-0040, and rendered only when it is turned OFF: `true` is the daemon's own
+      # default, so emitting it would be a second spelling of the same thing.
+      #
+      # OFF restores the pre-ADR-0040 read path — every concurrent reader of one cold
+      # chunk issues its own backend ranged GET, and the fill guard dedupes only the
+      # inserts that happen to overlap. That is correct and merely wasteful, which is why
+      # this is the control arm for measuring what the single flight is worth rather than
+      # a safety valve.
+      fill-coalesce: false
+      {{- end }}
       {{- if .Values.config.verifyChunkBody }}
       # Verify a chunk body's CRC32 on every read from the ADR-0033 store. OFF by
       # default, deliberately: a full pass over a 16 MiB chunk is ~1.1 ms against

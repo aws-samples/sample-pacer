@@ -167,6 +167,24 @@ config:
   # detect that an object was replaced in place. ADR-0015 requires a new name per version,
   # under which the condition can never legitimately fail. Set false for strict semantics.
   conditionalGetFromCache: true
+  # Whether a home's read of a missed chunk joins a read of the SAME chunk key already in
+  # flight instead of issuing its own (ADR-0040). Default true.
+  #
+  # Before this the node-wide fill guard was taken AFTER the backend read, so N clients
+  # arriving together on one cold chunk each issued a ranged GET and all but one then found
+  # the key claimed and skipped the insert: the writes were deduped, the reads were not.
+  # Now one of them leads, the rest are handed its bytes, and only the leader inserts.
+  #
+  # It cannot cost a read: a claim held by a path that publishes nothing, and a leader whose
+  # read failed or whose client disconnected, both leave the waiting request exactly where it
+  # was — it fetches for itself, and `pacer_fill_coalesce_fallbacks_total` counts that.
+  #
+  # ⚠ What it does introduce is a COUPLING that did not exist: one request's latency now
+  # depends on another's read. Bounded (a leader that fails or vanishes wakes its waiters at
+  # once) and observable — `pacer_fill_waiters` pinned with `pacer_fill_coalesced_total` flat
+  # is a stuck leader holding requests. Set false to measure the same fan-in without it.
+  # docs/helm/cache-and-disk-tier.md#one-backend-read-per-chunk-key-adr-0040
+  fillCoalesce: true
   # Chunk reads in flight against the ADR-0033 store, node-wide. Empty/0 = the daemon's
   # measured default (16); `unlimited` is the pre-ceiling behaviour and must be asked for by
   # NAME, because 0 already means "the default" here as it does everywhere else.

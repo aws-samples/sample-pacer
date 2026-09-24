@@ -54,6 +54,11 @@ pub struct DaemonSpec {
     /// `true` — the shipped default — so every other suite exercises what a deployment
     /// runs; the one arm that turns it off is testing the escape hatch itself.
     pub conditional_get_from_cache: bool,
+    /// Whether concurrent readers of one missed chunk share its backend read (ADR-0040).
+    /// `true` — the shipped default — so every other suite exercises what a deployment
+    /// runs; `fill_coalesce`'s arm runs both sides of it, because the only way to show
+    /// the mechanism did anything is to show what happens without it.
+    pub fill_coalesce: bool,
 }
 
 impl Default for DaemonSpec {
@@ -70,6 +75,7 @@ impl Default for DaemonSpec {
             cache: CacheSpec::default(),
             foyer_metrics: false,
             conditional_get_from_cache: true,
+            fill_coalesce: true,
         }
     }
 }
@@ -168,7 +174,8 @@ pub async fn daemon_core_over(spec: DaemonSpec, backend: BackendPair) -> DaemonC
         spec.fill_parallelism,
     )
     .with_backend_type(spec.backend_type)
-    .with_conditional_get_from_cache(spec.conditional_get_from_cache);
+    .with_conditional_get_from_cache(spec.conditional_get_from_cache)
+    .with_fill_coalesce(spec.fill_coalesce);
     DaemonCore {
         proxy,
         metrics,

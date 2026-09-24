@@ -222,6 +222,24 @@ const CONDITIONAL_GET_FROM_CACHE: EnvVar = EnvVar {
     name: "PACER_CONDITIONAL_GET_FROM_CACHE",
     default: "true",
 };
+/// Whether a home's read of a missed chunk joins a read of the same chunk key that is
+/// already in flight, instead of issuing its own (ADR-0040).
+///
+/// **Default `true` because the alternative is paying twice for one answer.** Before
+/// this the node-wide fill guard was taken *after* the backend read, so N clients
+/// arriving together on one cold chunk each issued a ranged GET and then all but one
+/// found the key claimed and skipped the insert: the writes were deduped, the reads
+/// were not.
+///
+/// It is a knob rather than a constant for two reasons. It makes the mechanism an
+/// *arm* — the only honest way to say what it is worth is to run the same fan-in with
+/// it off. And it is the one change that makes one request's latency depend on
+/// another's read, which is bounded (a leader that fails or vanishes wakes its waiters
+/// and they fetch for themselves) but is still a coupling that did not exist before.
+const FILL_COALESCE: EnvVar = EnvVar {
+    name: "PACER_FILL_COALESCE",
+    default: "true",
+};
 /// Whether a store hit issues its 4 KiB header read and its 16 MiB body read one
 /// after the other (`two-read`, the default and every measurement through
 /// 2026-09-10) or at the same time (`overlap`).
@@ -874,6 +892,12 @@ pub struct Config {
     /// the ETag compared against is the cached one, so `If-Match` through PACER cannot
     /// *detect* an in-place replacement.
     pub conditional_get_from_cache: bool,
+    /// Whether concurrent readers of one missed chunk share its backend read (ADR-0040,
+    /// `PACER_FILL_COALESCE`). Defaults **on**: the second reader of bytes already in
+    /// flight has nothing to gain from fetching them again, and a leader that fails
+    /// leaves every waiter exactly where it was. `false` restores the pre-ADR-0040 path,
+    /// where the fill guard deduped the insert but not the read.
+    pub fill_coalesce: bool,
     /// Whether a store hit's two reads are issued together (`PACER_STORE_READ_SHAPE`).
     /// Read only when `PACER_DISK_TIER=store`.
     pub store_read_shape: pacer_cache::store::ReadShape,
@@ -1142,6 +1166,7 @@ struct FilePolicy {
     disk_tier: Option<String>,
     verify_chunk_body: Option<bool>,
     conditional_get_from_cache: Option<bool>,
+    fill_coalesce: Option<bool>,
     store_read_shape: Option<String>,
     store_read_concurrency: Option<String>,
 }
@@ -1262,6 +1287,7 @@ fn resolve(file: &FileConfig, env: EnvFn) -> anyhow::Result<Config> {
             .parse()?,
         verify_chunk_body: verify_chunk_body(file, env),
         conditional_get_from_cache: conditional_get_from_cache(file, env),
+        fill_coalesce: fill_coalesce(file, env),
         store_read_shape: STORE_READ_SHAPE
             .resolve(env, policy_field(file, |p| p.store_read_shape.clone()))
             .parse()?,
@@ -1851,6 +1877,21 @@ fn conditional_get_from_cache(file: &FileConfig, env: EnvFn) -> bool {
         .and_then(|p| p.conditional_get_from_cache)
         .map(|b| b.to_string());
     CONDITIONAL_GET_FROM_CACHE.resolve(env, file_val) == "true"
+}
+
+/// `fill-coalesce`: env wins, then the file bool, then `true` (ADR-0040).
+///
+/// Compared against `"true"` like every other boolean here, so a TYPO reads as `false`.
+/// That is the right direction for this one too: `false` is the pre-ADR-0040 read path,
+/// which is correct and merely wasteful, so a misspelling costs throughput rather than
+/// leaving a coupling an operator was trying to remove.
+fn fill_coalesce(file: &FileConfig, env: EnvFn) -> bool {
+    let file_val = file
+        .policy
+        .as_ref()
+        .and_then(|p| p.fill_coalesce)
+        .map(|b| b.to_string());
+    FILL_COALESCE.resolve(env, file_val) == "true"
 }
 
 /// `force-path-style`: env (`"true"`) wins, then the file bool, then `false`.

@@ -350,6 +350,46 @@ bypass unconditionally — unchanged, and not covered by this knob.
 is conditional looks identical in `pacer_cache_hits_total`/`pacer_cache_bypass_total` whether
 the ETag check honoured the request or turned it away, which is why this counter exists.
 
+## One backend read per chunk key (ADR-0040)
+
+**`fillCoalesce`** (default `true`) — whether a home's read of a missed chunk joins a read of
+the **same chunk key** already in flight instead of issuing its own
+([ADR-0040](../adr/0040-one-backend-read-per-chunk-key.md)).
+
+**What it fixes.** The daemon already claimed "at most one fill per chunk key node-wide", and
+that claim was about the *insert*. The fill guard was taken **after** the backend read, so N
+clients arriving together on one cold chunk each issued a full ranged `GetObject` and all but
+one then found the key claimed and skipped the insert. Now one of them leads, the rest are
+handed its bytes, and only the leader writes.
+
+**It cannot cost a read.** A key claimed by a path that publishes nothing (the peer server's
+read-through, or a layer-1 admit — both already hold their bytes) and a leader that publishes
+nothing (its read failed, or its client disconnected) both leave the waiting request exactly
+where it was: it fetches for itself, and `pacer_fill_coalesce_fallbacks_total` counts it.
+
+⚠ **What it introduces, and the reason it is a knob.** One request's latency now depends on
+another request's read. That is bounded — a leader that fails or vanishes releases its claim and
+wakes every waiter at once, and a waiter is subject to exactly the retry budget its leader is —
+but it is a coupling that did not exist before. Set `false` to run the same fan-in without it,
+which is the only honest way to say what the mechanism is worth on your shape.
+
+**How to confirm it engaged:** `pacer_fill_coalesced_bytes_total` is the headline — backend bytes
+not re-fetched. `pacer_fill_coalesced_total` alone cannot state it, because chunks differ in size
+(ADR-0015 clamps the last one to the object). `pacer_fill_waiters` is the live view of a fan-in
+being absorbed; pinned with `pacer_fill_coalesced_total` flat, it is a stuck leader holding
+requests.
+
+⚠ `pacer_fill_inflight` keeps its meaning but changes shape at this ADR: a leader holds its claim
+across the whole backend read, so a cold multi-chunk read keeps `fillParallelism` claims up for
+the duration of the reads rather than only for the inserts after them. A step change there is the
+mechanism engaging, not a leak.
+
+**Two fan-in gaps this does not close**, both deliberate: a local GET and a peer read-through of
+the same chunk still double-fetch (the read-through streams to a remote requester, and making a
+local client wait on it would couple its latency to how fast that requester drains), and
+concurrent readers of an **already cached** chunk under `diskTier=store` still each cost a
+`pread` — the coalescing ADR-0033 gave up when it replaced foyer's hybrid cache.
+
 ## Chunk-body verification
 
 **`verifyChunkBody`** (default `false`) — verify a chunk body's CRC32 on every store
@@ -391,3 +431,4 @@ full trade.
 - [ADR-0015 — Chunk-granular caching](../adr/0015-chunk-granular-caching.md)
 - [ADR-0023 — Pluggable S3 backend type (Express or Standard)](../adr/0023-pluggable-s3-backend-type-express-or-standard.md)
 - [ADR-0033 — Chunk store owns the disk tier](../adr/0033-chunk-store-owns-the-disk-tier.md)
+- [ADR-0040 — One backend read per chunk key](../adr/0040-one-backend-read-per-chunk-key.md)

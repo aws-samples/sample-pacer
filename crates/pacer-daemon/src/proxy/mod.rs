@@ -25,8 +25,8 @@
 //! Everything a *passthrough* op does is here in full, because there is nothing to
 //! it: count the op, resolve the bucket alias (ADR-0002), forward to `inner`.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use pacer_backend::retry::RetryPolicy;
 use pacer_backend::BackendType;
@@ -51,6 +51,7 @@ pub use cluster::Cluster;
 
 pub(crate) use cluster::chunk_sources;
 pub(crate) use fill::FillGuard;
+pub use fill::FillRegistry;
 
 /// The S3 service implementation: cache policy in front of a re-signing proxy.
 pub struct PacerProxy {
@@ -85,9 +86,9 @@ pub struct PacerProxy {
     /// optional — clients may address the real bucket directly. The rewrite
     /// itself is a plain string map, identical for both backends.
     bucket_map: HashMap<String, String>,
-    /// Keys with a tee fill in flight — one concurrent fill per object.
-    /// Shared with the peer server (one fill per key node-wide).
-    filling: Arc<Mutex<HashSet<String>>>,
+    /// Chunk keys with a fill in flight, and what each one will hand a second
+    /// arrival (ADR-0040). Shared with the peer server (one fill per key node-wide).
+    filling: FillRegistry,
     /// Cluster tier (Phase 2): ring + peer transport. None = single-node.
     cluster: Option<Cluster>,
     /// Backend shape (ADR-0023). Gates the Express-only request normalization
@@ -119,6 +120,10 @@ pub struct PacerProxy {
     /// Whether an `If-Match` GET may be served from cache on an ETag match (ADR-0039).
     /// `false` restores the unconditional passthrough every conditional GET took before it.
     conditional_get_from_cache: bool,
+    /// Whether a home's read of a missed chunk joins an in-flight read of the same
+    /// key instead of issuing its own (ADR-0040). `false` is the pre-ADR-0040 path,
+    /// where N concurrent readers of one cold chunk each cost a backend GET.
+    fill_coalesce: bool,
 }
 
 impl PacerProxy {
@@ -152,7 +157,7 @@ impl PacerProxy {
             // No client-facing aliases unless an operator configured some
             // (ADR-0002): an empty map resolves every bucket to itself.
             bucket_map: HashMap::new(),
-            filling: Arc::new(Mutex::new(HashSet::new())),
+            filling: FillRegistry::new(),
             cluster: None,
             // Defaults to Express (ADR-0002/0023) so callers that don't set a
             // backend shape keep the historical behavior; main.rs overrides it
@@ -178,7 +183,24 @@ impl PacerProxy {
             // behaviour rather than the strict one, and the suites therefore exercise what
             // a deployment runs.
             conditional_get_from_cache: true,
+            // ADR-0040's default, stated here for the same reason: on, because a second
+            // request for bytes already in flight has nothing to gain from fetching them
+            // again, and the fallbacks leave it exactly where it was if the first one
+            // fails.
+            fill_coalesce: true,
         }
+    }
+
+    /// Whether a home's read of a missed chunk joins an in-flight read of the same key
+    /// rather than issuing its own (ADR-0040).
+    ///
+    /// Builder-style like every other policy here. `false` is the pre-ADR-0040 path: N
+    /// concurrent readers of one cold chunk each issue a backend ranged GET, and all but
+    /// one of them then find the key claimed and skip the insert.
+    #[must_use]
+    pub fn with_fill_coalesce(mut self, coalesce: bool) -> Self {
+        self.fill_coalesce = coalesce;
+        self
     }
 
     /// Whether an `If-Match` GET may be served from cache on an ETag match (ADR-0039).
@@ -283,10 +305,10 @@ impl PacerProxy {
         self
     }
 
-    /// The in-flight-fill guard, shared with the peer server so a client GET
+    /// The in-flight-fill registry, shared with the peer server so a client GET
     /// and a peer FetchBlob never fill the same key concurrently.
-    pub fn filling(&self) -> Arc<Mutex<HashSet<String>>> {
-        Arc::clone(&self.filling)
+    pub fn filling(&self) -> FillRegistry {
+        self.filling.clone()
     }
 
     fn count(&self, op: &str) {

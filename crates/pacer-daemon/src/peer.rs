@@ -13,8 +13,7 @@
 //! read (or a chunk this node does not own) returns NOT_FOUND — the requester
 //! falls back to a direct backend GET.
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use pacer_cache::chunk::{CachedChunk, ChunkConfig};
@@ -38,7 +37,7 @@ use tracing::{debug, warn};
 
 use crate::cachefill::ChunkFill;
 use crate::metrics::Metrics;
-use crate::proxy::FillGuard;
+use crate::proxy::{FillGuard, FillRegistry};
 use crate::staging::{StageOutcome, StagingArea};
 
 /// gRPC message payload per BlobChunk frame. Well under tonic's 4 MiB default
@@ -144,7 +143,12 @@ pub struct PacerPeer {
     metrics: Metrics,
     /// Shared with the proxy: one concurrent fill per chunk key node-wide,
     /// regardless of whether a client GET or a peer fetch triggered it.
-    filling: Arc<Mutex<HashSet<String>>>,
+    ///
+    /// This server claims **exclusively** (ADR-0040): a read-through already holds
+    /// the backend response it is about to accumulate, so there is no fetch for
+    /// another request to share, and making one wait on this pump would couple a
+    /// local client's latency to how fast a remote requester drains its stream.
+    filling: FillRegistry,
     /// Caps how many peer read-through fills run concurrently on this holder,
     /// bounding their combined memory to `fill_parallelism × chunk_size` — the
     /// same bound the proxy's client read path already enforces via
@@ -245,9 +249,9 @@ pub struct PeerParts {
     /// The node's one metrics registry, so a serve and a client GET count into the
     /// same series.
     pub metrics: Metrics,
-    /// The node-wide in-flight-fill guard, shared with the proxy: one concurrent fill
-    /// per chunk key whichever path triggered it.
-    pub filling: Arc<Mutex<HashSet<String>>>,
+    /// The node-wide in-flight-fill registry, shared with the proxy: one concurrent
+    /// fill per chunk key whichever path triggered it.
+    pub filling: FillRegistry,
     /// Concurrent peer read-through fills allowed. Becomes a semaphore, clamped to at
     /// least one — a zero-permit semaphore would deadlock every read-through.
     pub fill_parallelism: usize,
@@ -1314,9 +1318,9 @@ mod tests {
         // lifetime with nothing in `/metrics` to show it. Aborting a spawned task
         // drops its future the same way: mid-poll, with no chance to run anything
         // past the last `.await`.
-        let filling: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let filling = FillRegistry::new();
         let metrics = Metrics::new().expect("a fresh registry must accept every metric");
-        let (filling_task, metrics_task) = (Arc::clone(&filling), metrics.clone());
+        let (filling_task, metrics_task) = (filling.clone(), metrics.clone());
 
         let pump = tokio::spawn(async move {
             let _guard = FillGuard::for_fill(&filling_task, &metrics_task, A_CHUNK_KEY)
@@ -1325,7 +1329,7 @@ mod tests {
             // the `guard.complete()` at the end of `pump_read_through`.
             std::future::pending::<()>().await;
         });
-        while filling.lock().unwrap().is_empty() {
+        while !filling.is_claimed(A_CHUNK_KEY) {
             tokio::task::yield_now().await;
         }
         assert_eq!(
@@ -1341,7 +1345,7 @@ mod tests {
             "the pump must have been cancelled, not have run to completion"
         );
         assert!(
-            filling.lock().unwrap().is_empty(),
+            !filling.is_claimed(A_CHUNK_KEY),
             "the key must be released even though the pump never reached its own release"
         );
         assert_eq!(metrics.fill_inflight.get(), 0);
@@ -1354,11 +1358,11 @@ mod tests {
 
     #[test]
     fn a_client_fill_already_in_flight_refuses_the_read_through_claim() {
-        // The reason the set is shared at all (ADR-0016/0017): one fill per chunk
-        // key node-wide, whichever path got there first. A holder that read the
+        // The reason the registry is shared at all (ADR-0016/0017): one fill per
+        // chunk key node-wide, whichever path got there first. A holder that read the
         // chunk through anyway would pay a second backend GET for bytes already
         // being fetched.
-        let filling: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let filling = FillRegistry::new();
         let metrics = Metrics::new().expect("a fresh registry must accept every metric");
 
         let client_fill = FillGuard::for_fill(&filling, &metrics, A_CHUNK_KEY)

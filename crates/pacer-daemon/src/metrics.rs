@@ -273,15 +273,16 @@ pub struct Metrics {
     /// Peer-owned chunks kept locally after passing the frequency gate
     /// (ADR-0016 layer 1 requester-local admission).
     pub local_admits: IntCounter,
-    /// Fills currently claimed through a `FillGuard` (private to `proxy.rs`)
-    /// — i.e. in flight inside `maybe_admit_local` or `maybe_fill` right now.
+    /// Fills currently claimed through a `FillGuard` (private to `proxy.rs`) — the
+    /// occupancy of the node-wide fill registry, on every path that claims it:
+    /// `maybe_admit_local`, `maybe_fill`, ADR-0040's leading read
+    /// (`FillCtx::fetch_owned`) and the peer server's read-through.
     ///
-    /// ⚠ Not the whole `filling` set: the peer server's own read-through fill
-    /// (`peer.rs`) claims the same node-wide set directly rather than through
-    /// this guard, so this gauge undercounts relative to the set's true size
-    /// whenever a read-through fill is also in flight. It exists to answer one
-    /// question this set previously could not — "is a guarded fill stuck?" — not
-    /// to be the set's total occupancy.
+    /// Note what ADR-0040 changed about the *shape* of this gauge without changing
+    /// its definition: a leader now holds its claim across the whole backend read,
+    /// so a cold multi-chunk read keeps `fill_parallelism` claims up for the
+    /// duration of the reads rather than only for the inserts that follow them. A
+    /// step change here at that ADR is the mechanism engaging, not a leak.
     pub fill_inflight: IntGauge,
     /// Guarded fills (see [`Self::fill_inflight`]) whose `FillGuard` dropped
     /// before calling `complete()` — i.e. the fill's future was cut short
@@ -294,6 +295,9 @@ pub struct Metrics {
     /// again until the daemon restarted. Every increment here is exactly that
     /// event, now visible.
     pub fill_abandoned: IntCounter,
+    /// Reads served from another request's in-flight fill (ADR-0040) — see
+    /// [`FillCoalesceMetrics`].
+    pub fill_coalesce: FillCoalesceMetrics,
     /// Client-memory delivery (ADR-0026, planning/19 Track C) — see
     /// [`DeliveryMetrics`].
     pub delivery: DeliveryMetrics,
@@ -420,6 +424,44 @@ pub struct BackendReadMetrics {
     /// health (`exhausted`) or at this daemon's credentials and request shape
     /// (`permanent`).
     pub failures: IntCounterVec,
+}
+
+/// ADR-0040's single flight, as an operator sees it: what it saved, and how often
+/// it tried and could not.
+///
+/// Three series rather than one because the question "did it engage?" and the
+/// question "was it worth it?" have different answers, and before this the read
+/// path had neither: duplicated backend GETs were invisible, inferable only from
+/// the gap between `pacer_cache_misses_total` and `pacer_fills_completed_total`,
+/// which also folds in every read that was never admitted.
+#[derive(Clone)]
+pub struct FillCoalesceMetrics {
+    /// Chunk reads answered from a fill another request already had in flight.
+    /// Each one is a backend ranged GET this node did **not** issue.
+    pub served: IntCounter,
+    /// Bytes those reads returned — i.e. backend traffic avoided.
+    ///
+    /// **The headline number**, and the reason [`Self::served`] is not enough on
+    /// its own: chunks differ in size (ADR-0015 clamps the last one to the object),
+    /// so a count cannot be turned into bytes by multiplying by `chunkSize`.
+    pub bytes: IntCounter,
+    /// Requests parked on another request's fill **right now**.
+    ///
+    /// The only one of these four readable *during* an incident rather than after it.
+    /// The counters say a fan-in was absorbed; this says one is being absorbed — which is
+    /// the difference between "the single flight is working" and "a stuck leader is
+    /// holding N requests", the one failure mode ADR-0040's coupling introduces. Pinned
+    /// here with [`Self::served`] flat is that incident.
+    pub waiters: IntGauge,
+    /// Reads that waited on a leader and got nothing — the leader's own read failed,
+    /// or its client disconnected and took the future with it — and so fell back to
+    /// fetching for themselves.
+    ///
+    /// Not an error series: a fallback is the pre-ADR-0040 path, so every increment
+    /// is a request that lost the optimisation and nothing else. A *rate* here
+    /// tracking `pacer_backend_read_failures_total` is the backend being unhealthy;
+    /// a rate here without that is clients disconnecting mid-read.
+    pub fallbacks: IntCounter,
 }
 
 /// Allocator gauges (`mallinfo2`, see [`crate::memstats`]): of the resident bytes
@@ -1331,6 +1373,34 @@ fn register_fill_guard_metrics(
     Ok((local_admits, inflight, abandoned))
 }
 
+/// Register ADR-0040's single-flight series (see [`FillCoalesceMetrics`]). Split out
+/// of [`Metrics::new`] for the same reason as [`register_fill_guard_metrics`]: that
+/// constructor is at its function-length budget.
+fn register_fill_coalesce_metrics(registry: &Registry) -> anyhow::Result<FillCoalesceMetrics> {
+    Ok(FillCoalesceMetrics {
+        served: counter(
+            registry,
+            "pacer_fill_coalesced_total",
+            "Chunk reads served from a fill another request already had in flight — each one a backend ranged GET this node did not issue (ADR-0040)",
+        )?,
+        bytes: counter(
+            registry,
+            "pacer_fill_coalesced_bytes_total",
+            "Bytes served from another request's in-flight fill, i.e. backend traffic avoided (ADR-0040)",
+        )?,
+        waiters: int_gauge(
+            registry,
+            "pacer_fill_waiters",
+            "Requests parked on another request's in-flight fill right now — pinned with pacer_fill_coalesced_total flat means a stuck leader is holding them (ADR-0040)",
+        )?,
+        fallbacks: counter(
+            registry,
+            "pacer_fill_coalesce_fallbacks_total",
+            "Reads that waited on a leading fill, were handed nothing (its read failed or its client disconnected), and fetched for themselves — the pre-ADR-0040 path, not an error",
+        )?,
+    })
+}
+
 /// Register the backend chunk-read series (`pacer_backend::retry`). Split out of
 /// [`Metrics::new`] for the same reason as [`register_scatter_metrics`]: that
 /// constructor is at its function-length budget.
@@ -1374,6 +1444,69 @@ fn register_cache_path_counters(registry: &Registry) -> anyhow::Result<CachePath
         )?,
         bytes_from_cache: c("pacer_bytes_from_cache_total", "Bytes served from cache")?,
         bytes_filled: c("pacer_bytes_filled_total", "Bytes written into the cache")?,
+    })
+}
+
+/// The peer tier's plain counters — both sides of it — on the way to [`Metrics`]'s flat
+/// fields.
+///
+/// Private and immediately destructured, for the same reason as
+/// [`CachePathCounters`]: a grouping for one function's benefit, not a change to the
+/// public shape. Every reader still says `metrics.peer_fetches`.
+struct PeerPathCounters {
+    fetches: IntCounter,
+    fallbacks: IntCounter,
+    bytes_from_peers: IntCounter,
+    serves: IntCounter,
+    serves_rdma: IntCounter,
+    misses: IntCounter,
+    readthroughs: IntCounter,
+    bytes_to_peers: IntCounter,
+}
+
+/// Register the eight counters of [`PeerPathCounters`].
+///
+/// Extracted from [`Metrics::new`] for the reason the sibling registrars name: that
+/// constructor is at clippy's 80-line budget, and these eight were 32 of its lines.
+///
+/// # Errors
+///
+/// A duplicate registration in `registry`.
+fn register_peer_path_counters(registry: &Registry) -> anyhow::Result<PeerPathCounters> {
+    let c = |name: &str, help: &str| counter(registry, name, help);
+    Ok(PeerPathCounters {
+        fetches: c(
+            "pacer_peer_fetches_total",
+            "Misses resolved by fetching from the owning peer",
+        )?,
+        fallbacks: c(
+            "pacer_peer_fallbacks_total",
+            "Peer fetches that failed over to a direct backend GET",
+        )?,
+        bytes_from_peers: c(
+            "pacer_bytes_from_peers_total",
+            "Bytes received from peers (requester side)",
+        )?,
+        serves: c(
+            "pacer_peer_serves_total",
+            "Peer FetchBlob requests served (cache hit or read-through)",
+        )?,
+        serves_rdma: c(
+            "pacer_peer_serves_rdma_total",
+            "Peer FetchBlob requests served via a one-sided RDMA WRITE (ADR-0018)",
+        )?,
+        misses: c(
+            "pacer_peer_misses_total",
+            "Peer FetchBlob requests answered NOT_FOUND",
+        )?,
+        readthroughs: c(
+            "pacer_peer_readthroughs_total",
+            "Owned misses read through to the backend on behalf of a peer",
+        )?,
+        bytes_to_peers: c(
+            "pacer_bytes_to_peers_total",
+            "Bytes sent to peers (server side)",
+        )?,
     })
 }
 
@@ -2083,15 +2216,14 @@ impl Metrics {
         #[cfg(feature = "efa")]
         let rdma = register_rdma_gauges(&registry)?;
         let (local_admits, fill_inflight, fill_abandoned) = register_fill_guard_metrics(&registry)?;
-        // Local alias: every plain IntCounter registers the same way, and the
-        // short name keeps each field on one line despite the long metric names.
-        let c = |name: &str, help: &str| counter(&registry, name, help);
-        // Flattened into the fields below rather than held as a sub-struct: these eight are
-        // read by name all over the tree and by three test suites, so grouping them in the
-        // public type would be a rename with no benefit. Split out of this function for the
-        // same reason as `register_scatter_metrics` — the line budget (clippy.toml's
-        // `too-many-lines-threshold = 80`), which adding one counter here crossed.
+        // Both groups are flattened into the fields below rather than held as sub-structs:
+        // they are read by name all over the tree and by three test suites, so grouping
+        // them in the public type would be a rename with no benefit. Split out of this
+        // function for the same reason as `register_scatter_metrics` — the line budget
+        // (clippy.toml's `too-many-lines-threshold = 80`), which each of them crossed in
+        // turn as a counter was added.
         let cache_path = register_cache_path_counters(&registry)?;
+        let peer_path = register_peer_path_counters(&registry)?;
         Ok(Self {
             ops_total,
             ring_members,
@@ -2112,41 +2244,18 @@ impl Metrics {
             bytes_from_cache: cache_path.bytes_from_cache,
             bytes_filled: cache_path.bytes_filled,
             backend_read: register_backend_read_metrics(&registry)?,
-            peer_fetches: c(
-                "pacer_peer_fetches_total",
-                "Misses resolved by fetching from the owning peer",
-            )?,
-            peer_fallbacks: c(
-                "pacer_peer_fallbacks_total",
-                "Peer fetches that failed over to a direct backend GET",
-            )?,
-            bytes_from_peers: c(
-                "pacer_bytes_from_peers_total",
-                "Bytes received from peers (requester side)",
-            )?,
-            peer_serves: c(
-                "pacer_peer_serves_total",
-                "Peer FetchBlob requests served (cache hit or read-through)",
-            )?,
-            peer_serves_rdma: c(
-                "pacer_peer_serves_rdma_total",
-                "Peer FetchBlob requests served via a one-sided RDMA WRITE (ADR-0018)",
-            )?,
-            peer_misses: c(
-                "pacer_peer_misses_total",
-                "Peer FetchBlob requests answered NOT_FOUND",
-            )?,
-            peer_readthroughs: c(
-                "pacer_peer_readthroughs_total",
-                "Owned misses read through to the backend on behalf of a peer",
-            )?,
-            bytes_to_peers: c(
-                "pacer_bytes_to_peers_total",
-                "Bytes sent to peers (server side)",
-            )?,
+            peer_fetches: peer_path.fetches,
+            peer_fallbacks: peer_path.fallbacks,
+            bytes_from_peers: peer_path.bytes_from_peers,
+            peer_serves: peer_path.serves,
+            peer_serves_rdma: peer_path.serves_rdma,
+            peer_misses: peer_path.misses,
+            peer_readthroughs: peer_path.readthroughs,
+            bytes_to_peers: peer_path.bytes_to_peers,
             local_admits,
             fill_inflight,
             fill_abandoned,
+            fill_coalesce: register_fill_coalesce_metrics(&registry)?,
             delivery: register_delivery_metrics(&registry)?,
             scatter: register_scatter_metrics(&registry)?,
             listener: register_listener_metrics(&registry)?,

@@ -38,6 +38,8 @@
 //! * [`budgets`] — every one of those bounds *reached*, with several clients at once.
 //! * [`backend_retry`] — a severed backend body, and the truncation the retry exists to
 //!   prevent.
+//! * [`fill_coalesce`] — ADR-0040's single flight: two clients on one cold chunk, counted
+//!   at the backend, with the knob off as the control.
 //! * [`write_framing`] — what the passthrough PUT puts on the wire, as a function of
 //!   what the client sent.
 //! * [`backend_matrix_s3`] — the arm that needs a real bucket. `#[ignore]`d, and it
@@ -57,6 +59,8 @@ mod cluster;
 mod correctness;
 #[path = "daemon/delivery.rs"]
 mod delivery;
+#[path = "daemon/fill_coalesce.rs"]
+mod fill_coalesce;
 #[path = "daemon/listener.rs"]
 mod listener;
 #[path = "daemon/scatter/mod.rs"]

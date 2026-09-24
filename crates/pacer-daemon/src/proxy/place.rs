@@ -268,9 +268,12 @@ impl FillCtx {
                 .await;
         }
         if self.owns_chunk(&chunk_key) {
-            let bytes = self
-                .fetch_from_backend(window.idx, &chunk_key, self.admit)
-                .await?;
+            // Through `fetch_owned`, not `fetch_from_backend`, so the delivery path
+            // joins ADR-0040's single flight rather than being the one reader that
+            // still duplicates. This is the path where it matters most: N ranks of one
+            // job delivering one checkpoint into N pieces of their own memory are N
+            // requests for the same chunk keys, differing only in destination.
+            let bytes = self.fetch_owned(window.idx, &chunk_key).await?;
             return self
                 .place_window(client_memory, window, &bytes, SOURCE_BACKEND)
                 .await;

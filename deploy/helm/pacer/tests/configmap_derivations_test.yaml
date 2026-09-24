@@ -274,3 +274,23 @@ tests:
       - matchRegex:
           path: data["config.yaml"]
           pattern: 'conditional-get-from-cache: false'
+
+  # ---- ADR-0040: the single-flight knob renders only when turned OFF ---------------------
+  #
+  # Same shape as the row above, and asserted in BOTH directions for the reason
+  # `delivery.remoteWrite` is: this is an A/B arm's control, so a value that fails to reach
+  # the daemon corrupts a measurement rather than a run. Rendered by accident, the control
+  # arm silently measures the treatment; unrenderable, the treatment's number is reported
+  # as the control's.
+  - it: "the default renders NO fill-coalesce key, because the daemon's default is the same"
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: 'fill-coalesce'
+
+  - it: "turning it off renders it, so the control arm can actually be deployed"
+    set: { config.fillCoalesce: false }
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'fill-coalesce: false'

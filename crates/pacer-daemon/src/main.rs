@@ -313,7 +313,9 @@ async fn run(
     .with_backend_type(cfg.backend.backend_type)
     .with_delivery(cfg.delivery.clone(), delivery_quota)
     // ADR-0039: whether an If-Match GET may reach the cache at all.
-    .with_conditional_get_from_cache(cfg.conditional_get_from_cache);
+    .with_conditional_get_from_cache(cfg.conditional_get_from_cache)
+    // ADR-0040: whether concurrent readers of one cold chunk share its backend read.
+    .with_fill_coalesce(cfg.fill_coalesce);
 
     // Cluster tier (Phase 2): membership → SharedRing; peer gRPC server;
     // ring-aware miss path in the proxy (ADR-0012). Phase 3: an EFA
@@ -1179,10 +1181,7 @@ fn build_peer_server(
         pacer_ring::directory::SharedDirectory,
     ),
     metrics: &metrics::Metrics,
-    (filling, chunk_fill): (
-        Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-        cachefill::ChunkFill,
-    ),
+    (filling, chunk_fill): (proxy::FillRegistry, cachefill::ChunkFill),
     #[cfg(feature = "efa")] (efa, rdma_runtime): (
         Option<Arc<pacer_transport::efa::EfaRdmaTransport>>,
         &tokio::runtime::Handle,

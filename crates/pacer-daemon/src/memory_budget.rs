@@ -488,11 +488,21 @@ pub fn pinned_budget(cfg: &Config, arenas: EfaArenas) -> MemoryBudget {
             Term::ScatterCoordinator,
             cfg.scatter.windows_in_flight as u64 * chunk,
         );
-    } else if cfg.auth_mode == crate::auth::AuthMode::Requester && cfg.cluster.is_some() {
-        // A requester-mode node homes peers' populate-only windows in the same staging
-        // area with the scatter off (ADR-0041), so the budget is held; it coordinates
-        // nothing, so no coordinator term. Mirrors `pacer.scatterStagingBytes`.
-        set(Term::ScatterStaging, cfg.scatter.staging_bytes);
+    } else if cfg.auth_mode == crate::auth::AuthMode::Requester {
+        // A requester-mode node stages populate-only windows — peers' on a cluster, its own
+        // write tee's anywhere — in the same staging area with the scatter off (ADR-0041).
+        // Mirrors `pacer.scatterStagingBytes`.
+        if cfg.cluster.is_some() || cfg.populate_on_write {
+            set(Term::ScatterStaging, cfg.scatter.staging_bytes);
+        }
+        // The tee holds at most `windows_in_flight` windows between a body and staging,
+        // plus one partial window for each of as many bodies. Mirrors `pacer.teeBytes`.
+        if cfg.populate_on_write {
+            set(
+                Term::ScatterCoordinator,
+                2 * cfg.scatter.windows_in_flight as u64 * chunk,
+            );
+        }
     }
     set(
         Term::FoyerFlushBuffers,
@@ -896,8 +906,8 @@ scatter:
 
     /// `limits.memory` the chart renders for [`CHART_REQUESTER_CLUSTER_CONFIG`]: the
     /// same release in node mode renders 9 GiB, and requester mode adds exactly the
-    /// 2 GiB staging area.
-    const CHART_REQUESTER_CLUSTER_LIMIT: u64 = 11_811_160_064;
+    /// 2 GiB staging area and the write tee's 512 MiB.
+    const CHART_REQUESTER_CLUSTER_LIMIT: u64 = 12_348_030_976;
 
     /// `limits.memory` the chart renders for `--set efa.enabled=true --set
     /// delivery.enabled=true`: 4 (base) + 8 (`efa.pinnedPoolReservation`) + 8
@@ -1005,10 +1015,10 @@ scatter:
         const { assert!(DEFAULT_HEADROOM_FRACTION < 21.0 / 18.0 - 1.0) };
     }
 
-    /// Requester mode on a cluster holds a staging area with the scatter off (ADR-0041):
-    /// the daemon must charge it, charge no coordinator, and agree with the limit the
-    /// chart rendered for the same values — the number that would otherwise have been
-    /// 2 GiB short and OOMKilled under a populate burst.
+    /// Requester mode on a cluster holds a staging area with the scatter off (ADR-0041),
+    /// and by default the write tee's windows: the daemon must charge both and agree with
+    /// the limit the chart rendered for the same values — the number that would otherwise
+    /// have been 2.5 GiB short and OOMKilled under a save.
     #[test]
     fn budget_mirrors_the_chart_requester_cluster_render() {
         let b = budget_of(CHART_REQUESTER_CLUSTER_CONFIG, EfaArenas::Absent);
@@ -1017,12 +1027,13 @@ scatter:
             2 * GIB,
             "pacer.scatterStagingBytes"
         );
+        // No coordinator, but the write tee, on by default: 2 x 16 windows x 16 MiB.
         assert_eq!(
             b.get(Term::ScatterCoordinator),
-            0,
-            "requester mode coordinates nothing"
+            2 * 16 * (16 << 20),
+            "pacer.teeBytes"
         );
-        assert_eq!(CHART_REQUESTER_CLUSTER_LIMIT, 11 * GIB);
+        assert_eq!(CHART_REQUESTER_CLUSTER_LIMIT, 11 * GIB + (512 << 20));
         check(&b, Some(CHART_REQUESTER_CLUSTER_LIMIT), Headroom::DEFAULT)
             .expect("the chart's own requester-mode cluster render must start");
     }

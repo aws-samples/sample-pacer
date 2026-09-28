@@ -365,7 +365,30 @@ with the scatter off. Every budget that counts staging keys on THIS, not on the 
 equal to pacer.scatterEnabled in node mode, so node-mode renders are unchanged.
 */}}
 {{- define "pacer.stagingHeld" -}}
-{{- if or (include "pacer.scatterEnabled" .) (and (include "pacer.requesterMode" .) .Values.cluster.enabled) -}}true{{- end -}}
+{{- if or (include "pacer.scatterEnabled" .) (and (include "pacer.requesterMode" .) (or .Values.cluster.enabled (include "pacer.populateOnWrite" .))) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+"true" when requester mode tees writes into the cache (planning/30), else "". On unless
+auth.requester.populateOnWrite is explicitly false — `ne false` rather than truthiness so an
+unset key keeps the documented default.
+*/}}
+{{- define "pacer.populateOnWrite" -}}
+{{- if and (include "pacer.requesterMode" .) (ne (((.Values.auth).requester).populateOnWrite) false) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The write tee's bytes, or "": at most scatter.windowsInFlight windows between a body and its
+staging, plus one partial window for each of as many bodies — 2 x windowsInFlight x
+chunkSize. Mirrors crates/pacer-daemon/src/memory_budget.rs, which charges the same term.
+*/}}
+{{- define "pacer.teeBytes" -}}
+{{- if include "pacer.populateOnWrite" . -}}
+{{- $chunk := include "pacer.toBytes" (.Values.config.chunkSize | default "16MiB") | int64 -}}
+{{- $windows := .Values.scatter.windowsInFlight | toString | trim -}}
+{{- if or (eq $windows "") (eq $windows "0") -}}{{- $windows = "16" -}}{{- end -}}
+{{- mul 2 ($windows | int64) $chunk -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -886,8 +909,8 @@ they watch it.
 {{- $bytes = add $bytes (include "pacer.scatterStagingBytes" . | int64) (include "pacer.scatterCoordinatorBytes" . | int64) -}}
 {{- $pinned = true -}}
 {{- else if include "pacer.stagingHeld" . -}}
-{{/* Requester mode on a cluster: the staging area without a coordinator (ADR-0041). */}}
-{{- $bytes = add $bytes (include "pacer.scatterStagingBytes" . | int64) -}}
+{{/* Requester mode: the staging area without a coordinator, and the write tee (ADR-0041). */}}
+{{- $bytes = add $bytes (include "pacer.scatterStagingBytes" . | int64) (include "pacer.teeBytes" . | default "0" | int64) -}}
 {{- $pinned = true -}}
 {{- end -}}
 {{- if $pinned -}}

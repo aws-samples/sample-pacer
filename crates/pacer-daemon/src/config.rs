@@ -392,6 +392,14 @@ const TLS_LISTEN_ADDR: EnvVar = EnvVar {
     name: "PACER_TLS_LISTEN_ADDR",
     default: "0.0.0.0:9443",
 };
+/// Whether requester mode tees `PutObject` / `UploadPart` bodies into the cache
+/// (ADR-0041, planning/30). On: the tee never slows a write — it drops a window rather
+/// than wait — so the only cost is memory, which both budgets charge. Read only in
+/// requester mode; `false` forwards writes untouched and populates nothing.
+const POPULATE_ON_WRITE: EnvVar = EnvVar {
+    name: "PACER_POPULATE_ON_WRITE",
+    default: "true",
+};
 /// This node's Kubernetes node name (downward API). Set = cluster mode on.
 /// Env-only: it is per-pod, so it can never live in the shared ConfigMap.
 const NODE_NAME: EnvVar = EnvVar {
@@ -971,6 +979,9 @@ pub struct Config {
     /// Requester mode's second, TLS listener (ADR-0041 § 9); `None` = plaintext only.
     /// Refused in node mode, where there is no proxy for it to serve.
     pub auth_tls: Option<TlsListenConfig>,
+    /// Whether requester mode tees write bodies into the cache (planning/30). Ignored in
+    /// node mode, where the write scatter is the populate path.
+    pub populate_on_write: bool,
     /// Cluster tier (Phase 2). None = single-node (Phase 1 behavior).
     pub cluster: Option<ClusterConfig>,
     /// Client-memory delivery (ADR-0026): whether `x-pacer-target` is honoured,
@@ -1237,6 +1248,7 @@ struct FileAuth {
     mode: Option<String>,
     s3_domains: Option<Vec<String>>,
     tls: Option<FileAuthTls>,
+    populate_on_write: Option<bool>,
 }
 
 /// `auth.tls:` block — requester mode's TLS listener (ADR-0041 § 9).
@@ -1424,6 +1436,7 @@ fn resolve(file: &FileConfig, env: EnvFn) -> anyhow::Result<Config> {
         auth_mode,
         auth_s3_domains,
         auth_tls,
+        populate_on_write: populate_on_write(file, env),
         cluster: cluster_config(file, env)?,
         delivery: delivery_config(file, env)?,
         scatter: scatter_config(file, env, backend_type(file, env)?, auth_mode)?,
@@ -2006,6 +2019,17 @@ fn verify_chunk_body(file: &FileConfig, env: EnvFn) -> bool {
 /// passthrough every conditional GET took before ADR-0039, so a misspelling loses the
 /// optimisation rather than silently keeping a semantic deviation the operator was trying
 /// to turn off.
+/// `auth.populate-on-write`: env wins, then the file bool, then `true`. A typo reads as
+/// `false` — the direction that populates less and can never cache a wrong byte.
+fn populate_on_write(file: &FileConfig, env: EnvFn) -> bool {
+    let file_val = file
+        .auth
+        .as_ref()
+        .and_then(|a| a.populate_on_write)
+        .map(|b| b.to_string());
+    POPULATE_ON_WRITE.resolve(env, file_val) == "true"
+}
+
 fn conditional_get_from_cache(file: &FileConfig, env: EnvFn) -> bool {
     let file_val = file
         .policy
@@ -3645,6 +3669,30 @@ auth:
         assert_eq!(tls.cert, std::path::PathBuf::from("/etc/pacer-tls/tls.crt"));
         assert_eq!(tls.key, std::path::PathBuf::from("/etc/pacer-tls/tls.key"));
         assert_eq!(tls.listen_addr, "0.0.0.0:9443");
+    }
+
+    /// planning/30: the write tee is on unless turned off, from either layer; a typo is
+    /// off, the direction that can only populate less.
+    #[test]
+    fn populate_on_write_defaults_on_and_turns_off_from_either_layer() {
+        let base = [
+            ("PACER_AUTH_MODE", "requester"),
+            ("PACER_AUTH_S3_DOMAINS", "s3.us-east-2.amazonaws.com"),
+        ];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut env = base.to_vec();
+            env.extend_from_slice(extra);
+            resolve(&FileConfig::default(), &fake_env(&env)).unwrap()
+        };
+        assert!(with(&[]).populate_on_write);
+        assert!(!with(&[("PACER_POPULATE_ON_WRITE", "false")]).populate_on_write);
+        assert!(!with(&[("PACER_POPULATE_ON_WRITE", "flase")]).populate_on_write);
+        let cfg = resolve_for_test(
+            "auth:\n  mode: requester\n  s3-domains: [\"s3.us-east-2.amazonaws.com\"]\n  populate-on-write: false\n",
+            &[],
+        )
+        .unwrap();
+        assert!(!cfg.populate_on_write, "the chart's rendered key");
     }
 
     #[test]

@@ -224,10 +224,21 @@ above is what a reader will otherwise take as the behaviour.
    `config.awsRegion`; the design's own warning — a wrong list yields a plausible bucket name
    and a 404, not an error — argues against guessing, so both the chart and the daemon refuse
    an empty list.
-6. **The write tee is not implemented.** Writes are forwarded unmodified and do not populate
-   the cache; `populateOnWrite` does not exist yet. A requester-mode node on a cluster still
-   holds a staging area, for chunks peers push to it, and the chart and the daemon's startup
-   memory check both charge it.
+6. **The write tee is built, with four departures from its spec** (`populateOnWrite`, on by
+   default). Writes are forwarded unmodified; `PutObject` and `UploadPart` bodies are teed onto
+   the chunk grid, staged at each chunk's home, and committed under the new ETag once S3 says
+   the object exists. (a) **No invalidation before the commit:** the version witness (point 1)
+   already keeps an older version's chunks from being served, and the new version's chunks
+   overwrite them under the same keys. (b) **A multipart part never stages its short tail** —
+   that window is a whole chunk only if the part is the last, which nothing says until
+   Complete, and staging it anyway would commit a truncated chunk under a placement that
+   verifies; so an uploaded object's final chunk is one miss. (c) **`aws-chunked` bodies are
+   decoded** before they are teed: modern SDKs send streaming and trailing-checksum uploads
+   that way, and teeing the framing would cache it as object bytes. (d) **An upload is
+   discarded, not committed, if any part is seen twice, refused by S3, or ends short** — a
+   retried part may carry different bytes and S3 keeps the last. Every requester-mode node
+   holds a staging area for this (a single node included), and both the chart and the
+   daemon's startup check charge it and the tee's in-flight windows.
 
 Two things are as the text says but are worth stating: the authorization request is never
 overlapped with the cache read, so a hit waits for it (its in-cluster latency is still the

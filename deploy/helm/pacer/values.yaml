@@ -267,6 +267,11 @@ auth:
     tls:
       secretName: ""
       port: 9443
+    # Tee PutObject/UploadPart bodies into the cache as they are forwarded, so a checkpoint
+    # just written reads back as a hit. Never slows a write (a window is dropped rather than
+    # waited for); costs 2 x scatter.windowsInFlight x chunkSize plus the staging area, both
+    # added to the memory limit. docs/helm/auth.md#writes
+    populateOnWrite: true
 
 # ADR-0006's authorization boundary: reaching :9000 IS the authorization to spend the node's
 # IAM identity, so this is the client-side security model, not a hardening extra — which is

@@ -45,6 +45,20 @@ const HOP_BY_HOP_HEADERS: [&str; 9] = [
 
 type HttpsConnector = hyper_rustls::HttpsConnector<HttpConnector>;
 
+/// Every body the raw forward sends, erased to one type so a plain body, a teed one and one
+/// re-sent from bytes share a client and its connection pool.
+pub(crate) type OutBody =
+    http_body_util::combinators::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Erase `body` to [`OutBody`].
+pub(crate) fn out_body<B>(body: B) -> OutBody
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    body.map_err(Into::into).boxed_unsync()
+}
+
 /// The client's request exactly as it arrived — method, URI, headers,
 /// **including** `Authorization` — captured before that header is stripped
 /// for the anonymous `s3s` parse (ADR-0041 § 2.3). Lives exactly as long as
@@ -141,8 +155,58 @@ fn signed_range(headers: &HeaderMap) -> bool {
     list.split(';').any(|h| h.eq_ignore_ascii_case("range"))
 }
 
+/// The bucket and key a request addresses, as s3s would parse them: the bucket from the
+/// virtual host or the first path segment, the key percent-decoded — so the chunk keys the
+/// write path stages under are the ones the read path looks up. `None` for a request that
+/// addresses no object.
+pub(crate) fn object_address<B>(
+    req: &Request<B>,
+    domains: &MultiDomain,
+) -> Option<(String, String)> {
+    let host = req.headers().get(http::header::HOST)?.to_str().ok()?;
+    let vh = domains.parse_host_header(host).ok()?;
+    let path = req.uri().path().trim_start_matches('/');
+    let (bucket, key) = match vh.bucket() {
+        Some(bucket) => (bucket.to_owned(), path),
+        None => {
+            let (bucket, key) = path.split_once('/')?;
+            (bucket.to_owned(), key)
+        }
+    };
+    if key.is_empty() {
+        return None;
+    }
+    Some((bucket, percent_decode(key)?))
+}
+
+/// Percent-decode `s`; `None` when an escape is malformed or the result is not UTF-8.
+pub(crate) fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The percent-decoded value of query parameter `key`, if present with a value.
+pub(crate) fn query_value(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then(|| percent_decode(v)).flatten()
+    })
+}
+
 /// Whether `query` names `key` as a bare or valued parameter.
-fn query_has(query: &str, key: &str) -> bool {
+pub(crate) fn query_has(query: &str, key: &str) -> bool {
     query.split('&').any(|kv| kv.split('=').next() == Some(key))
 }
 
@@ -211,9 +275,18 @@ pub struct RequesterFront<S> {
     domains: Arc<MultiDomain>,
     forwarder: Arc<Forwarder>,
     metrics: Metrics,
+    /// Tees writes into the cache (planning/30); `None` forwards them untouched.
+    tee: Option<crate::populate::WriteTee>,
 }
 
 impl<S> RequesterFront<S> {
+    /// Tee `PutObject` and `UploadPart` bodies into the cache through `tee`.
+    #[must_use]
+    pub fn with_write_tee(mut self, tee: crate::populate::WriteTee) -> Self {
+        self.tee = Some(tee);
+        self
+    }
+
     /// Build the front door. `domains` and `forwarder` are shared with
     /// [`crate::proxy`]'s `RequesterS3`, which needs the same forwarding
     /// client for the probe and chunk fills.
@@ -228,6 +301,7 @@ impl<S> RequesterFront<S> {
             domains,
             forwarder,
             metrics,
+            tee: None,
         }
     }
 }
@@ -286,6 +360,11 @@ where
                 self.metrics.authz.signed_range_bypass.inc();
             } else {
                 return self.strip_and_hold(req).await;
+            }
+        }
+        if let Some(tee) = &self.tee {
+            if let Some(op) = crate::requester_write::WriteOp::of(&req, &self.domains) {
+                return crate::requester_write::forward(&self.forwarder, tee, req, op).await;
             }
         }
         match self.forwarder.forward(req).await {
@@ -347,8 +426,9 @@ fn text_response(status: StatusCode, body: &str) -> Response<s3s::Body> {
 /// forward streams the client's own body while a probe or chunk read always
 /// synthesizes a bodyless GET.
 pub struct Forwarder {
-    /// Raw forward: streams the client's own `Incoming` body through.
-    client: Client<HttpsConnector, Incoming>,
+    /// Raw forward: streams the client's body through — as it arrived, wrapped in the write
+    /// tee, or re-sent from bytes already read (a `CompleteMultipartUpload`'s part list).
+    client: Client<HttpsConnector, OutBody>,
     /// Probe / chunk-range re-emission: always a bodyless GET.
     held_client: Client<HttpsConnector, Empty<Bytes>>,
 }
@@ -381,6 +461,22 @@ impl Forwarder {
         req: Request<Incoming>,
     ) -> Result<Response<s3s::Body>, hyper_util::client::legacy::Error> {
         let (parts, body) = req.into_parts();
+        let resp = self.send(parts, out_body(body)).await?;
+        let (parts, body) = resp.into_parts();
+        Ok(Response::from_parts(parts, s3s::Body::http_body(body)))
+    }
+
+    /// [`Self::forward`] with the body supplied separately and S3's response returned as it
+    /// arrived, for the write path, which reads some responses before relaying them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::forward`].
+    pub(crate) async fn send(
+        &self,
+        parts: request::Parts,
+        body: OutBody,
+    ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
         let mut builder = Request::builder().method(parts.method).uri(parts.uri);
         if let Some(headers) = builder.headers_mut() {
             for (name, value) in &parts.headers {
@@ -392,9 +488,7 @@ impl Forwarder {
         let outbound = builder
             .body(body)
             .expect("method/uri/headers were copied from an already-parsed request");
-        let resp = self.client.request(outbound).await?;
-        let (parts, body) = resp.into_parts();
-        Ok(Response::from_parts(parts, s3s::Body::http_body(body)))
+        self.client.request(outbound).await
     }
 
     /// Re-emit `held` exactly as the caller sent it and hand back S3's response, body

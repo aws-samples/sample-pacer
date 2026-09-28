@@ -18,6 +18,7 @@
 //! the directory home's sharer set, ADR-0016/0017), and it is AWAITED before the
 //! write returns so read-after-write holds cluster-wide.
 
+use aws_sdk_s3::operation::head_object::HeadObjectError;
 use pacer_backend::BackendType;
 use pacer_cache::object_key;
 use s3s::dto::{self, ETag};
@@ -42,6 +43,18 @@ fn verdict_label(verdict: ScatterVerdict) -> &'static str {
         ScatterVerdict::ChunkBelowPartMinimum => "chunk_below_part_minimum",
         ScatterVerdict::ChunkAbovePeerMessageLimit => "chunk_above_peer_message_limit",
     }
+}
+
+/// Whether a failed `HeadObject` says the key does not exist, and nothing else.
+///
+/// Both 404 shapes count — the modeled `NotFound` variant and a bare `NoSuchKey`
+/// code — for the same reason the read path accepts both
+/// (`head_list_delete_passthrough`): a HEAD has no response body to model the error
+/// from, so which one arrives depends on the backend. Everything else (a throttle, a
+/// 5xx, a timeout) is *not* an answer about the key, and a caller must not treat it
+/// as one.
+fn is_clean_404(err: &HeadObjectError) -> bool {
+    err.is_not_found() || err.meta().code() == Some("NoSuchKey")
 }
 
 /// Whether `numbers` (the part numbers of a `CompleteMultipartUpload`) satisfy
@@ -252,12 +265,9 @@ impl PacerProxy {
     /// backend problem routes the write down the conservative path rather than
     /// letting it populate over something it could not see.
     ///
-    /// Both 404 shapes count as absent — the modeled `NotFound` variant and a bare
-    /// `NoSuchKey` code — for the same reason the read path accepts both
-    /// (`head_list_delete_passthrough`): a HEAD has no response body to model the
-    /// error from, so which one arrives depends on the backend. Accepting only the
-    /// first would make every write look like an overwrite against a backend that
-    /// answers the second, and the scatter would never engage there.
+    /// Both 404 shapes count as absent ([`is_clean_404`]). Accepting only the modeled
+    /// one would make every write look like an overwrite against a backend that
+    /// answers the other, and the scatter would never engage there.
     async fn key_already_exists(&self, bucket: &str, key: &str) -> bool {
         match self
             .backend
@@ -268,10 +278,7 @@ impl PacerProxy {
             .await
         {
             Ok(_) => true,
-            Err(e) => {
-                let svc = e.into_service_error();
-                !(svc.is_not_found() || svc.meta().code() == Some("NoSuchKey"))
-            }
+            Err(e) => !is_clean_404(&e.into_service_error()),
         }
     }
 
@@ -299,75 +306,82 @@ impl PacerProxy {
         s.owners_engaged.inc_by(result.distinct_owners as u64);
     }
 
-    /// Drop an object's cache footprint on a write (ADR-0007/ADR-0015): the
-    /// header key AND every covering chunk key. If the header is cached, its
-    /// `object_len` bounds the chunk set to remove; if not, nothing chunked can
-    /// be stale for this object (a covering chunk is only ever inserted after
-    /// its header, so no header ⇒ no chunks — same reasoning as ADR-0012's
-    /// two-nodes-can-hold-it argument), and only the header key is dropped.
+    /// Drop an object's cache footprint after a write (ADR-0007/ADR-0015, as amended
+    /// by ADR-0042): the header key and every chunk key of the object the write
+    /// replaced. `footprint` is that object's length, measured by
+    /// [`Self::stale_footprint`] **before** the write was forwarded; `None` means the
+    /// key did not exist, so only the header key is dropped.
     ///
-    /// Each key is removed locally and, in cluster mode, at its own owner (the
-    /// only two nodes that can hold it — ADR-0012). Awaited before the write
-    /// returns so read-after-write holds cluster-wide; an unreachable owner
-    /// logs and counts but never fails the write (the backend mutation already
-    /// happened, and reads fall back to the fresh backend anyway).
-    async fn invalidate(&self, bucket: &str, key: &str) {
+    /// Each key is removed locally and, in cluster mode, at every node that can hold
+    /// it ([`Self::invalidate_key`]). Awaited before the write returns so
+    /// read-after-write holds cluster-wide; an unreachable node logs and counts but
+    /// never fails the write (the backend mutation already happened).
+    ///
+    /// Measuring the replaced object rather than the new one is what makes a
+    /// shrinking overwrite purge every old chunk instead of orphaning those past the
+    /// new length, and what makes a DELETE purge anything at all.
+    async fn invalidate(&self, bucket: &str, key: &str, footprint: Option<u64>) {
         let object_key = object_key(bucket, key);
-        // Learn the chunk set to purge. Prefer a locally cached header; if none
-        // (this node is not the header's owner, e.g. a write through a
-        // non-owner), the PRE-overwrite object length still tells us how many
-        // chunk keys the old object occupied — a HEAD reflects the NEW length,
-        // which for a same-or-larger overwrite still covers every stale chunk
-        // key, and for a delete returns 404 (nothing to purge beyond the
-        // header). A missing length falls back to header-only removal.
-        let object_len = self.invalidation_object_len(&object_key, bucket, key).await;
         self.invalidate_key(&object_key).await;
-        if let Some(object_len) = object_len {
-            for idx in 0..self.chunk.chunk_count(object_len) {
-                let chunk_key = self.chunk.chunk_key(&object_key, idx);
-                self.invalidate_key(&chunk_key).await;
-            }
+        let Some(object_len) = footprint else {
+            return;
+        };
+        for idx in 0..self.chunk.chunk_count(object_len) {
+            let chunk_key = self.chunk.chunk_key(&object_key, idx);
+            self.invalidate_key(&chunk_key).await;
         }
-        // Known bound — shrinking overwrite: if the object is overwritten SMALLER,
-        // chunks beyond the new length are not in this covering set, so they
-        // ORPHAN (stale keys) rather than being purged. This is a bounded capacity
-        // leak, never a wrong serve: the header is invalidated, so a later read
-        // re-HEADs the new (shorter) length and its covering set never includes
-        // the orphaned indices — they are unreachable, and LRU reclaims them.
-        // ADR-0015's immutability precondition (checkpoint writers write a new
-        // name per version, never overwrite in place) means this case does not
-        // arise for the target workload; the leak is the accepted cost otherwise.
     }
 
-    /// The object length used to compute an invalidation's covering chunk set:
-    /// a locally cached header wins; otherwise a backend `HeadObject` (a
-    /// non-owner writer holds no header). A 404 (deleted) or any HEAD failure
-    /// yields `None` — only the header key is then dropped, which is correct
-    /// (no header ⇒ no chunk was inserted under this object at this node).
-    async fn invalidation_object_len(
-        &self,
-        object_key: &str,
-        bucket: &str,
-        key: &str,
-    ) -> Option<u64> {
-        if let Ok(Some(entry)) = self.tier.cache().get(object_key).await {
+    /// The length of the object a write is about to replace — the bound on which
+    /// chunk keys that write can leave stale. Called **before** the write is
+    /// forwarded (ADR-0042).
+    ///
+    /// A locally cached header answers without a call. Otherwise a backend
+    /// `HeadObject` does, on every node: "no header ⇒ no chunks" held only for one
+    /// node holding both, and fails both when the chunks are on other nodes and when
+    /// LRU evicted the header before its chunks. A clean 404 is `None`: nothing
+    /// under this key was cacheable.
+    ///
+    /// # Errors
+    ///
+    /// `ServiceUnavailable` when the length cannot be learned — a HEAD that fails
+    /// with anything other than a clean 404, or answers without a length. The write
+    /// is then refused before anything changed, so the client's retry finds the
+    /// cache and the backend still in agreement. Guessing "no chunks" instead left
+    /// the header purged and every old chunk serving under the new object's length.
+    async fn stale_footprint(&self, bucket: &str, key: &str) -> S3Result<Option<u64>> {
+        let object_key = object_key(bucket, key);
+        if let Ok(Some(entry)) = self.tier.cache().get(&object_key).await {
             if let Some(h) = entry.value().as_header() {
-                return Some(h.object_len);
+                return Ok(Some(h.object_len));
             }
         }
-        // Only a clustered writer needs the backend HEAD: single-node, a
-        // no-header object never had chunks inserted, so there is nothing more
-        // to purge.
-        self.cluster.as_ref()?;
         let head = self
             .backend
             .head_object()
             .bucket(bucket)
             .key(key)
             .send()
-            .await
-            .ok()?;
-        head.content_length().and_then(|l| u64::try_from(l).ok())
+            .await;
+        let len = match head {
+            Ok(out) => out.content_length().and_then(|l| u64::try_from(l).ok()),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if is_clean_404(&svc) {
+                    return Ok(None);
+                }
+                warn!(key = %object_key, error = %svc,
+                    "cannot size the cache footprint this write would leave stale; refusing it");
+                None
+            }
+        };
+        len.map(Some).ok_or_else(|| {
+            self.metrics.writes_refused.inc();
+            s3_error!(
+                ServiceUnavailable,
+                "the cache footprint of this key could not be measured; retry"
+            )
+        })
     }
 
     /// Remove one cache key locally and, in cluster mode, at every node that
@@ -430,7 +444,9 @@ impl PacerProxy {
     /// # Errors
     ///
     /// A failed scatter (by then the body is consumed, so there is no plain PUT to
-    /// fall back to) or the backend's own rejection of the passthrough — the latter
+    /// fall back to), `ServiceUnavailable` when the key's cache footprint cannot be
+    /// measured ([`Self::stale_footprint`]), or the backend's own rejection of the
+    /// passthrough — the latter
     /// logged with the request's framing first, because that log line is the only
     /// record of WHY on the node that forwarded it.
     pub(super) async fn scatter_or_write_through(
@@ -455,6 +471,7 @@ impl PacerProxy {
             return Ok(scattered);
         }
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let footprint = self.stale_footprint(&bucket, &key).await?;
         // A failed passthrough PUT used to propagate silently: the client saw the
         // s3s-wrapped SDK error and the daemon logged nothing, so a write that the
         // backend rejected left no record of WHY on the node that forwarded it. The
@@ -474,7 +491,7 @@ impl PacerProxy {
                 "passthrough PUT rejected by the backend",
             );
         })?;
-        self.invalidate(&bucket, &key).await;
+        self.invalidate(&bucket, &key, footprint).await;
         Ok(resp)
     }
 
@@ -482,7 +499,9 @@ impl PacerProxy {
     ///
     /// # Errors
     ///
-    /// The backend's own; the invalidation itself never fails a write.
+    /// `ServiceUnavailable` when the destination's cache footprint cannot be measured
+    /// ([`Self::stale_footprint`]), else the backend's own; the invalidation itself
+    /// never fails a write.
     pub(super) async fn copy_and_invalidate(
         &self,
         mut req: S3Request<dto::CopyObjectInput>,
@@ -490,16 +509,23 @@ impl PacerProxy {
         self.count("copy_object");
         self.map_bucket(&mut req.input.bucket);
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let footprint = self.stale_footprint(&bucket, &key).await?;
         let resp = self.inner.copy_object(req).await?;
-        self.invalidate(&bucket, &key).await;
+        self.invalidate(&bucket, &key, footprint).await;
         Ok(resp)
     }
 
     /// Proxy a DELETE and invalidate the key it removed (ADR-0007).
     ///
+    /// The footprint is measured before the DELETE is forwarded, because afterwards
+    /// the only answer a HEAD can give is 404 — which is how a DELETE through a node
+    /// holding no header used to purge no chunks at all (ADR-0042).
+    ///
     /// # Errors
     ///
-    /// The backend's own; the invalidation itself never fails a write.
+    /// `ServiceUnavailable` when the key's cache footprint cannot be measured
+    /// ([`Self::stale_footprint`]), else the backend's own; the invalidation itself
+    /// never fails a write.
     pub(super) async fn delete_and_invalidate(
         &self,
         mut req: S3Request<dto::DeleteObjectInput>,
@@ -507,21 +533,26 @@ impl PacerProxy {
         self.count("delete_object");
         self.map_bucket(&mut req.input.bucket);
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let footprint = self.stale_footprint(&bucket, &key).await?;
         let resp = self.inner.delete_object(req).await?;
-        self.invalidate(&bucket, &key).await;
+        self.invalidate(&bucket, &key, footprint).await;
         Ok(resp)
     }
 
     /// Proxy a batch DELETE and invalidate every key it names (ADR-0007).
     ///
-    /// The keys are captured BEFORE the request is forwarded, because forwarding
-    /// consumes it — and each is invalidated even if the backend refused that one,
-    /// which is the conservative direction: a dropped cache entry costs a re-fetch,
-    /// a kept one could serve a deleted object.
+    /// The keys and their footprints are captured BEFORE the request is forwarded:
+    /// forwarding consumes it, and afterwards a HEAD can only answer 404. Each key is
+    /// invalidated even if the backend refused that one, which is the conservative
+    /// direction: a dropped cache entry costs a re-fetch, a kept one could serve a
+    /// deleted object. One unmeasurable key refuses the whole batch, before any of it
+    /// is deleted.
     ///
     /// # Errors
     ///
-    /// The backend's own; the invalidations themselves never fail a write.
+    /// `ServiceUnavailable` when any key's cache footprint cannot be measured
+    /// ([`Self::stale_footprint`]), else the backend's own; the invalidations
+    /// themselves never fail a write.
     pub(super) async fn delete_many_and_invalidate(
         &self,
         mut req: S3Request<dto::DeleteObjectsInput>,
@@ -529,16 +560,14 @@ impl PacerProxy {
         self.count("delete_objects");
         self.map_bucket(&mut req.input.bucket);
         let bucket = req.input.bucket.clone();
-        let keys: Vec<String> = req
-            .input
-            .delete
-            .objects
-            .iter()
-            .map(|o| o.key.clone())
-            .collect();
+        let mut footprints = Vec::with_capacity(req.input.delete.objects.len());
+        for object in &req.input.delete.objects {
+            let footprint = self.stale_footprint(&bucket, &object.key).await?;
+            footprints.push((object.key.clone(), footprint));
+        }
         let resp = self.inner.delete_objects(req).await?;
-        for key in &keys {
-            self.invalidate(&bucket, key).await;
+        for (key, footprint) in footprints {
+            self.invalidate(&bucket, &key, footprint).await;
         }
         Ok(resp)
     }
@@ -549,7 +578,9 @@ impl PacerProxy {
     /// # Errors
     ///
     /// `InvalidPartOrder` for a part set this backend would reject anyway — failed
-    /// fast, with the error the backend would have given — or the backend's own.
+    /// fast, with the error the backend would have given — `ServiceUnavailable` when
+    /// the key's cache footprint cannot be measured ([`Self::stale_footprint`]), or
+    /// the backend's own.
     pub(super) async fn complete_mpu_and_invalidate(
         &self,
         mut req: S3Request<dto::CompleteMultipartUploadInput>,
@@ -576,8 +607,9 @@ impl PacerProxy {
             }
         }
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let footprint = self.stale_footprint(&bucket, &key).await?;
         let resp = self.inner.complete_multipart_upload(req).await?;
-        self.invalidate(&bucket, &key).await;
+        self.invalidate(&bucket, &key, footprint).await;
         Ok(resp)
     }
 }

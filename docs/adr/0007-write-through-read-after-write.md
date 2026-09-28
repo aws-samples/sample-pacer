@@ -44,6 +44,10 @@ before returning success to the client:
    `DeleteObject(s)` and multipart-complete derive it from the cached header (or,
    if the header is cold, nothing cacheable could be stale — the same reasoning as
    the original two-holder argument, now per chunk).
+   **Amended by [0042](0042-invalidation-measures-the-replaced-object.md):** the
+   cold-header rule is false once chunks live on other nodes than the header. The
+   length is now measured before the write, from the header or a `HeadObject`, and a
+   length that cannot be measured refuses the write.
 
 Subsequent GETs re-fetch fresh from Express (single-digit ms, ADR-0002).
 

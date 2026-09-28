@@ -258,6 +258,11 @@ pub struct Metrics {
     pub bytes_from_cache: IntCounter,
     /// Bytes written into the local cache.
     pub bytes_filled: IntCounter,
+    /// Writes refused before they reached the backend because the cache footprint
+    /// they would leave stale could not be measured (ADR-0042) — a backend `HeadObject`
+    /// that failed with something other than a clean 404. Non-zero means clients
+    /// were told to retry, not that anything stale was served.
+    pub writes_refused: IntCounter,
     /// How the retrying backend chunk read fared — see [`BackendReadMetrics`].
     pub backend_read: BackendReadMetrics,
     // ---- cluster tier (Phase 2) ----
@@ -1490,9 +1495,10 @@ struct CachePathCounters {
     fills_aborted: IntCounter,
     bytes_from_cache: IntCounter,
     bytes_filled: IntCounter,
+    writes_refused: IntCounter,
 }
 
-/// Register the eight counters of [`CachePathCounters`].
+/// Register the nine counters of [`CachePathCounters`].
 ///
 /// # Errors
 ///
@@ -1517,6 +1523,10 @@ fn register_cache_path_counters(registry: &Registry) -> anyhow::Result<CachePath
         )?,
         bytes_from_cache: c("pacer_bytes_from_cache_total", "Bytes served from cache")?,
         bytes_filled: c("pacer_bytes_filled_total", "Bytes written into the cache")?,
+        writes_refused: c(
+            "pacer_writes_refused_total",
+            "Writes refused because the cache footprint they would leave stale could not be measured (ADR-0042)",
+        )?,
     })
 }
 
@@ -2316,6 +2326,7 @@ impl Metrics {
             fills_aborted: cache_path.fills_aborted,
             bytes_from_cache: cache_path.bytes_from_cache,
             bytes_filled: cache_path.bytes_filled,
+            writes_refused: cache_path.writes_refused,
             backend_read: register_backend_read_metrics(&registry)?,
             peer_fetches: peer_path.fetches,
             peer_fallbacks: peer_path.fallbacks,

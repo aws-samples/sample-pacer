@@ -76,7 +76,9 @@ Cons:
   boundaries; such workloads must keep objects whole (≤ 1 chunk) or accept the
   window. This is a documented boundary of PACER's applicability, not just an
   accepted edge case. ADR-0007's write-through + awaited invalidation bounds the
-  window to in-flight reads regardless.
+  window to in-flight reads regardless. (That did not hold while invalidation could
+  purge no chunks; see [0042](0042-invalidation-measures-the-replaced-object.md), which
+  restores it for every write except the scattered PUT.)
 
 ## Knobs
 

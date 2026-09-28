@@ -13,18 +13,26 @@
 // hurt readability (CLAUDE.md: size limits target production code).
 #![allow(clippy::too_many_lines)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use bytes::Bytes;
+use pacer_cache::tier::ChunkTier;
 use pacer_daemon::metrics::Metrics;
 use pacer_daemon::proxy::PacerProxy;
 use pacer_ring::directory::Tier;
 use pacer_ring::{NodeId, SharedRing};
 use pacer_transport::grpc::GrpcTransport;
 use pacer_transport::PeerTransport;
+use s3s::dto;
+use s3s::{s3_error, S3Request, S3Response, S3Result};
 
 use crate::common::{
-    self, create_test_bucket, fs_backend_service, node_parts, sdk_client_for, seeded_body,
-    serve_node, CacheSpec, NodeSpec, BUCKET, FILL_PARALLELISM,
+    self, backend_service, create_test_bucket, fs_backend_service, node_parts, sdk_client_for,
+    seeded_body, serve_node, CacheSpec, NodeSpec, BUCKET, FILL_PARALLELISM,
 };
 
 const MIN_OBJECT_SIZE: u64 = 4 << 20;
@@ -47,6 +55,8 @@ struct Node {
     /// Client pointing at this node's S3 front (placeholder creds).
     client: aws_sdk_s3::Client,
     metrics: Metrics,
+    /// This node's chunk tier, so an arm can ask which nodes still hold a key.
+    tier: ChunkTier,
     name: String,
     /// TCP connections this node's peer server has accepted, from anyone — read as a
     /// delta around the calls under test.
@@ -79,6 +89,26 @@ async fn cluster() -> ClusterHarness {
 async fn cluster_with(names: &[&str], replication_r: usize) -> ClusterHarness {
     let backend_dir = tempfile::tempdir().unwrap();
     let (backend_service, backend_creds) = fs_backend_service(backend_dir.path());
+    cluster_on(
+        names,
+        replication_r,
+        backend_service,
+        backend_creds,
+        backend_dir,
+    )
+    .await
+}
+
+/// [`cluster_with`] over a backend the caller built — [`HeadGate`], for the arms that
+/// need the backend's `HeadObject` to fail on demand. `backend_dir` is whatever the
+/// backend stores its objects in, held for the harness's lifetime.
+async fn cluster_on(
+    names: &[&str],
+    replication_r: usize,
+    backend_service: s3s::service::S3Service,
+    backend_creds: aws_sdk_s3::config::Credentials,
+    backend_dir: tempfile::TempDir,
+) -> ClusterHarness {
     let backend_client = sdk_client_for(backend_service.clone(), backend_creds.clone());
     create_test_bucket(&backend_client).await;
 
@@ -113,6 +143,7 @@ async fn cluster_with(names: &[&str], replication_r: usize) -> ClusterHarness {
         nodes.push(Node {
             client: served.client,
             metrics: parts.metrics,
+            tier: parts.tier,
             name: name.to_owned(),
             accepted: served.accepted,
             _cache_dir: parts.cache_dir,
@@ -160,6 +191,42 @@ impl ClusterHarness {
             .find(|i| !homes.contains(i))
             .expect("cluster has no non-home node for this key; add more nodes");
         (homes, outsider)
+    }
+
+    /// Names of the nodes whose tier holds `cache_key` right now.
+    async fn holders(&self, cache_key: &str) -> Vec<String> {
+        let mut holders = Vec::new();
+        for node in &self.nodes {
+            if matches!(node.tier.cache().get(cache_key).await, Ok(Some(_))) {
+                holders.push(node.name.clone());
+            }
+        }
+        holders
+    }
+
+    /// PUT `body` at `key` through node `via`, then GET it through node `reader` and wait
+    /// for the fill — so `reader`'s side of the cluster holds the object's chunks.
+    async fn put_and_warm(&self, key: &str, body: &Bytes, via: usize, reader: usize) {
+        self.nodes[via]
+            .client
+            .put_object()
+            .bucket(BUCKET)
+            .key(key)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await
+            .unwrap();
+        let fills = self.nodes[reader].metrics.fills_completed.get();
+        let got = self.nodes[reader]
+            .client
+            .get_object()
+            .bucket(BUCKET)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(&got.body.collect().await.unwrap().into_bytes(), body);
+        wait_for_fill(&self.nodes[reader].metrics, fills).await;
     }
 }
 
@@ -1034,4 +1101,205 @@ async fn owner_fill_self_registers_in_the_directory() {
     assert_eq!(set.holders[0].node, owner_node.name());
     assert_eq!(set.holders[0].tier, Tier::Dram);
     assert!(!set.widely_held);
+}
+
+/// An `s3s-fs` backend whose `HeadObject` answers `ServiceUnavailable` while `failing`
+/// is raised — the throttle or 5xx that a write's invalidation used to read as "the key
+/// does not exist". Every other call is delegated untouched.
+struct HeadGate {
+    inner: s3s_fs::FileSystem,
+    failing: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl s3s::S3 for HeadGate {
+    async fn create_bucket(
+        &self,
+        req: S3Request<dto::CreateBucketInput>,
+    ) -> S3Result<S3Response<dto::CreateBucketOutput>> {
+        self.inner.create_bucket(req).await
+    }
+
+    async fn put_object(
+        &self,
+        req: S3Request<dto::PutObjectInput>,
+    ) -> S3Result<S3Response<dto::PutObjectOutput>> {
+        self.inner.put_object(req).await
+    }
+
+    async fn get_object(
+        &self,
+        req: S3Request<dto::GetObjectInput>,
+    ) -> S3Result<S3Response<dto::GetObjectOutput>> {
+        self.inner.get_object(req).await
+    }
+
+    async fn head_object(
+        &self,
+        req: S3Request<dto::HeadObjectInput>,
+    ) -> S3Result<S3Response<dto::HeadObjectOutput>> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(s3_error!(ServiceUnavailable, "HeadGate is failing HEADs"));
+        }
+        self.inner.head_object(req).await
+    }
+}
+
+/// [`cluster`] over a [`HeadGate`], with the switch that makes its HEADs fail.
+async fn head_gated_cluster() -> (ClusterHarness, Arc<AtomicBool>) {
+    let backend_dir = tempfile::tempdir().unwrap();
+    let failing = Arc::new(AtomicBool::new(false));
+    let (service, creds) = backend_service(HeadGate {
+        inner: s3s_fs::FileSystem::new(backend_dir.path()).unwrap(),
+        failing: Arc::clone(&failing),
+    });
+    let h = cluster_on(&["node-a", "node-b"], 1, service, creds, backend_dir).await;
+    (h, failing)
+}
+
+/// How a test removes an object: the two DELETE operations take different paths.
+#[derive(Clone, Copy, Debug)]
+enum Removal {
+    DeleteObject,
+    DeleteObjects,
+}
+
+/// ADR-0042 (#20): a DELETE through a node that holds no header purges the object's
+/// chunks everywhere.
+///
+/// The old code sized the purge with a HEAD sent *after* the delete, which can only
+/// answer 404, so a node without the header dropped the header key and no chunk. Those
+/// chunks are invisible to a GET (the header is gone and the backend says 404), which
+/// is why `write_through_non_owner_invalidates_owner` passes regardless — they surface
+/// only when the key is written again by a path that does not purge them (#21). So this
+/// arm asserts the cache itself rather than a read.
+#[rstest::rstest]
+#[case::delete_object(Removal::DeleteObject)]
+#[case::delete_objects(Removal::DeleteObjects)]
+#[tokio::test]
+async fn a_delete_through_a_headerless_node_purges_every_chunk(#[case] removal: Removal) {
+    let h = cluster().await;
+    let key = "peer/deleted.bin";
+    let object = format!("{BUCKET}/{key}");
+    let chunk = chunk0_key(&object);
+    let (chunk_home, _) = h.owner_and_other(&chunk);
+    let (header_home, deleter) = h.owner_and_other(&object);
+    h.put_and_warm(
+        key,
+        &big_body(7, (MIN_OBJECT_SIZE + 1024) as usize),
+        deleter,
+        chunk_home,
+    )
+    .await;
+    assert!(
+        !h.holders(&chunk).await.is_empty(),
+        "precondition: the chunk is cached somewhere"
+    );
+    assert!(
+        !h.holders(&object).await.contains(&h.nodes[deleter].name),
+        "precondition: the deleting node holds no header (only {} may)",
+        h.nodes[header_home].name
+    );
+
+    let client = &h.nodes[deleter].client;
+    match removal {
+        Removal::DeleteObject => {
+            client
+                .delete_object()
+                .bucket(BUCKET)
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+        }
+        Removal::DeleteObjects => {
+            let target = ObjectIdentifier::builder().key(key).build().unwrap();
+            let batch = Delete::builder().objects(target).build().unwrap();
+            client
+                .delete_objects()
+                .bucket(BUCKET)
+                .delete(batch)
+                .send()
+                .await
+                .unwrap();
+        }
+    }
+
+    assert_eq!(
+        h.holders(&chunk).await,
+        Vec::<String>::new(),
+        "{removal:?} through a headerless node must purge the chunk on every node"
+    );
+}
+
+/// ADR-0042 (#20): an overwrite whose footprint cannot be measured is refused, never
+/// left half-invalidated.
+///
+/// The old code treated a failed HEAD like a 404: the PUT reached the backend, the
+/// header was purged, the chunk survived, and the next GET resolved the new object's
+/// length and assembled the old one's bytes. Now the HEAD runs before the write, and a
+/// failure refuses it, so the backend and every node still agree afterwards.
+#[tokio::test]
+async fn an_overwrite_whose_footprint_cannot_be_measured_is_refused() {
+    let (h, head_fails) = head_gated_cluster().await;
+    let key = "peer/overwritten.bin";
+    let object = format!("{BUCKET}/{key}");
+    let (chunk_home, _) = h.owner_and_other(&chunk0_key(&object));
+    let (_, writer) = h.owner_and_other(&object);
+    let len = (MIN_OBJECT_SIZE + 1024) as usize;
+    h.put_and_warm(key, &big_body(8, len), writer, chunk_home)
+        .await;
+
+    // Same length, different bytes: a stale chunk would then be served under the new
+    // object's length without any size mismatch to give it away.
+    head_fails.store(true, Ordering::SeqCst);
+    let no_retry = aws_sdk_s3::config::Builder::default().retry_config(RetryConfig::disabled());
+    let overwrite = h.nodes[writer]
+        .client
+        .put_object()
+        .bucket(BUCKET)
+        .key(key)
+        .body(ByteStream::from(big_body(9, len)))
+        .customize()
+        .config_override(no_retry)
+        .send()
+        .await;
+    head_fails.store(false, Ordering::SeqCst);
+
+    let truth = h
+        .backend
+        .get_object()
+        .bucket(BUCKET)
+        .key(key)
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    for node in &h.nodes {
+        let got = node
+            .client
+            .get_object()
+            .bucket(BUCKET)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            got.body.collect().await.unwrap().into_bytes(),
+            truth,
+            "{} must serve what the backend holds",
+            node.name
+        );
+    }
+    let code = overwrite.map_err(|e| e.into_service_error().meta().code().map(str::to_owned));
+    assert_eq!(
+        code.err(),
+        Some(Some("ServiceUnavailable".to_owned())),
+        "the overwrite must be refused with a retryable 503"
+    );
+    assert_eq!(h.nodes[writer].metrics.writes_refused.get(), 1);
 }

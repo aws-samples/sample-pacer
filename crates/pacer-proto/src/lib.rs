@@ -378,7 +378,7 @@ mod field_number_hygiene {
         let messages = parse_messages(PEER_PROTO);
         assert_eq!(
             messages.len(),
-            24,
+            26,
             "message count changed — update this alongside the .proto edit, \
              or the scanner stopped finding messages it used to"
         );

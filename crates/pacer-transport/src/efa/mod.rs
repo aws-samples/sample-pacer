@@ -1334,6 +1334,15 @@ impl PeerTransport for EfaRdmaTransport {
     async fn discard_upload(&self, owner: &NodeId, upload_id: &str) -> Result<u32, TransportError> {
         self.grpc.discard_upload(owner, upload_id).await
     }
+
+    /// A header is metadata only and stays gRPC forever, like the directory edges.
+    async fn store_header(
+        &self,
+        home: &NodeId,
+        offer: crate::HeaderOffer<'_>,
+    ) -> Result<bool, TransportError> {
+        self.grpc.store_header(home, offer).await
+    }
 }
 
 impl EfaRdmaTransport {

@@ -16,16 +16,17 @@
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use pacer_cache::chunk::{CachedChunk, ChunkConfig};
+use pacer_cache::chunk::{CachedChunk, ChunkConfig, ObjectHeader};
 use pacer_cache::tier::ChunkTier;
-use pacer_cache::{object_key_parts, Promotion};
+use pacer_cache::{object_key_parts, CacheValue, Promotion};
 use pacer_proto::v1::peer_server::{Peer, PeerServer};
 use pacer_proto::v1::{
     AnnounceRequest, AnnounceResponse, BlobChunk, BlobMeta, CommitUploadRequest,
     CommitUploadResponse, DiscardUploadRequest, DiscardUploadResponse, FetchBlobRequest,
     HandshakeRequest, HandshakeResponse, InvalidateRequest, InvalidateResponse,
     LookupSharersRequest, LookupSharersResponse, RdmaCapabilities, RefusalReason, Sharer,
-    StoreChunkRequest, StoreChunkResponse, StoreRefusal as WireRefusal, Tier as WireTier,
+    StoreChunkRequest, StoreChunkResponse, StoreHeaderRequest, StoreHeaderResponse,
+    StoreRefusal as WireRefusal, Tier as WireTier,
 };
 use pacer_ring::directory::{SharedDirectory, Tier};
 use pacer_ring::SharedRing;
@@ -1219,6 +1220,38 @@ impl Peer for PacerPeer {
         });
         debug!(upload = %req.upload_id, discarded, "discarded staged chunks");
         Ok(Response::new(DiscardUploadResponse { discarded }))
+    }
+
+    /// Cache a scattered object's header, sent here because this node homes the
+    /// object key (ADR-0032 § 2) — the coordinator is usually not a home, and a
+    /// header cached off-home is a copy no later write's invalidation reaches.
+    ///
+    /// Gated on this node *actually* being a home, by its own ring: the sender
+    /// planned against a ring that may have moved, and accepting a key this node
+    /// no longer homes would recreate exactly the unreachable copy this RPC
+    /// exists to avoid (the same gate `proxy::read`'s `remember_header` argues
+    /// is correctness, not policy). A decline answers `stored: false` — the
+    /// header is then cached nowhere, and readers resolve it per request.
+    async fn store_header(
+        &self,
+        request: Request<StoreHeaderRequest>,
+    ) -> Result<Response<StoreHeaderResponse>, Status> {
+        let req = request.into_inner();
+        let homes = self.ring.homes(&req.cache_key, self.replication_r);
+        if !homes.iter().any(|n| n.name() == self.local_node) {
+            debug!(key = %req.cache_key, "declined a header this node does not home");
+            return Ok(Response::new(StoreHeaderResponse { stored: false }));
+        }
+        let header = ObjectHeader::new(
+            req.object_len,
+            req.e_tag,
+            req.content_type,
+            req.last_modified_epoch_secs,
+        );
+        self.tier
+            .cache()
+            .insert(req.cache_key, CacheValue::Header(header));
+        Ok(Response::new(StoreHeaderResponse { stored: true }))
     }
 
     async fn invalidate(

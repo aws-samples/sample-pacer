@@ -21,7 +21,7 @@ use futures::StreamExt;
 use pacer_proto::v1::{
     peer_client::PeerClient, AnnounceRequest, BlobChunk, CommitUploadRequest, DiscardUploadRequest,
     FetchBlobRequest, HandshakeRequest, InvalidateRequest, LookupSharersRequest, RdmaCapabilities,
-    RefusalReason, StoreChunkRequest, StoreChunkResponse, Tier as WireTier,
+    RefusalReason, StoreChunkRequest, StoreChunkResponse, StoreHeaderRequest, Tier as WireTier,
 };
 use pacer_ring::directory::{Holder, SharerSet, Tier};
 use pacer_ring::NodeId;
@@ -30,7 +30,8 @@ use tonic::transport::Channel;
 use tracing::debug;
 
 use crate::{
-    BlobStream, ByteRange, PeerTransport, StoreOffer, StoreOutcome, StoreRefusal, TransportError,
+    BlobStream, ByteRange, HeaderOffer, PeerTransport, StoreOffer, StoreOutcome, StoreRefusal,
+    TransportError,
 };
 
 /// [`Tier`] → wire enum for an `Announce` admit.
@@ -541,6 +542,26 @@ impl PeerTransport for GrpcTransport {
             .map_err(|s| TransportError::PeerUnavailable(s.to_string()))?
             .into_inner();
         Ok(resp.discarded)
+    }
+
+    async fn store_header(
+        &self,
+        home: &NodeId,
+        offer: HeaderOffer<'_>,
+    ) -> Result<bool, TransportError> {
+        let mut client = self.client(home).await?;
+        let resp = client
+            .store_header(StoreHeaderRequest {
+                cache_key: offer.cache_key.to_owned(),
+                object_len: offer.object_len,
+                e_tag: offer.e_tag.map(ToOwned::to_owned),
+                content_type: offer.content_type.map(ToOwned::to_owned),
+                last_modified_epoch_secs: offer.last_modified_epoch_secs,
+            })
+            .await
+            .map_err(|s| TransportError::PeerUnavailable(s.to_string()))?
+            .into_inner();
+        Ok(resp.stored)
     }
 }
 

@@ -44,7 +44,7 @@ use pacer_cache::tier::ChunkTier;
 use pacer_cache::CacheValue;
 use pacer_ring::directory::Tier;
 use pacer_ring::NodeId;
-use pacer_transport::{StoreOffer, StoreOutcome};
+use pacer_transport::{HeaderOffer, StoreOffer, StoreOutcome};
 use s3s::dto::StreamingBlob;
 use tokio::sync::{AcquireError, Semaphore};
 use tracing::{debug, warn};
@@ -761,18 +761,55 @@ impl ScatterCoordinator {
         }
     }
 
-    /// Store the object header at its home, carrying the composite ETag Complete
-    /// just minted — which is why this cannot happen any earlier.
+    /// Store the object header where a later write's invalidation can find it
+    /// (ADR-0032 § 2): locally when this node homes the object key, else at
+    /// `home(object_key)` over the peer plane. It carries the composite ETag
+    /// Complete just minted — which is why this cannot happen any earlier.
+    ///
+    /// The remote store is **awaited** — a fire-and-forget store could land after
+    /// a subsequent write's invalidation and resurrect a stale header — and a
+    /// failure (or a home whose own ring disagrees and declines) caches the
+    /// header **nowhere**: readers then resolve it per request via HEAD, a
+    /// warmth loss. Falling back to a local insert instead would be the bug this
+    /// exists to avoid: the coordinator is whichever node the client's pod
+    /// reached, headers are never announced to the directory, and the cache has
+    /// no TTL, so an off-home copy outlives every later write's invalidation and
+    /// keeps serving a deleted or replaced object.
     async fn write_header(&self, target: &ScatterTarget<'_>, e_tag: &str) {
-        let header = ObjectHeader::new(
-            target.object_len,
-            Some(e_tag.to_owned()),
-            target.content_type.map(ToOwned::to_owned),
-            None,
-        );
-        self.tier
-            .cache()
-            .insert(target.object_key.to_owned(), CacheValue::Header(header));
+        let cluster = &self.shared.cluster;
+        let homes = cluster.ring.homes(target.object_key, cluster.replication_r);
+        // Same "am I a home" rule as the read path's `is_home`, an empty ring
+        // (not yet converged) counting as local — computed here from `homes`
+        // because the non-home arm needs the actual home to send to.
+        if homes.is_empty() || homes.iter().any(|n| n.name() == cluster.local_node) {
+            let header = ObjectHeader::new(
+                target.object_len,
+                Some(e_tag.to_owned()),
+                target.content_type.map(ToOwned::to_owned),
+                None,
+            );
+            self.tier
+                .cache()
+                .insert(target.object_key.to_owned(), CacheValue::Header(header));
+            return;
+        }
+        let home = &homes[0];
+        let offer = HeaderOffer {
+            cache_key: target.object_key,
+            object_len: target.object_len,
+            e_tag: Some(e_tag),
+            content_type: target.content_type,
+            // CompleteMultipartUpload does not return Last-Modified (issue #25
+            // tracks recovering it).
+            last_modified_epoch_secs: None,
+        };
+        match cluster.transport.store_header(home, offer).await {
+            Ok(true) => {}
+            Ok(false) => warn!(key = %target.object_key, home = %home.name(),
+                "home declined the object header; readers resolve it per request"),
+            Err(e) => warn!(key = %target.object_key, home = %home.name(), error = %e,
+                "storing the object header at its home failed; readers resolve it per request"),
+        }
     }
 
     /// Abort the upload and drop everything staged for it, on either side.

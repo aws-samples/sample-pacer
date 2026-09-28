@@ -19,6 +19,8 @@
 //! | [`probe`] | the suite's own checksum oracle |
 //! | [`populate_only`] | planning/30 § 4.1's T3: the owner's `StoreChunk` branch for
 //!   `populate_only` offers (ADR-0041's read-path populate and write-tee share it) |
+//! | [`header_home`] | issue #19: the scattered header lands at `home(object_key)`,
+//!   where a later write's invalidation can reach it, never on the coordinator |
 //!
 //! Still owed: gate 3.1's hardware arm (a real checkpoint shard on a real cluster) and
 //! every Phase-4 bench arm. Gate 3.10's Express half is a *startup* refusal, so it
@@ -60,6 +62,7 @@ mod gate_concurrency;
 mod gate_integrity;
 mod gate_pipeline;
 mod gate_placement;
+mod header_home;
 mod populate_only;
 mod probe;
 
@@ -150,6 +153,11 @@ struct Node {
     /// body stream of its own making: the S3 front end reframes whatever a client
     /// sends, and one test needs to control exactly when a frame is handed over.
     coordinator: Arc<ScatterCoordinator>,
+    /// The node's chunk tier — the same one its proxy and peer server share — so a
+    /// test can assert WHERE an entry landed, not just that reads succeed
+    /// ([`header_home`]: a header cached off its home reads back fine right up
+    /// until an invalidation cannot find it).
+    tier: pacer_cache::tier::ChunkTier,
     _cache_dir: tempfile::TempDir,
 }
 
@@ -232,6 +240,7 @@ async fn fleet(staging_bytes: u64) -> Harness {
             name: name.to_owned(),
             staging,
             coordinator,
+            tier: parts.tier,
             _cache_dir: parts.cache_dir,
         });
     }

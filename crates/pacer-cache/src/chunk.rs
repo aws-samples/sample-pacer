@@ -13,6 +13,8 @@
 //!   hash scores a *chunk key*, so a hot large object spreads across many homes.
 //!   That happens in `pacer-ring`; this module only produces the keys it scores.
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -21,12 +23,69 @@ use serde::{Deserialize, Serialize};
 /// restore-storm benchmark. Config-overridable (ADR-0013); pinned per cluster.
 pub const DEFAULT_CHUNK_SIZE: u64 = 16 << 20;
 
+/// User metadata and the representation headers S3 returns alongside an
+/// object's core fields (issue #25), bundled apart from [`ObjectHeader`]'s
+/// scalar fields purely to keep [`ObjectHeader::new`]'s argument count under
+/// the workspace's `too_many_arguments` limit — every field here is optional
+/// and independent, so the grouping carries no meaning beyond that.
+///
+/// # What is deliberately not here
+///
+/// `x-amz-storage-class`, the response's `x-amz-version-id`, `x-amz-tagging-count`
+/// and the SSE headers (`x-amz-server-side-encryption*`) are not cached:
+///
+/// - **Version id.** This cache is not version-aware (`cacheable_shape` already
+///   bypasses any GET that names one), and unlike the ETag there is no cheap
+///   check that would catch a cached version id going stale under a later
+///   overwrite of the same key — caching it would risk handing out a version
+///   id for a version a subsequent write has already superseded.
+/// - **Storage class and tagging count.** Both can change out from under this
+///   cache with no write through the proxy at all — a lifecycle transition, or
+///   `PutObjectTagging` — so a cached value has no invalidation path and could
+///   go stale indefinitely, unlike the fields above, which only change by a
+///   write this cache already observes.
+/// - **SSE headers.** A customer-supplied key (`sse_customer_algorithm`)
+///   already forces passthrough in `cacheable_shape`; bucket-default SSE-S3/
+///   SSE-KMS metadata is static per object and rarely consulted by a client,
+///   so adding it would grow this struct for little value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepresentationHeaders {
+    /// `x-amz-meta-*`, keyed by the suffix after that prefix (matching
+    /// `HeadObjectOutput::metadata`'s shape). A `BTreeMap` rather than a
+    /// `HashMap` only for deterministic iteration order — nothing here depends
+    /// on it, it just keeps a byte-for-byte comparison in a test reproducible.
+    pub metadata: BTreeMap<String, String>,
+    /// Content-Encoding, replayed on hits.
+    pub content_encoding: Option<String>,
+    /// Content-Disposition, replayed on hits.
+    pub content_disposition: Option<String>,
+    /// Content-Language, replayed on hits.
+    pub content_language: Option<String>,
+    /// Cache-Control, replayed on hits.
+    pub cache_control: Option<String>,
+    /// Seconds since epoch, from the backend's Expires.
+    pub expires_epoch_secs: Option<i64>,
+}
+
 /// Per-object metadata, cached once per object alongside chunk 0's home
 /// (ADR-0015). It carries everything needed to (a) compute the covering chunk
 /// set for a ranged read and (b) reproduce the S3 GET response headers, without
 /// holding any object bytes. Keyed by the plain object key (`"{bucket}/{key}"`),
 /// distinct from chunk keys (which carry `#{size}:{index}`), so the two never
 /// collide in the cache.
+///
+/// # The on-disk format, and issue #25
+///
+/// This struct is what the disk tier's codec bincode-serializes directly for a
+/// `CacheValue::Header` entry (`pacer_cache::codec`) — no hand-rolled framing,
+/// unlike a chunk's ETag witness. [`RepresentationHeaders`] was added as a new
+/// field at the **end** of the struct, appending to what a previous build wrote
+/// rather than reordering it, so that decoding a header a previous build cached
+/// runs out of bytes partway through the new field and fails — which foyer's
+/// disk-tier load, and every call site here, already treats as a miss (see
+/// `codec::tests::a_pre_representation_headers_entry_is_a_miss`). A one-time
+/// re-fetch of a warm header, never a panic and never the old, incomplete
+/// answer served as if it were current.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObjectHeader {
     /// Total object length in bytes — the Content-Range denominator and the
@@ -38,6 +97,9 @@ pub struct ObjectHeader {
     pub content_type: Option<String>,
     /// Seconds since epoch, from the backend's Last-Modified.
     pub last_modified_epoch_secs: Option<i64>,
+    /// User metadata and the representation headers (issue #25) — see
+    /// [`RepresentationHeaders`] for what is and is not carried here.
+    pub representation: RepresentationHeaders,
 }
 
 impl ObjectHeader {
@@ -50,12 +112,14 @@ impl ObjectHeader {
         e_tag: Option<String>,
         content_type: Option<String>,
         last_modified_epoch_secs: Option<i64>,
+        representation: RepresentationHeaders,
     ) -> Self {
         Self {
             object_len,
             e_tag,
             content_type,
             last_modified_epoch_secs,
+            representation,
         }
     }
 }
@@ -315,6 +379,7 @@ mod tests {
             e_tag: Some("abc".into()),
             content_type: None,
             last_modified_epoch_secs: Some(42),
+            representation: RepresentationHeaders::default(),
         };
         // A whole-object read covers exactly chunk_count chunks, each with valid
         // bounds; the spans tile [0, object_len) with no gap.
@@ -355,16 +420,25 @@ mod tests {
 
     #[test]
     fn header_new_maps_fields() {
+        let mut representation = RepresentationHeaders {
+            content_encoding: Some("gzip".into()),
+            ..RepresentationHeaders::default()
+        };
+        representation
+            .metadata
+            .insert("owner".into(), "pacer".into());
         let h = ObjectHeader::new(
             4096,
             Some("etag".into()),
             Some("text/plain".into()),
             Some(7),
+            representation.clone(),
         );
         assert_eq!(h.object_len, 4096);
         assert_eq!(h.e_tag.as_deref(), Some("etag"));
         assert_eq!(h.content_type.as_deref(), Some("text/plain"));
         assert_eq!(h.last_modified_epoch_secs, Some(7));
+        assert_eq!(h.representation, representation);
     }
 
     #[test]
@@ -377,6 +451,7 @@ mod tests {
             e_tag: Some("\"deadbeef\"".into()),
             content_type: Some("application/octet-stream".into()),
             last_modified_epoch_secs: Some(1_700_000_000),
+            representation: RepresentationHeaders::default(),
         };
         assert_eq!(header.clone(), header);
     }

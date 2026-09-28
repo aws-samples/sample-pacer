@@ -225,9 +225,17 @@ pub trait PeerTransport: Send + Sync {
 /// A scattered object's header, offered to the object key's home
 /// (ADR-0032 § 2 — the header lives where invalidation can find it).
 ///
-/// The four fields mirror `pacer-cache`'s `ObjectHeader`, carried loose because
-/// this crate does not depend on the cache; the daemon maps them on both ends.
-#[derive(Debug, Clone, Copy)]
+/// The scalar fields mirror `pacer-cache`'s `ObjectHeader` (including its
+/// `RepresentationHeaders`, issue #25), carried loose because this crate does
+/// not depend on the cache; the daemon maps them on both ends.
+///
+/// `metadata` is owned rather than borrowed like every other field: it is a
+/// map, and holding a `&'a BTreeMap` would tie this offer's lifetime to
+/// wherever the sender's header lives instead of just to its borrowed
+/// strings. Cloning a handful of `x-amz-meta-*` entries once per scattered
+/// PUT to a non-home is not a cost this control-plane RPC — "stays gRPC
+/// forever" per [`PeerTransport::store_header`] — needs to avoid.
+#[derive(Debug, Clone)]
 pub struct HeaderOffer<'a> {
     /// Object cache key, `"{bucket}/{key}"` — the plain key, no chunk suffix.
     pub cache_key: &'a str,
@@ -237,9 +245,26 @@ pub struct HeaderOffer<'a> {
     pub e_tag: Option<&'a str>,
     /// Content type to replay on a cache hit, if the client sent one.
     pub content_type: Option<&'a str>,
-    /// Seconds since epoch. `None` today: Complete does not return
-    /// Last-Modified.
+    /// Seconds since epoch, from the backend's Last-Modified. Resolved by the
+    /// sender's own post-Complete `HeadObject` (issue #25) before this offer
+    /// is ever built — a coordinator that could not confirm the object's
+    /// current ETag does not send an offer at all, so this field being
+    /// `None` here means the backend's Last-Modified was itself absent, not
+    /// that nothing tried to learn it.
     pub last_modified_epoch_secs: Option<i64>,
+    /// Content-Encoding, replayed on hits.
+    pub content_encoding: Option<&'a str>,
+    /// Content-Disposition, replayed on hits.
+    pub content_disposition: Option<&'a str>,
+    /// Content-Language, replayed on hits.
+    pub content_language: Option<&'a str>,
+    /// Cache-Control, replayed on hits.
+    pub cache_control: Option<&'a str>,
+    /// Seconds since epoch, from the backend's Expires.
+    pub expires_epoch_secs: Option<i64>,
+    /// `x-amz-meta-*`, keyed by the suffix after that prefix — see the type
+    /// doc for why this is owned rather than borrowed.
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 /// One window offered to its chunk's home.

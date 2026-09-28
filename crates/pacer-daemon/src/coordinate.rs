@@ -897,28 +897,68 @@ impl ScatterCoordinator {
     /// `home(object_key)` over the peer plane. It carries the composite ETag
     /// Complete just minted — which is why this cannot happen any earlier.
     ///
-    /// The remote store is **awaited** — a fire-and-forget store could land after
-    /// a subsequent write's invalidation and resurrect a stale header — and a
-    /// failure (or a home whose own ring disagrees and declines) caches the
-    /// header **nowhere**: readers then resolve it per request via HEAD, a
-    /// warmth loss. Falling back to a local insert instead would be the bug this
-    /// exists to avoid: the coordinator is whichever node the client's pod
-    /// reached, headers are never announced to the directory, and the cache has
-    /// no TTL, so an off-home copy outlives every later write's invalidation and
-    /// keeps serving a deleted or replaced object.
+    /// Everything the write itself has not seen — Last-Modified and the
+    /// representation headers (issue #25); a scattered PUT does not forward
+    /// them to `CreateMultipartUpload` today, a separate, pre-existing gap
+    /// this fix does not extend to closing — comes from one `HeadObject`,
+    /// issued **inline, here, before the header is placed anywhere at all**.
+    /// [`header_if_etag_agrees`] is the gate that makes caching that answer
+    /// safe: nothing is cached, locally or remotely, unless the HEAD's own
+    /// ETag still names the version this call just completed. One `HeadObject`
+    /// serves BOTH branches below — it happens once, before the home decision,
+    /// so neither branch pays it twice and neither can cache an answer the
+    /// other has not also been guarded by.
+    ///
+    /// An earlier version of the issue #25 half of this cached a partial
+    /// header immediately and backfilled the rest from a **detached**
+    /// background `HeadObject`. Review caught two races in it before it
+    /// shipped: its own read-check-insert on the cache was not atomic, so a
+    /// DELETE or overwrite's invalidation landing in that window could
+    /// resurrect a header the write path had just dropped; and its guard
+    /// compared the *cached* ETag against this write's, never the *HEAD's
+    /// own* answer against it, so a newer write B landing before the HEAD
+    /// returned could have its data cached while still labelled with A's
+    /// ETag. Doing the HEAD inline, before either branch's one store, removes
+    /// both races: there is no separate check-then-insert to race an
+    /// invalidation, and the guard is on the HEAD's own answer.
+    ///
+    /// The remote store is **awaited** — a fire-and-forget store could land
+    /// after a subsequent write's invalidation and resurrect a stale header —
+    /// and a failure (or a home whose own ring disagrees and declines) caches
+    /// the header **nowhere**: readers then resolve it per request via HEAD, a
+    /// warmth loss. Falling back to a local insert instead would be the bug
+    /// this exists to avoid: the coordinator is whichever node the client's
+    /// pod reached, headers are never announced to the directory, and the
+    /// cache has no TTL, so an off-home copy outlives every later write's
+    /// invalidation and keeps serving a deleted or replaced object.
     async fn write_header(&self, target: &ScatterTarget<'_>, e_tag: &str) {
+        let Ok(head) = self
+            .shared
+            .backend
+            .head_object()
+            .bucket(target.bucket)
+            .key(target.key)
+            .send()
+            .await
+            .inspect_err(|e| {
+                warn!(key = %target.object_key, error = %e,
+                    "post-Complete HeadObject failed; header not cached");
+            })
+        else {
+            return;
+        };
+        let Some(header) = header_if_etag_agrees(&head, e_tag) else {
+            warn!(key = %target.object_key,
+                "post-Complete HeadObject did not confirm this write's ETag; header not cached \
+                 (a newer write to this key, or a delete, landed first)");
+            return;
+        };
         let cluster = &self.shared.cluster;
         let homes = cluster.ring.homes(target.object_key, cluster.replication_r);
         // Same "am I a home" rule as the read path's `is_home`, an empty ring
         // (not yet converged) counting as local — computed here from `homes`
         // because the non-home arm needs the actual home to send to.
         if homes.is_empty() || homes.iter().any(|n| n.name() == cluster.local_node) {
-            let header = ObjectHeader::new(
-                target.object_len,
-                Some(e_tag.to_owned()),
-                target.content_type.map(ToOwned::to_owned),
-                None,
-            );
             self.tier
                 .cache()
                 .insert(target.object_key.to_owned(), CacheValue::Header(header));
@@ -927,12 +967,16 @@ impl ScatterCoordinator {
         let home = &homes[0];
         let offer = HeaderOffer {
             cache_key: target.object_key,
-            object_len: target.object_len,
-            e_tag: Some(e_tag),
-            content_type: target.content_type,
-            // CompleteMultipartUpload does not return Last-Modified (issue #25
-            // tracks recovering it).
-            last_modified_epoch_secs: None,
+            object_len: header.object_len,
+            e_tag: header.e_tag.as_deref(),
+            content_type: header.content_type.as_deref(),
+            last_modified_epoch_secs: header.last_modified_epoch_secs,
+            content_encoding: header.representation.content_encoding.as_deref(),
+            content_disposition: header.representation.content_disposition.as_deref(),
+            content_language: header.representation.content_language.as_deref(),
+            cache_control: header.representation.cache_control.as_deref(),
+            expires_epoch_secs: header.representation.expires_epoch_secs,
+            metadata: header.representation.metadata.clone(),
         };
         match cluster.transport.store_header(home, offer).await {
             Ok(true) => {}
@@ -1004,6 +1048,37 @@ impl ScatterCoordinator {
         }
         homes
     }
+}
+
+/// Build a header from `head` only if its own ETag agrees with `e_tag`,
+/// compared unquoted — a raw S3 ETag is quoted and nothing guarantees the two
+/// spellings agree.
+///
+/// This is the whole safety argument for [`ScatterCoordinator::write_header`]
+/// caching a post-Complete `HeadObject`'s answer at all: without this check, a
+/// newer write to the same key completing between this write's `Complete` and
+/// its `HeadObject` would be cached under a length and representation headers
+/// that are its own, but an ETag that names the *older* write — or, read the
+/// other way, this write's own correct answer could be discarded because a
+/// still-newer write's `HeadObject` raced ahead of it. Requiring agreement
+/// makes every disagreement a plain miss: nothing is cached, and the next GET
+/// discovers the current version's header the same way any other cache miss
+/// does.
+///
+/// `None` too when the answer has no usable length — the one other shape a
+/// `HeadObject` can return that this cache cannot build a header from.
+fn header_if_etag_agrees(
+    head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+    e_tag: &str,
+) -> Option<ObjectHeader> {
+    let agrees = head
+        .e_tag()
+        .is_some_and(|got| got.trim_matches('"') == e_tag.trim_matches('"'));
+    if !agrees {
+        return None;
+    }
+    let object_len = head.content_length().and_then(|l| u64::try_from(l).ok())?;
+    Some(crate::proxy::object_header_from_head(head, object_len))
 }
 
 /// One window task's result, flattened: a panicked task and a failed upload both
@@ -1455,5 +1530,47 @@ mod tests {
     #[test]
     fn the_checksum_encoding_matches_what_s3_reported() {
         assert_eq!(base64_u32(0x8b1d_7a0b), "ix16Cw==");
+    }
+
+    /// A `HeadObjectOutput` carrying the ETag this write just minted (a
+    /// composite, multipart shape, quoted the way S3 sends it).
+    fn head_with_e_tag(e_tag: &str) -> aws_sdk_s3::operation::head_object::HeadObjectOutput {
+        aws_sdk_s3::operation::head_object::HeadObjectOutput::builder()
+            .e_tag(e_tag)
+            .content_length(4096)
+            .build()
+    }
+
+    /// The guard issue #25's review caught missing: a `HeadObject` run after
+    /// `Complete` must not be cached unless its OWN ETag still names the
+    /// version this write completed. A newer write to the same key racing
+    /// ahead of the HEAD is exactly what makes this answer disagree — and a
+    /// disagreement must be a miss, never a header for the wrong version.
+    #[test]
+    fn a_head_that_disagrees_with_complete_is_not_cached() {
+        let head = head_with_e_tag("\"newer-etag-4\"");
+        assert!(header_if_etag_agrees(&head, "\"our-etag-4\"").is_none());
+    }
+
+    /// The unquoting is symmetric: a raw S3 ETag is quoted, and neither side
+    /// of the comparison is trusted to already be unquoted the same way the
+    /// other is.
+    #[test]
+    fn the_etag_comparison_ignores_quoting_on_either_side() {
+        let head = head_with_e_tag("\"same-etag-4\"");
+        assert!(header_if_etag_agrees(&head, "same-etag-4").is_some());
+        let head = head_with_e_tag("same-etag-4");
+        assert!(header_if_etag_agrees(&head, "\"same-etag-4\"").is_some());
+    }
+
+    /// The agreeing case: the header this write is entitled to cache is built
+    /// from the HEAD's own answer, once it is confirmed to describe this
+    /// write's version.
+    #[test]
+    fn a_head_that_agrees_with_complete_is_cached() {
+        let head = head_with_e_tag("\"our-etag-4\"");
+        let header = header_if_etag_agrees(&head, "\"our-etag-4\"").expect("ETags agree");
+        assert_eq!(header.object_len, 4096);
+        assert_eq!(header.e_tag.as_deref(), Some("our-etag-4"));
     }
 }

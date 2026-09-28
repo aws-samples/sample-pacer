@@ -141,6 +141,12 @@ async fn a_node_declines_a_header_for_a_key_it_does_not_home() {
                 e_tag: Some("deadbeef-8"),
                 content_type: None,
                 last_modified_epoch_secs: None,
+                content_encoding: None,
+                content_disposition: None,
+                content_language: None,
+                cache_control: None,
+                expires_epoch_secs: None,
+                metadata: std::collections::BTreeMap::new(),
             },
         )
         .await

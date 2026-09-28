@@ -39,6 +39,8 @@ use std::sync::Arc;
 
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
+use pacer_cache::chunk::ChunkConfig;
+use pacer_cache::object_key;
 use pacer_daemon::metrics::Metrics;
 use s3s::dto;
 use s3s::{S3Request, S3Response, S3Result};
@@ -323,5 +325,102 @@ async fn without_coalescing_the_same_race_costs_two() {
         2,
         "with reads that do not overlap, the guard dedupes nothing and the chunk is \
          written twice"
+    );
+}
+
+/// gh22 / ADR-0044's fence: an `Invalidate` landing on a key while its leader's
+/// backend read is still in flight must stop that leader's fill from ever
+/// reaching the tier, and must wake a follower parked on it rather than let the
+/// follower take what the leader was about to hand it.
+///
+/// The choreography extends `coalesced_reads_cost_one_backend_get`'s: hold the
+/// leader mid-read exactly as that arm does, park a follower on it exactly as
+/// that arm does, and then — the one new step — overwrite the object *before*
+/// releasing the leader. No sleep anywhere: every step below waits on a
+/// condition ([`poll_until`]) that only the fix under test can make true.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalidation_mid_fill_fences_the_leader_and_its_follower() {
+    let h = harness(true).await;
+    let body_v1 = fixture();
+    seed(&h, &body_v1).await;
+
+    // The leader reaches the gated backend GET and stops there — its fill is
+    // genuinely in flight, not merely believed to be.
+    let leader = tokio::spawn(get_whole(h.daemon.client.clone()));
+    poll_until(
+        "the leader's ranged GET has reached the backend",
+        || async { h.ranged_gets() == 1 },
+    )
+    .await;
+
+    // The follower arrives while the leader is still reading and parks on it,
+    // never issuing a GET of its own — same as `coalesced_reads_cost_one_\
+    // backend_get`, up to this point.
+    let follower = tokio::spawn(get_whole(h.daemon.client.clone()));
+    poll_until("the follower has parked on the leader's fill", || async {
+        h.waiters() == 1
+    })
+    .await;
+
+    // The write lands and invalidates *while the leader's read is still held at
+    // the gate* — the exact ordering #22 describes: the reader started before
+    // the write, and nothing before this fix ordered the reader's insert after
+    // the write's invalidation.
+    let body_v2 = seeded_body(0xa5, OBJECT_SIZE);
+    h.daemon
+        .client
+        .put_object()
+        .bucket(BUCKET)
+        .key(KEY)
+        .body(ByteStream::from(body_v2.clone()))
+        .send()
+        .await
+        .expect("the overwrite must succeed");
+
+    // The fence must wake the follower empty-handed rather than let it wait for
+    // the now-poisoned leader's publish: it falls back and issues its own
+    // ranged GET — the second one this arm counts. Without the fix this never
+    // happens and the poll times out, because the follower would still be
+    // parked on a `Fetching` claim `Invalidate` never touched.
+    poll_until(
+        "the poisoned leader's follower fell back to its own backend read",
+        || async { h.ranged_gets() == 2 },
+    )
+    .await;
+
+    // Only now let the leader's held read proceed.
+    h.release.notify_waiters();
+    let (a, b) = (leader.await.unwrap(), follower.await.unwrap());
+
+    // Both requesters are served in full: a fence poisons the CACHE ENTRY, never
+    // a caller already waiting on bytes that are already in hand or freshly
+    // re-read.
+    assert_eq!(
+        a, body_v2,
+        "the leader's own requester is still served in full"
+    );
+    assert_eq!(
+        b, body_v2,
+        "the follower's own fresh read must see the object the write left behind"
+    );
+
+    // The one thing #22 is about: the leader's fill must never have reached the
+    // tier. `fills_completed` only counts an insert that actually landed
+    // (`insert_fenced`), so zero here is "the poisoned insert was skipped or
+    // undone", not just "nobody happened to look".
+    assert_eq!(
+        h.metrics.fills_completed.get(),
+        0,
+        "a poisoned leader's fill must never reach the tier"
+    );
+    let chunk_key = ChunkConfig::new(CHUNK_SIZE).chunk_key(&object_key(BUCKET, KEY), 0);
+    assert!(
+        h.daemon
+            .tier
+            .get_chunk(&chunk_key)
+            .await
+            .expect("the tier read must not itself fail")
+            .is_none(),
+        "the tier must not hold the pre-write bytes a poisoned fill tried to insert"
     );
 }

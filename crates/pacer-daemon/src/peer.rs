@@ -38,7 +38,7 @@ use tracing::{debug, warn};
 
 use crate::cachefill::ChunkFill;
 use crate::metrics::Metrics;
-use crate::proxy::{FillGuard, FillRegistry};
+use crate::proxy::{insert_fenced, FillGuard, FillRegistry};
 use crate::staging::{StageOutcome, StagingArea};
 
 /// gRPC message payload per BlobChunk frame. Well under tonic's 4 MiB default
@@ -942,21 +942,29 @@ async fn pump_read_through(mut st: PumpState) {
         // fully registered slab on the first hardware run, because a cold holder
         // fills HERE and this line did not consult the slab.
         let body = st.fill.cached_bytes(&buf.freeze(), &st.metrics);
-        if let Err(e) = st
-            .tier
-            .put_chunk(&st.cache_key, CachedChunk::new(body))
-            .await
-        {
-            warn!(key = %st.cache_key, error = %e, "chunk fill could not reach the disk tier");
+        // `st.guard` is `Some` exactly when `st.buf` is (both driven by the same
+        // `admit` bool above), so this holds the claim this fill's insert needs
+        // fenced against a write's `Invalidate` racing it (gh22, ADR-0044) —
+        // see `insert_fenced`.
+        let inserted = match st.guard.as_ref() {
+            Some(guard) => {
+                insert_fenced(&st.tier, &st.cache_key, CachedChunk::new(body), guard).await
+            }
+            None => false,
+        };
+        if inserted {
+            // Record this node as a holder in its own directory shard
+            // (ADR-0017): the fill lands in DRAM, so the tier hint is Dram
+            // (advisory — foyer may demote it later; a stale hint costs a
+            // suboptimal source pick, never a wrong serve).
+            st.directory
+                .admit_next(&st.cache_key, &st.local_node, Tier::Dram);
+            st.metrics.fills_completed.inc();
+            st.metrics.bytes_filled.inc_by(sent);
+        } else {
+            st.metrics.fills_aborted.inc();
+            debug!(key = %st.cache_key, "read-through fill poisoned or refused by the tier");
         }
-        // Record this node as a holder in its own directory shard (ADR-0017):
-        // the fill lands in DRAM, so the tier hint is Dram (advisory — foyer
-        // may demote it later; a stale hint costs a suboptimal source pick,
-        // never a wrong serve).
-        st.directory
-            .admit_next(&st.cache_key, &st.local_node, Tier::Dram);
-        st.metrics.fills_completed.inc();
-        st.metrics.bytes_filled.inc_by(sent);
     } else {
         st.metrics.fills_aborted.inc();
         debug!(key = %st.cache_key, got = sent, expected = st.chunk_len, "read-through fill abandoned");
@@ -1259,6 +1267,17 @@ impl Peer for PacerPeer {
         request: Request<InvalidateRequest>,
     ) -> Result<Response<InvalidateResponse>, Status> {
         let req = request.into_inner();
+        // gh22 / ADR-0044: fence any fill claim for this key. A leader (this
+        // proxy's ADR-0040 single flight) or an exclusive holder (this server's
+        // own read-through pump below, or the proxy's layer-1 admit) may be
+        // mid-read or mid-insert for exactly this key right now, and each checks
+        // the claim both before and after its own `put_chunk` (see
+        // `FillCtx::put_chunk_fenced` and `pump_read_through`) — so whichever
+        // side of that write this call lands on, the write's holder either skips
+        // the insert or undoes it, and `tier.forget` below then covers the one
+        // case neither check can: a fill that had already finished and released
+        // its claim before this call ever ran.
+        self.filling.poison(&req.cache_key);
         self.tier.forget(&req.cache_key).await;
         // ADR-0017: a write's invalidation clears the home's directory entry
         // too, not just this node's own cache copy — the sharer set for a

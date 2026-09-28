@@ -50,8 +50,8 @@ mod write;
 pub use cluster::Cluster;
 
 pub(crate) use cluster::chunk_sources;
-pub(crate) use fill::FillGuard;
 pub use fill::FillRegistry;
+pub(crate) use fill::{insert_fenced, FillGuard};
 
 /// The S3 service implementation: cache policy in front of a re-signing proxy.
 pub struct PacerProxy {

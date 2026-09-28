@@ -400,6 +400,12 @@ impl PacerProxy {
     /// awaited hop; invalidation is a rare path (checkpoint objects are
     /// immutable, ADR-0016), so the writer-side cost is immaterial.
     async fn invalidate_key(&self, cache_key: &str) {
+        // gh22 / ADR-0044: fence this node's own fill registry before dropping
+        // its cache copy, exactly as the peer handler does for a remote node
+        // (`PacerPeer::invalidate`) — a home co-located with the writer can be
+        // mid-read or mid-insert of this same key when its own write invalidates
+        // it, and that in-flight fill needs the same fence a remote one gets.
+        self.filling.poison(cache_key);
         self.tier.forget(cache_key).await;
         let Some(cluster) = &self.cluster else {
             return;

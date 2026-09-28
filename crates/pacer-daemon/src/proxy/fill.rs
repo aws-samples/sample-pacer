@@ -196,9 +196,9 @@ const FILL_BROADCAST_CAPACITY: usize = 1;
 /// What one claimed chunk key is doing, and therefore what a second arrival
 /// should do about it.
 ///
-/// The distinction that matters is between the last variant and the other two: a
-/// claim that will never publish anything must not be waited on, or a request
-/// would block on a fill whose bytes it is never going to see.
+/// The distinction that matters is between the last two variants and the other
+/// two: a claim that will never publish anything must not be waited on, or a
+/// request would block on a fill whose bytes it is never going to see.
 enum FillState {
     /// A leader is reading this chunk from the backend and will publish the bytes
     /// to this channel. Subscribe and wait.
@@ -215,6 +215,17 @@ enum FillState {
     /// no backend read to share. A second arrival fetches its own, exactly as it
     /// did before ADR-0040.
     Exclusive,
+    /// A write's `Invalidate` landed on this key while a claim for it was still
+    /// live (gh22, ADR-0044's fence). Whoever holds the claim — leader or
+    /// exclusive — is reading or about to insert bytes from *before* that write,
+    /// so it must serve them to its own requester (already in hand, nothing else
+    /// to give that caller) but never publish or insert them. A second arrival
+    /// must not wait on or take this claim's bytes either: it fetches its own,
+    /// exactly like [`Self::Exclusive`]. Replaces whichever state was live when
+    /// [`FillRegistry::poison`] ran, dropping a live `Fetching`'s `Sender` — which
+    /// is what wakes an already-parked follower empty-handed instead of leaving
+    /// it to wait for bytes that must not reach it.
+    Poisoned,
 }
 
 /// The node-wide record of which chunk keys are being filled right now, and by
@@ -272,7 +283,7 @@ impl FillRegistry {
         match claims.get(key) {
             Some(FillState::Fetching(tx)) => return FillClaim::Follow(tx.subscribe()),
             Some(FillState::Filled(bytes)) => return FillClaim::Ready(bytes.clone()),
-            Some(FillState::Exclusive) => return FillClaim::Busy,
+            Some(FillState::Exclusive | FillState::Poisoned) => return FillClaim::Busy,
             None => {}
         }
         // The receiver `channel` hands back is dropped immediately: waiters get
@@ -300,6 +311,38 @@ impl FillRegistry {
         }
         claims.insert(key.to_owned(), FillState::Exclusive);
         true
+    }
+
+    /// Fence `key`'s current claim, whichever kind it is, against a write's
+    /// `Invalidate` that just landed on it (gh22, ADR-0044).
+    ///
+    /// A no-op when nobody holds `key` right now — there is nothing in flight to
+    /// fence, and the caller's own `tier.forget` (the peer server's `invalidate`
+    /// handler and the write path's own `invalidate_key` both call this
+    /// alongside it) already covers a chunk that finished landing before this
+    /// call. Replacing a live `Fetching`'s state drops its `Sender`, which is
+    /// what closes the broadcast channel and wakes every parked follower with
+    /// `None` — see [`FillState::Poisoned`] for why that is exactly what they
+    /// should get.
+    pub(crate) fn poison(&self, key: &str) {
+        let mut claims = self.claims.lock().unwrap();
+        if let Some(state) = claims.get_mut(key) {
+            *state = FillState::Poisoned;
+        }
+    }
+
+    /// Whether `key`'s claim is poisoned right now.
+    ///
+    /// Checked by the claim's own holder on both sides of its tier write —
+    /// before, so a claim already poisoned skips the write outright, and after,
+    /// so an `Invalidate` landing *during* the write (the window a before-only
+    /// check cannot see) is still caught: see [`FillGuard::is_poisoned`] and its
+    /// callers.
+    fn is_poisoned(&self, key: &str) -> bool {
+        matches!(
+            self.claims.lock().unwrap().get(key),
+            Some(FillState::Poisoned)
+        )
     }
 
     /// Hand `bytes` to every waiter on `key`, and leave them in the claim for
@@ -475,6 +518,15 @@ impl FillGuard {
     pub(crate) fn complete(&mut self) {
         self.completed = true;
     }
+
+    /// Whether an `Invalidate` poisoned this guard's key while the fill was in
+    /// flight (gh22, ADR-0044). Checked on both sides of every tier write a
+    /// guard's holder makes — see [`FillCtx::put_chunk_fenced`] and `peer.rs`'s
+    /// read-through pump, which holds the same guard but is not a `FillCtx`
+    /// method.
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.registry.is_poisoned(&self.key)
+    }
 }
 
 impl Drop for FillGuard {
@@ -489,6 +541,60 @@ impl Drop for FillGuard {
             self.abandoned.inc();
         }
     }
+}
+
+/// Write `cached` into `tier` under `chunk_key`, unless `guard`'s claim was
+/// poisoned by a write's `Invalidate` racing this fill (gh22, ADR-0044's
+/// fence). Returns whether the chunk is left in the tier by this call.
+///
+/// A free function, not a [`FillCtx`] method, so `crate::peer`'s read-through
+/// pump can share it: that path holds the same [`FillGuard`] shape and the same
+/// race, but assembles its chunk from a streamed backend body rather than
+/// through a `FillCtx`.
+///
+/// Checked on **both** sides of the write, and that is the whole fence:
+///
+/// - Before, so a claim already poisoned when this runs skips the write
+///   outright — the common case, since an `Invalidate` that raced a fill this
+///   far ahead had the whole backend read to land in.
+/// - After, because the first check cannot see an `Invalidate` that lands
+///   *during* `put_chunk` — the exact window the issue names. Re-reading the
+///   claim once the write returns is the only way to observe that: if it is
+///   poisoned now, the bytes just written are the pre-write body the
+///   invalidation was for, and this call forgets them again before anything
+///   else can observe them. Both checks read the *same* registry entry the
+///   caller is still holding the claim on, so nothing else can begin a fill of
+///   this key in between (`FillGuard` is not released until the caller's
+///   `complete`/`Drop`) — the only way the key becomes poisoned is exactly the
+///   `Invalidate` this fence exists for.
+///
+/// A `put_chunk` failure is logged and returns `false` too: callers count
+/// `fills_completed`/`bytes_filled` only on a write that actually landed, which
+/// is one behaviour this tightens versus pre-gh22 (a failed write used to still
+/// count) — harmless, and there is no test pinning the old count.
+pub(crate) async fn insert_fenced(
+    tier: &ChunkTier,
+    chunk_key: &str,
+    cached: CachedChunk,
+    guard: &FillGuard,
+) -> bool {
+    if guard.is_poisoned() {
+        trace!(key = %chunk_key, "fill poisoned by invalidation before insert; dropping the pre-write bytes");
+        return false;
+    }
+    if let Err(e) = tier.put_chunk(chunk_key, cached).await {
+        warn!(key = %chunk_key, error = %e, "chunk fill could not reach the disk tier");
+        return false;
+    }
+    if guard.is_poisoned() {
+        trace!(
+            key = %chunk_key,
+            "fill poisoned by invalidation during insert; forgetting the pre-write bytes just written"
+        );
+        tier.forget(chunk_key).await;
+        return false;
+    }
+    true
 }
 
 impl FillCtx {
@@ -668,6 +774,14 @@ impl FillCtx {
     /// already served from the cache when the chunk happens to be there cannot
     /// object to being served from a read that is already in flight.
     ///
+    /// **gh22 / ADR-0044's fence.** A write's `Invalidate` can land on `chunk_key`
+    /// at any point during this read: `guard.publish` is already a no-op once
+    /// that has happened ([`FillRegistry::publish`] only sends from `Fetching`),
+    /// and [`Self::insert_filled`] re-checks the same poison both before its tier
+    /// write and after — the leader still returns `body` to its own caller either
+    /// way, because those bytes are already read and there is nothing else to
+    /// serve them.
+    ///
     /// # Errors
     ///
     /// The backend read's, unchanged — see [`Self::fetch_from_backend`].
@@ -680,7 +794,7 @@ impl FillCtx {
         let body = self.read_backend_chunk(idx, chunk_key).await?;
         guard.publish(&body);
         if self.admit {
-            self.insert_filled(chunk_key, &body).await;
+            self.insert_filled(chunk_key, &body, &guard).await;
         }
         guard.complete();
         Ok(body)
@@ -786,12 +900,13 @@ impl FillCtx {
         // its `Bytes`. Note the slab does NOT reintroduce the hazard it looks
         // like it might: a frame is the cache's own memory, sized for the
         // resident set, not a range borrowed from the transport's fetch supply.
-        if let Err(e) = self.tier.put_chunk(chunk_key, self.to_cached(data)).await {
-            warn!(key = %chunk_key, error = %e, "chunk fill could not reach the disk tier");
+        let inserted = insert_fenced(&self.tier, chunk_key, self.to_cached(data), &guard).await;
+        guard.complete();
+        if !inserted {
+            return;
         }
         self.metrics.local_admits.inc();
         self.metrics.bytes_filled.inc_by(data.len() as u64);
-        guard.complete();
         // Announce to the chunk's home (a remote node — this node is not a
         // home). Fire-and-forget: a dropped announce costs one stale-entry
         // retry later, never a wrong serve (ADR-0017 soft state).
@@ -991,24 +1106,25 @@ impl FillCtx {
         let Some(mut guard) = self.try_begin_fill(chunk_key) else {
             return;
         };
-        self.insert_filled(chunk_key, data).await;
+        self.insert_filled(chunk_key, data, &guard).await;
         guard.complete();
     }
 
     /// Put a fetched chunk in the tier, count it, and record this node as a holder
-    /// — everything [`Self::maybe_fill`] does once its claim is won.
+    /// — everything [`Self::maybe_fill`] does once its claim is won, gated by
+    /// [`insert_fenced`].
     ///
     /// Reached by two callers holding two *kinds* of claim: `maybe_fill`'s exclusive
     /// one, and ADR-0040's leader, which took a publishing claim before its read.
-    /// Neither may claim again from in here, which is why the claim is the caller's
-    /// and this function takes none.
-    async fn insert_filled(&self, chunk_key: &str, data: &Bytes) {
+    /// Neither may claim again from in here, which is why the claim is the
+    /// caller's and `guard` is only ever read.
+    async fn insert_filled(&self, chunk_key: &str, data: &Bytes, guard: &FillGuard) {
         // `cached_bytes`, not `data.clone()`: this is the OWNER's copy, the one
         // peers fetch from, so it is exactly the chunk whose serve ADR-0028
         // wants to post without staging. On a build or node with no slab this is
         // the same refcount bump it always was.
-        if let Err(e) = self.tier.put_chunk(chunk_key, self.to_cached(data)).await {
-            warn!(key = %chunk_key, error = %e, "chunk fill could not reach the disk tier");
+        if !insert_fenced(&self.tier, chunk_key, self.to_cached(data), guard).await {
+            return;
         }
         self.metrics.fills_completed.inc();
         self.metrics.bytes_filled.inc_by(data.len() as u64);
@@ -1348,6 +1464,77 @@ mod tests {
             registry.len(),
             2,
             "two keys claimed at once is what keeps one GET's chunks concurrent"
+        );
+    }
+
+    /// gh22 / ADR-0044's fence, at the registry level: an `Invalidate` landing on
+    /// a key whose leader is still mid-read must wake every follower already
+    /// parked on it empty-handed, rather than let them wait for bytes the leader
+    /// is about to be forbidden from publishing.
+    #[tokio::test]
+    async fn poisoning_a_fetching_claim_wakes_its_follower_empty_handed() {
+        let registry = FillRegistry::new();
+        let metrics = fill_metrics();
+
+        let FillClaim::Lead(leader) = registry.claim_fill(&metrics, A_CHUNK_KEY) else {
+            panic!("the first claim of a free key must lead");
+        };
+        let FillClaim::Follow(waiter) = registry.claim_fill(&metrics, A_CHUNK_KEY) else {
+            panic!("a claim taken while a leader is fetching must follow it");
+        };
+        assert!(
+            !leader.is_poisoned(),
+            "a claim just taken has nothing to poison it yet"
+        );
+
+        // The write's invalidation lands while the leader's backend read is
+        // still in flight — no sleep needed: the leader has not even finished
+        // that read yet, so this is the exact ordering #22 describes.
+        registry.poison(A_CHUNK_KEY);
+        assert!(
+            leader.is_poisoned(),
+            "the leader's own guard must see the poison the registry now carries"
+        );
+
+        assert_eq!(
+            await_published_fill(waiter, &metrics.fill_coalesce.waiters).await,
+            None,
+            "a poisoned leader must wake its follower empty-handed rather than \
+             let it wait for bytes that must never reach it"
+        );
+
+        // The leader's read "finishes" with the pre-write bytes; publishing them
+        // now must be a no-op, and a fresh arrival must be told to fetch its own
+        // rather than take what is parked (nothing is, but the claim kind alone
+        // must already say so).
+        leader.publish(&Bytes::from_static(b"pre-write bytes the write erased"));
+        assert!(
+            matches!(registry.claim_fill(&metrics, A_CHUNK_KEY), FillClaim::Busy),
+            "a claim on a poisoned key must be told to fetch its own bytes, \
+             never handed the leader's stale ones"
+        );
+    }
+
+    /// The other half of the fence: an `Invalidate` that lands after the leader
+    /// has already published — the `Filled` window
+    /// `bytes_published_before_the_claim_is_released_are_taken_without_waiting`
+    /// covers — must still stop a *later* arrival from taking those parked bytes.
+    #[test]
+    fn poisoning_a_filled_claim_stops_a_later_arrival_from_taking_the_parked_bytes() {
+        let registry = FillRegistry::new();
+        let metrics = fill_metrics();
+
+        let FillClaim::Lead(leader) = registry.claim_fill(&metrics, A_CHUNK_KEY) else {
+            panic!("the first claim of a free key must lead");
+        };
+        leader.publish(&Bytes::from_static(b"published, not yet inserted"));
+
+        registry.poison(A_CHUNK_KEY);
+
+        assert!(
+            matches!(registry.claim_fill(&metrics, A_CHUNK_KEY), FillClaim::Busy),
+            "an arrival after the poison must not take bytes parked from before it, \
+             even though an arrival before the poison would have"
         );
     }
 }

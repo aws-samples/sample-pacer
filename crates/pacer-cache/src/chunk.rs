@@ -71,15 +71,26 @@ impl ObjectHeader {
 /// one key could leave a cache holding chunk 0 from one and chunk 1 from the
 /// other — an object matching neither.
 ///
-/// `None` on every chunk the read path fills: ADR-0007's world had one version
-/// per key by construction, and those entries keep their pre-ADR-0032 on-disk
-/// encoding byte for byte. Set by the write path, which does not learn the ETag
-/// until `CompleteMultipartUpload`.
+/// `None` on every chunk an ordinary read-path fill builds
+/// (`FillCtx::to_cached`'s `node`-mode arm, `pacer-daemon`): ADR-0007's world had
+/// one version per key by construction, and those entries keep their
+/// pre-ADR-0032 on-disk encoding byte for byte. Set by the write path, which
+/// does not learn the ETag until `CompleteMultipartUpload` — and, under
+/// `auth.mode=requester` (ADR-0041), by a read-path fill too, from the
+/// requester's own held probe.
 ///
-/// **Not validated in v1.** Immutable checkpoint keys (ADR-0015: a new name per
-/// version) mean mixed-version assembly cannot arise for the target workload.
-/// Carrying the witness unchecked is what makes turning the check on later a flag
-/// flip instead of a cache-format migration.
+/// **Not validated in v1, and not a flag flip away from being.** Immutable
+/// checkpoint keys (ADR-0015: a new name per version) mean mixed-version
+/// assembly cannot arise for the target workload, which is why nothing checks
+/// this witness today. But turning that check on is not simply flipping a flag:
+/// this field is absent on most of the chunks that would need checking (every
+/// `node`-mode read fill carries no witness at all, gh22), and on the chunk
+/// store — the default disk tier wherever a slab exists (ADR-0038) — a
+/// witness that IS present does not survive the round trip regardless: its
+/// `SlotHeader` has no ETag field, and `ChunkStore::verified` reconstructs
+/// every hit as `CachedChunk::new(body)`, witness dropped. Enabling validation
+/// there needs a slot format change (v3) and a fill path that always sets the
+/// witness, not a flag.
 ///
 /// The last chunk of an object may be shorter than `chunk_size` (see
 /// [`ChunkConfig::chunk_bounds`]).

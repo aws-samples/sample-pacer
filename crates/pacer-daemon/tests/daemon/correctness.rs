@@ -340,6 +340,46 @@ async fn read_after_write_sees_fresh_data() {
     assert!(err.into_service_error().is_no_such_key());
 }
 
+/// ADR-0042: an overwrite purges the old chunks even when the header was evicted first.
+///
+/// Header and chunks share one LRU tier, so the header can go before its chunks. The old
+/// invalidation read "no header" as "no chunks" on a single node and dropped only the
+/// header key; the next GET then resolved the new object's length and assembled the old
+/// object's bytes. `forget` stands in for that eviction.
+#[tokio::test]
+async fn overwrite_purges_chunks_whose_header_was_evicted() {
+    let h = harness().await;
+    let key = "evicted-header.bin";
+    let len = (MIN_OBJECT_SIZE + 1024) as usize;
+    let (v1, v2) = (big_body(10, len), big_body(11, len));
+    h.client
+        .put_object()
+        .bucket(BUCKET)
+        .key(key)
+        .body(ByteStream::from(v1.clone()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(h.get(key).await, v1);
+    wait_for_fills(&h.metrics, chunks_for(len)).await;
+
+    h.tier.forget(&pacer_cache::object_key(BUCKET, key)).await;
+    h.client
+        .put_object()
+        .bucket(BUCKET)
+        .key(key)
+        .body(ByteStream::from(v2.clone()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        h.get(key).await,
+        v2,
+        "a GET after the overwrite must not assemble the old chunks"
+    );
+}
+
 #[tokio::test]
 async fn cache_control_no_cache_bypasses() {
     let h = harness().await;

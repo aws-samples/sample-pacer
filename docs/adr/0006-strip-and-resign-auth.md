@@ -54,5 +54,13 @@ segmentation (NetworkPolicy).
   The proxy is opt-in — a pod can always use the real endpoint directly — so this
   governs only the accelerated path.
 - All node traffic acts as ONE IAM identity → per-caller authorization is out of scope for now. Multi-tenancy later = verify-then-re-sign via `s3s::auth::S3Auth` (the trait is already in the stack); ADR to be revisited then.
+
+  **Amended 2026-09-23 by [ADR-0041](0041-requester-identity-auth-mode.md).** The `S3Auth`
+  escape is withdrawn: that trait's one method is `get_secret_key(access_key)` — s3s verifies
+  the HMAC itself, so implementing it means the daemon holds every caller's real secret, the
+  gaul/s3proxy model this record rejected, and it cannot work against rotating STS
+  credentials at all. Per-caller authorization is instead a second **mode** (`auth.mode:
+  requester`) in which the daemon is a forward proxy and S3 authorizes the caller's own
+  signature. This record's decision stands unchanged as `auth.mode: node`, the default.
 - Simplest possible client config; no credential distribution problem.
 - Express detail: authorization happens once per CreateSession (5-min amortized) on AWS's side — per-request IAM evaluation isn't in the hot path anyway.

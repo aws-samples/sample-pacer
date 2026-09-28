@@ -65,6 +65,17 @@ const DELIVERY_CHUNK_LATENCY_BUCKETS: &[f64] = &[
     0.512,
 ];
 
+/// Latency buckets (seconds) for the `requester`-mode authorization probe
+/// (`AuthzMetrics::probe_seconds`, ADR-0041). Wide because the in-AZ number
+/// is unmeasured — `planning/29-auth-modes.md` § 4 names it as the gate that
+/// decides whether a future revision overlaps the probe with the cache read
+/// — so these buckets need to resolve both a single-digit-millisecond in-AZ
+/// round trip and the WAN dev-loop figure the ADR itself records (0.32 s,
+/// Mac to us-east-2).
+const AUTHZ_PROBE_LATENCY_BUCKETS: &[f64] = &[
+    0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.512, 1.0, 2.0,
+];
+
 /// Latency buckets (seconds) for the write-scatter phase histogram
 /// ([`ScatterMetrics::phase_seconds`]).
 ///
@@ -298,6 +309,8 @@ pub struct Metrics {
     /// Reads served from another request's in-flight fill (ADR-0040) — see
     /// [`FillCoalesceMetrics`].
     pub fill_coalesce: FillCoalesceMetrics,
+    /// `auth.mode: requester`'s probe and signed-range-bypass series (ADR-0041).
+    pub authz: AuthzMetrics,
     /// Client-memory delivery (ADR-0026, planning/19 Track C) — see
     /// [`DeliveryMetrics`].
     pub delivery: DeliveryMetrics,
@@ -462,6 +475,34 @@ pub struct FillCoalesceMetrics {
     /// tracking `pacer_backend_read_failures_total` is the backend being unhealthy;
     /// a rate here without that is clients disconnecting mid-read.
     pub fallbacks: IntCounter,
+}
+
+/// `auth.mode: requester`'s own series (ADR-0041 § 2.4): the per-GET
+/// authorization probe and the one shape it cannot serve — a caller who
+/// signed their own `Range`, which becomes an uncached pass-through.
+#[derive(Clone)]
+pub struct AuthzMetrics {
+    /// Every probe issued, labeled by how S3 answered it. `allow` covers
+    /// 2xx/206/416 (416 is a zero-byte object, not a deny — see
+    /// [`crate::proxy`]'s probe handling); `deny` is every other status,
+    /// returned to the client verbatim; `error` is a transport failure that
+    /// never reached S3 at all.
+    pub probe_total: IntCounterVec,
+    /// Probe latency. Not overlapped with the cache read in this
+    /// implementation (a deliberate simplification — see `planning/29-auth-modes.md`
+    /// § 2.4), so this is the whole added cost of one GET under `requester`
+    /// mode, not a fraction of it.
+    pub probe_seconds: HistogramVec,
+    /// GETs whose caller signed their own `Range` — the SigV4 asymmetry ADR-0041
+    /// depends on means such a request cannot be rewritten, so it is forwarded
+    /// verbatim and never cached. A rising rate here is cache coverage being
+    /// lost to a client's own range-signing choice, not a fault.
+    pub signed_range_bypass: IntCounter,
+    /// Chunks a non-home read from S3 under the caller's signature and pushed
+    /// to their home as populate-only windows, by outcome
+    /// (`committed`/`refused`/`failed`). `committed` is a home that became a
+    /// holder without ever reading S3 itself (ADR-0041 § 2.4 point 6).
+    pub populate_windows: IntCounterVec,
 }
 
 /// Allocator gauges (`mallinfo2`, see [`crate::memstats`]): of the resident bytes
@@ -1401,6 +1442,38 @@ fn register_fill_coalesce_metrics(registry: &Registry) -> anyhow::Result<FillCoa
     })
 }
 
+/// Register `auth.mode: requester`'s own series (ADR-0041). Split out of
+/// [`Metrics::new`] for the same reason as [`register_fill_coalesce_metrics`]:
+/// that constructor is at its function-length budget.
+fn register_authz_metrics(registry: &Registry) -> anyhow::Result<AuthzMetrics> {
+    Ok(AuthzMetrics {
+        probe_total: int_counter_vec(
+            registry,
+            "pacer_authz_probe_total",
+            "requester mode's per-GET authorization probe, labeled allow|deny|error (ADR-0041)",
+            &["result"],
+        )?,
+        probe_seconds: histogram_vec(
+            registry,
+            "pacer_authz_probe_seconds",
+            "requester mode's per-GET authorization probe latency — not overlapped with the cache read in this implementation, so this is the whole added cost of one GET (ADR-0041)",
+            &[],
+            AUTHZ_PROBE_LATENCY_BUCKETS,
+        )?,
+        signed_range_bypass: counter(
+            registry,
+            "pacer_authz_signed_range_bypass_total",
+            "GETs whose caller signed their own Range and so were forwarded verbatim, uncached (ADR-0041)",
+        )?,
+        populate_windows: int_counter_vec(
+            registry,
+            "pacer_populate_windows_total",
+            "requester-mode chunks pushed to their home as populate-only windows, by outcome committed|refused|failed (ADR-0041)",
+            &["outcome"],
+        )?,
+    })
+}
+
 /// Register the backend chunk-read series (`pacer_backend::retry`). Split out of
 /// [`Metrics::new`] for the same reason as [`register_scatter_metrics`]: that
 /// constructor is at its function-length budget.
@@ -2256,6 +2329,7 @@ impl Metrics {
             fill_inflight,
             fill_abandoned,
             fill_coalesce: register_fill_coalesce_metrics(&registry)?,
+            authz: register_authz_metrics(&registry)?,
             delivery: register_delivery_metrics(&registry)?,
             scatter: register_scatter_metrics(&registry)?,
             listener: register_listener_metrics(&registry)?,

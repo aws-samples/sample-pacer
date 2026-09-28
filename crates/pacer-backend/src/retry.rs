@@ -219,9 +219,13 @@ pub enum BackendReadErrorKind {
     Exhausted(String),
 }
 
-/// Outcome of one attempt, before the policy decides whether there is another.
+/// Outcome of one attempt, before the policy decides whether there is
+/// another. `pub` so a caller with its own attempt operation — ADR-0041's
+/// `requester` mode re-emits the caller's held signature instead of using
+/// the SDK client — can classify into the same three buckets `retrying`
+/// already knows how to act on.
 #[derive(Debug)]
-enum AttemptError {
+pub enum AttemptError {
     /// Worth another attempt.
     Transient(String),
     /// Not worth another attempt.
@@ -250,20 +254,41 @@ pub async fn read_range(
     read: &ChunkRead<'_>,
     policy: &RetryPolicy,
 ) -> Result<ChunkBody, BackendReadError> {
+    read_range_with(read, policy, || read_once(client, read)).await
+}
+
+/// [`read_range`], generalized over the attempt itself — ADR-0041's
+/// `requester` mode reads by re-emitting the caller's held signature with a
+/// chunk's `Range` instead of calling the SDK client, and gets the same
+/// retry/backoff/jitter contract for it rather than a second copy of
+/// `retrying`'s loop.
+///
+/// # Errors
+///
+/// As [`read_range`].
+pub async fn read_range_with<F, Fut>(
+    read: &ChunkRead<'_>,
+    policy: &RetryPolicy,
+    attempt_op: F,
+) -> Result<ChunkBody, BackendReadError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Bytes, AttemptError>>,
+{
     if read.range.is_empty() {
         return Ok(ChunkBody {
             body: Bytes::new(),
             attempts: 0,
         });
     }
-    retrying(policy, read.jitter_index, || read_once(client, read)).await
+    retrying(policy, read.jitter_index, attempt_op).await
 }
 
 /// The retry loop itself, over any attempt operation.
 ///
-/// Split from [`read_range`] so the loop's contract — attempt counting, which
-/// outcomes stop it early, what it reports on exhaustion — is testable without
-/// a live S3 endpoint.
+/// Split from [`read_range_with`] so the loop's contract — attempt counting,
+/// which outcomes stop it early, what it reports on exhaustion — is testable
+/// without a live S3 endpoint.
 async fn retrying<F, Fut>(
     policy: &RetryPolicy,
     jitter_index: u64,

@@ -1,4 +1,21 @@
 PACER {{ .Chart.AppVersion }} installed as {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+{{- if include "pacer.requesterMode" . }}
+
+auth.mode=requester (ADR-0041): S3 authorizes each caller's OWN signature. Configure the
+daemon as the SDK's HTTP PROXY, not as its endpoint, keep your own credentials, address
+the real bucket, and leave the Range header unsigned:
+
+  proxies     = {"http": "http://{{ include "pacer.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.ports.s3 }}"}
+  endpoint    = the real S3 endpoint, http:// (an https:// endpoint through a plain proxy
+                URL CONNECT-tunnels, and a tunnel is refused)
+  express     = the ZONAL endpoint (s3express-<az-id>.<region>.amazonaws.com)
+  range       = excluded from signing, or that GET is forwarded uncached
+                (pacer_authz_signed_range_bypass_total)
+
+The NetworkPolicy below is defence in depth in this mode, not the authorization: a pod
+that reaches :{{ .Values.ports.s3 }} gets exactly the access its own credentials carry.
+docs/helm/auth.md has the boto3 recipe.
+{{- else }}
 
 Point client SDKs at the node-local Service, path-style, with the placeholder credentials:
 
@@ -45,6 +62,7 @@ Point client SDKs at the node-local Service, path-style, with the placeholder cr
  own policy, or set networkPolicy.enabled=true.
 =============================================================================
 {{ end }}
+{{- end }}
 Neither the policy nor any CNI covers the EFA/RDMA data plane: one-sided RDMA over SRD
 is device-to-device and never reaches the CNI's hooks. Scope that with the EFA security
 group and placement group. Full posture: docs/helm/network-policy.md.

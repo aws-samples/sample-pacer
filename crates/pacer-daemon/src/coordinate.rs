@@ -896,6 +896,10 @@ async fn upload_window(
                 part_number: planned.part_number,
                 body: window.body.clone(),
                 checksum_crc32: &checksum,
+                // The coordinator always uploads for real — populate-only
+                // offers are the read-path populate's and the write-tee's,
+                // neither of which is this call site (ADR-0041, planning/30).
+                populate_only: false,
             };
             let offered = std::time::Instant::now();
             let answer = shared.cluster.transport.store_chunk(home, offer).await;
@@ -914,6 +918,17 @@ async fn upload_window(
                     debug!(key = %planned.chunk_key, owner = %home.name(), ?refusal,
                         "owner refused; uploading this window here");
                     note_refusal(shared, home, &refusal);
+                }
+                // Cannot happen through this crate's own transport (it
+                // refuses a `Staged` answer to an offer that was not
+                // `populate_only` — see `grpc::store_outcome_from_wire`),
+                // but `StoreOutcome` is a trait-level contract another
+                // transport could violate. Treat exactly like a transport
+                // error rather than assume the invariant.
+                Ok(StoreOutcome::Staged) => {
+                    warn!(key = %planned.chunk_key, owner = %home.name(),
+                        "owner staged a real-upload offer instead of uploading it (protocol \
+                         violation); uploading this window here");
                 }
                 Err(e) => {
                     warn!(key = %planned.chunk_key, owner = %home.name(), error = %e,
@@ -949,7 +964,11 @@ fn observe_offer(
     let phase = match answer {
         Ok(StoreOutcome::Uploaded { .. }) => crate::metrics::SCATTER_PHASE_OWNER_RPC,
         Ok(StoreOutcome::Refused(_)) => crate::metrics::SCATTER_PHASE_OWNER_REFUSED,
-        Err(_) => crate::metrics::SCATTER_PHASE_OWNER_FAILED,
+        // Cannot happen: this coordinator never offers `populate_only`, and
+        // the transport refuses a `Staged` answer to an offer that was not
+        // (see `grpc::store_outcome_from_wire`). Charged like a failure
+        // because it is one — an owner that violated the protocol.
+        Ok(StoreOutcome::Staged) | Err(_) => crate::metrics::SCATTER_PHASE_OWNER_FAILED,
     };
     shared.metrics.scatter.observe_phase(phase, elapsed);
 }

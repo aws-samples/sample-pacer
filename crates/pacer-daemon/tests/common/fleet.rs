@@ -154,6 +154,29 @@ pub async fn serve_node(
     proxy: PacerProxy,
     staging: Option<Arc<StagingArea>>,
 ) -> ServedNode {
+    let (peer_addr, accepted) = serve_peer(spec, parts, proxy.filling(), staging, false).await;
+    ServedNode {
+        client: sdk_client_for(daemon_service(proxy), placeholder_credentials()),
+        peer_addr,
+        accepted,
+    }
+}
+
+/// The peer half of [`serve_node`] alone: a gRPC peer server on a loopback port,
+/// with no S3 front. Split out for `requester`-mode nodes (ADR-0041), whose S3 front
+/// is `RequesterFront` rather than the placeholder-auth service `serve_node` builds,
+/// and whose peer server runs with [`PacerPeer::with_requester_mode`] set.
+///
+/// # Panics
+///
+/// If loopback cannot be bound.
+pub async fn serve_peer(
+    spec: &NodeSpec<'_>,
+    parts: &NodeParts,
+    filling: pacer_daemon::proxy::FillRegistry,
+    staging: Option<Arc<StagingArea>>,
+    requester_mode: bool,
+) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
     let mut peer = PacerPeer::new(PeerParts {
         tier: parts.tier.clone(),
         backend: parts.backend.clone(),
@@ -166,7 +189,7 @@ pub async fn serve_node(
         max_object_size: spec.max_object_size,
         channel_capacity: CHANNEL_CAPACITY,
         metrics: parts.metrics.clone(),
-        filling: proxy.filling(),
+        filling,
         fill_parallelism: FILL_PARALLELISM,
         // Heap, not the ADR-0028 slab: an in-process fleet has no RDMA plane, so
         // there is no slab to fill into (same reason `efa` below is `None`).
@@ -175,7 +198,8 @@ pub async fn serve_node(
         efa: None,
         #[cfg(feature = "efa")]
         rdma_runtime: tokio::runtime::Handle::current(),
-    });
+    })
+    .with_requester_mode(requester_mode);
     if let Some(staging) = staging {
         peer = peer.with_staging(staging);
     }
@@ -199,10 +223,5 @@ pub async fn serve_node(
             .add_service(peer.into_service())
             .serve_with_incoming(counted),
     );
-
-    ServedNode {
-        client: sdk_client_for(daemon_service(proxy), placeholder_credentials()),
-        peer_addr,
-        accepted,
-    }
+    (peer_addr, accepted)
 }

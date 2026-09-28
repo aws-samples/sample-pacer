@@ -265,6 +265,24 @@ data:
       {{ $alias }}: {{ $real | quote }}
       {{- end }}
     {{- end }}
+    {{- if include "pacer.requesterMode" . }}
+    # ADR-0041: S3 authorizes each caller's own signature; this node re-signs nothing.
+    # Rendered only in requester mode, so a node-mode ConfigMap is byte-identical to
+    # one from before auth.mode existed.
+    auth:
+      mode: requester
+      s3-domains:
+        {{- range .Values.auth.requester.s3Domains }}
+        - {{ . | quote }}
+        {{- end }}
+      {{- if include "pacer.tlsEnabled" . }}
+      # The daemon's own certificate, from auth.requester.tls.secretName (ADR-0041 § 9).
+      tls:
+        cert: "{{ include "pacer.tlsMountPath" . }}/tls.crt"
+        key: "{{ include "pacer.tlsMountPath" . }}/tls.key"
+        listen-addr: "0.0.0.0:{{ .Values.auth.requester.tls.port }}"
+      {{- end }}
+    {{- end }}
     {{- if .Values.cluster.enabled }}
     cluster:
       peer-listen-addr: "0.0.0.0:{{ .Values.ports.peer }}"
@@ -437,7 +455,7 @@ data:
     # every existing release must keep rendering a byte-identical ConfigMap.
     scatter:
       enabled: {{ ternary "true" "false" (ne (include "pacer.scatterEnabled" .) "") }}
-      {{- if include "pacer.scatterEnabled" . }}
+      {{- if include "pacer.stagingHeld" . }}
       # Emitted even when the operator left it empty, because pacer.memoryLimit had
       # to budget for a specific number and this is how the daemon is held to the
       # same one. See pacer.scatterStagingBytes.

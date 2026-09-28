@@ -2,6 +2,7 @@
 //! integration tests can assemble the daemon in-process.
 
 pub mod auth;
+pub mod authz;
 pub mod cachefill;
 pub mod cgroup;
 pub mod config;

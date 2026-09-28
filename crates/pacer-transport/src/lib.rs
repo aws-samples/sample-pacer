@@ -228,6 +228,13 @@ pub struct StoreOffer<'a> {
     /// Base64 CRC32 of `body` in S3's `ChecksumCRC32` form, covering the
     /// coordinator→owner hop.
     pub checksum_crc32: &'a str,
+    /// Stage without uploading — the offerer has no S3 identity to upload
+    /// with (`auth.mode: requester`, ADR-0041) or the bytes are already
+    /// confirmed to exist in S3 by a read rather than a write in progress
+    /// (planning/29 § 2.4 point 6). The owner must answer
+    /// [`StoreOutcome::Staged`], never [`StoreOutcome::Uploaded`], for a
+    /// `true` offer — see [`TransportError`].
+    pub populate_only: bool,
 }
 
 /// What an owner did with an offered window.
@@ -239,6 +246,8 @@ pub enum StoreOutcome {
         /// The part's ETag, as S3 returned it.
         e_tag: String,
     },
+    /// Staged without uploading — the answer to a `populate_only` offer.
+    Staged,
     /// Declined, immediately. The coordinator uploads this window itself.
     Refused(StoreRefusal),
 }

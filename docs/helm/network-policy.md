@@ -9,6 +9,10 @@ the NODE's IAM identity, so **reaching `:9000` IS the authorization to spend it*
 makes this block the client-side security model, not a hardening extra — and it is why the
 policy ships ON (`networkPolicy.enabled: true`).
 
+That is `auth.mode: node`, the default. Under `auth.mode: requester` S3 authorizes each
+caller's own signature and this policy becomes defence in depth rather than the
+authorization — see [auth.md](auth.md). Everything below still applies to it.
+
 **It enforces nothing unless your CNI enforces NetworkPolicy.** Every cluster's API server
 accepts the object; only a policy-enforcing CNI acts on it. On EKS with the AWS VPC CNI the
 addon ships enforcement DISABLED, so the default outcome is a policy that renders, applies,

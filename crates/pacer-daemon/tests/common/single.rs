@@ -226,19 +226,38 @@ impl DaemonCore {
     ///
     /// If loopback cannot be bound.
     pub async fn served(self, limits: ListenLimits) -> Daemon {
+        self.served_with_direct_client(limits).await.0
+    }
+
+    /// [`Self::served`], plus an in-process client over the **same** service — one
+    /// proxy, one chunk tier, one registry, but no socket and so none of `limits`.
+    ///
+    /// For the arm whose setup is not its subject: warming the cache through the
+    /// served port makes the setup subject to the deadline under test, so a slow cold
+    /// fill on a busy runner fails the arm for a reason unrelated to the socket layer.
+    ///
+    /// # Panics
+    ///
+    /// If loopback cannot be bound.
+    pub async fn served_with_direct_client(
+        self,
+        limits: ListenLimits,
+    ) -> (Daemon, aws_sdk_s3::Client) {
         let listener = tokio::net::TcpListener::bind(LOOPBACK_ANY_PORT)
             .await
             .expect("binding loopback");
         let addr = listener.local_addr().expect("a bound port has an address");
+        let service = daemon_service(self.proxy);
+        let direct = sdk_client_for(service.clone(), placeholder_credentials());
         let shutdown = Shutdown::new();
         let task = tokio::spawn(pacer_daemon::listen::serve_s3_on(
             listener,
-            daemon_service(self.proxy),
+            service,
             limits,
             self.metrics.clone(),
             shutdown.signal(),
         ));
-        Daemon {
+        let daemon = Daemon {
             client: tcp_client(addr),
             backend: self.backend,
             metrics: self.metrics,
@@ -248,7 +267,8 @@ impl DaemonCore {
             shutdown: Some(shutdown),
             listener: Some(task),
             _dirs: self.dirs,
-        }
+        };
+        (daemon, direct)
     }
 }
 

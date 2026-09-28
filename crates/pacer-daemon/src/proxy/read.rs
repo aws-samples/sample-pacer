@@ -164,6 +164,18 @@ fn if_match_allows_cache(if_match: Option<&dto::ETagCondition>, header_etag: Opt
     header_etag.is_some_and(|ours| ours.trim_matches('"') == requested)
 }
 
+/// Whether a GET asks S3 to override any response header (`response-content-type` and
+/// its five siblings). S3 honours these on the object it returns; the cached path builds
+/// its response from the stored header alone, so it would ignore them without an error.
+fn overrides_response_headers(input: &dto::GetObjectInput) -> bool {
+    input.response_cache_control.is_some()
+        || input.response_content_disposition.is_some()
+        || input.response_content_encoding.is_some()
+        || input.response_content_language.is_some()
+        || input.response_content_type.is_some()
+        || input.response_expires.is_some()
+}
+
 impl PacerProxy {
     /// Whether this node is one of `cache_key`'s R co-homes — single-node (no
     /// cluster), or the ring ranks this node in the top-R for the key (ADR-0016
@@ -188,12 +200,22 @@ impl PacerProxy {
     /// unconditional bypass: `if_none_match` would have to answer 304, and the two
     /// date-based ones would have to compare a `Last-Modified` this cache does not treat as
     /// authoritative. None of the three is on the path that motivated ADR-0039.
+    ///
+    /// Three more shapes bypass because a cached answer would silently drop what they ask
+    /// S3 to do. `expected_bucket_owner` is a check only S3 can make — the caller's guard
+    /// against a bucket name now owned by another account — and a hit would answer 200
+    /// without it. `request_payer` acknowledges charges S3 has to see. And the
+    /// `response-*` overrides ([`overrides_response_headers`]) rewrite headers a cached
+    /// response is rebuilt without.
     fn cacheable_shape(input: &dto::GetObjectInput) -> bool {
         input.if_none_match.is_none()
             && input.if_modified_since.is_none()
             && input.if_unmodified_since.is_none()
             && input.version_id.is_none()
             && input.sse_customer_algorithm.is_none()
+            && input.expected_bucket_owner.is_none()
+            && input.request_payer.is_none()
+            && !overrides_response_headers(input)
     }
 
     /// Resolve the object header (length + response metadata) needed to compute
@@ -322,8 +344,9 @@ impl PacerProxy {
     /// chance to deliver into memory the client named instead of into a body.
     ///
     /// Anything the cache cannot reproduce byte for byte is handed to `inner`
-    /// untouched instead: a `Cache-Control` that bypasses, a conditional or
-    /// versioned or SSE-C shape ([`PacerProxy::cacheable_shape`]), or an object
+    /// untouched instead: a `Cache-Control` that bypasses, a conditional,
+    /// versioned, SSE-C, bucket-owner, requester-pays or response-override shape
+    /// ([`PacerProxy::cacheable_shape`]), or an object
     /// outside the admitted size band (ADR-0002's small-object bypass).
     ///
     /// # Errors

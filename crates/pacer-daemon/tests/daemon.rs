@@ -40,6 +40,8 @@
 //!   prevent.
 //! * [`fill_coalesce`] — ADR-0040's single flight: two clients on one cold chunk, counted
 //!   at the backend, with the knob off as the control.
+//! * [`get_bypass`] — the GET parameters a cached object cannot honour, each shown to
+//!   reach the backend from a warm cache.
 //! * [`write_framing`] — what the passthrough PUT puts on the wire, as a function of
 //!   what the client sent.
 //! * [`backend_matrix_s3`] — the arm that needs a real bucket. `#[ignore]`d, and it
@@ -61,6 +63,8 @@ mod correctness;
 mod delivery;
 #[path = "daemon/fill_coalesce.rs"]
 mod fill_coalesce;
+#[path = "daemon/get_bypass.rs"]
+mod get_bypass;
 #[path = "daemon/listener.rs"]
 mod listener;
 #[path = "daemon/scatter/mod.rs"]

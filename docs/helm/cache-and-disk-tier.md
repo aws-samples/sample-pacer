@@ -344,7 +344,10 @@ the condition can never legitimately fail. Set `false` for strict semantics: eve
 GET then bypasses, exactly as before ADR-0039.
 
 `if-none-match`, `if-modified-since`, `if-unmodified-since`, `versionId` and SSE-C still
-bypass unconditionally — unchanged, and not covered by this knob.
+bypass unconditionally — unchanged, and not covered by this knob. So do
+`x-amz-expected-bucket-owner`, `x-amz-request-payer` and the six `response-*` overrides: each
+asks S3 for something a cached response cannot do (an ownership check, a charge
+acknowledgement, a rewritten header).
 
 **How to confirm it engaged:** `pacer_conditional_get_served_total`. A client whose every GET
 is conditional looks identical in `pacer_cache_hits_total`/`pacer_cache_bypass_total` whether

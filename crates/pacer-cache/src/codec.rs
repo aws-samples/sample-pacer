@@ -298,12 +298,41 @@ mod tests {
         body: Bytes,
     }
 
+    /// `ObjectHeader`'s on-disk shape before issue #25 added
+    /// [`RepresentationHeaders`] — four fields, nothing more. Exists only to
+    /// prove what a header written by that shape does when this build (which
+    /// expects a fifth field) tries to decode it:
+    /// [`a_pre_representation_headers_entry_is_a_miss`].
+    #[derive(Serialize, Deserialize)]
+    struct MirrorHeaderV1 {
+        object_len: u64,
+        e_tag: Option<String>,
+        content_type: Option<String>,
+        last_modified_epoch_secs: Option<i64>,
+    }
+
+    /// [`MirrorValue`] over [`MirrorHeaderV1`] instead of the current
+    /// `ObjectHeader` — the pre-issue-25 enum, byte for byte.
+    #[derive(Serialize, Deserialize)]
+    enum MirrorValueV1 {
+        Header(MirrorHeaderV1),
+    }
+
     fn header() -> ObjectHeader {
+        let mut representation = crate::chunk::RepresentationHeaders {
+            content_encoding: Some("gzip".into()),
+            cache_control: Some("max-age=3600".into()),
+            ..Default::default()
+        };
+        representation
+            .metadata
+            .insert("owner".into(), "pacer".into());
         ObjectHeader::new(
             1 << 30,
             Some("\"deadbeef\"".into()),
             Some("application/octet-stream".into()),
             Some(1_700_000_000),
+            representation,
         )
     }
 
@@ -354,6 +383,30 @@ mod tests {
         let encoded = bincode::serialize(&MirrorValue::Header(header())).unwrap();
         let decoded = CacheValue::decode(&mut &encoded[..]).unwrap();
         assert_eq!(*decoded.as_header().unwrap(), header());
+    }
+
+    /// Issue #25's compatibility claim: a header a previous build cached, before
+    /// `RepresentationHeaders` existed, must come back as a **miss** on this
+    /// build — not a panic, and not an `ObjectHeader` silently missing the new
+    /// fields as if that were a real cache hit. Header decode delegates straight
+    /// to bincode (unlike a chunk's hand-rolled tag), so the new field simply
+    /// runs the reader out of bytes partway through: `CacheValue::decode` on the
+    /// old four-field bytes returns `Err`, which is what every call site
+    /// (`if let Ok(Some(entry)) = …`) and foyer's own disk-tier load already
+    /// treat as "not cached" rather than as a fatal error.
+    #[test]
+    fn a_pre_representation_headers_entry_is_a_miss() {
+        let old = MirrorHeaderV1 {
+            object_len: 1 << 30,
+            e_tag: Some("\"deadbeef\"".into()),
+            content_type: Some("application/octet-stream".into()),
+            last_modified_epoch_secs: Some(1_700_000_000),
+        };
+        let encoded = bincode::serialize(&MirrorValueV1::Header(old)).unwrap();
+        assert!(
+            CacheValue::decode(&mut &encoded[..]).is_err(),
+            "a pre-issue-25 header must be a miss, not decode with defaulted fields"
+        );
     }
 
     /// An unversioned chunk must still write tag 1, not merely decode as one:
@@ -538,6 +591,11 @@ mod proptests {
     /// property above and by [`MAX_DECODABLE_CHUNK`]/[`MAX_DECODABLE_ETAG`]).
     const MAX_FUZZ_TAIL_BYTES: usize = 64;
 
+    /// Upper bound on generated `x-amz-meta-*` entries. A real object rarely
+    /// carries more than a handful; this only needs to exercise a non-empty
+    /// map plus the empty one, not model S3's actual (much larger) limit.
+    const MAX_PROPTEST_METADATA_ENTRIES: usize = 4;
+
     /// A chunk body: arbitrary bytes, bounded by [`MAX_PROPTEST_BODY_BYTES`].
     fn body_strategy() -> impl Strategy<Value = Bytes> {
         prop::collection::vec(any::<u8>(), 0..=MAX_PROPTEST_BODY_BYTES).prop_map(Bytes::from)
@@ -553,6 +611,43 @@ mod proptests {
             .prop_map(|chars| chars.into_iter().collect())
     }
 
+    /// An arbitrary [`crate::chunk::RepresentationHeaders`], including a small
+    /// `x-amz-meta-*` map — bounded the same way [`short_string_strategy`]
+    /// bounds a single string, so a header's total encoded size stays well
+    /// under any real limit here too.
+    fn representation_headers_strategy(
+    ) -> impl Strategy<Value = crate::chunk::RepresentationHeaders> {
+        (
+            prop::collection::btree_map(
+                short_string_strategy(),
+                short_string_strategy(),
+                0..=MAX_PROPTEST_METADATA_ENTRIES,
+            ),
+            prop::option::of(short_string_strategy()),
+            prop::option::of(short_string_strategy()),
+            prop::option::of(short_string_strategy()),
+            prop::option::of(short_string_strategy()),
+            prop::option::of(any::<i64>()),
+        )
+            .prop_map(
+                |(
+                    metadata,
+                    content_encoding,
+                    content_disposition,
+                    content_language,
+                    cache_control,
+                    expires_epoch_secs,
+                )| crate::chunk::RepresentationHeaders {
+                    metadata,
+                    content_encoding,
+                    content_disposition,
+                    content_language,
+                    cache_control,
+                    expires_epoch_secs,
+                },
+            )
+    }
+
     /// An arbitrary [`ObjectHeader`].
     fn object_header_strategy() -> impl Strategy<Value = ObjectHeader> {
         (
@@ -560,10 +655,17 @@ mod proptests {
             prop::option::of(short_string_strategy()),
             prop::option::of(short_string_strategy()),
             prop::option::of(any::<i64>()),
+            representation_headers_strategy(),
         )
             .prop_map(
-                |(object_len, e_tag, content_type, last_modified_epoch_secs)| {
-                    ObjectHeader::new(object_len, e_tag, content_type, last_modified_epoch_secs)
+                |(object_len, e_tag, content_type, last_modified_epoch_secs, representation)| {
+                    ObjectHeader::new(
+                        object_len,
+                        e_tag,
+                        content_type,
+                        last_modified_epoch_secs,
+                        representation,
+                    )
                 },
             )
     }

@@ -52,6 +52,10 @@ pub use cluster::Cluster;
 pub(crate) use cluster::chunk_sources;
 pub use fill::FillRegistry;
 pub(crate) use fill::{forget_fenced, insert_fenced, FillGuard};
+// The scatter path's inline post-Complete HEAD (`coordinate::write_header`) shares
+// this mapping with the read path's cache-miss HEAD, so both build an
+// `ObjectHeader` the same way — see the issue #25 note on `object_header_from_head`.
+pub(crate) use read::object_header_from_head;
 
 /// The S3 service implementation: cache policy in front of a re-signing proxy.
 pub struct PacerProxy {

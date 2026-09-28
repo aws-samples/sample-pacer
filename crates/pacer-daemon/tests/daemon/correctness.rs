@@ -1290,3 +1290,116 @@ async fn the_knob_restores_the_unconditional_bypass() {
     );
     assert_eq!(h.metrics.conditional_get_served.get(), 0);
 }
+
+/// Issue #25: a GET on the cached path must return the same header set a HEAD
+/// of the same object does — checksums excepted, which `PacerProxy::cacheable_shape`'s
+/// own doc names as deliberate (S3 checksums are validated once and this cache
+/// does not carry them). Before the fix, `ObjectHeader` stored only length,
+/// ETag, Content-Type and Last-Modified, so every header below was silently
+/// dropped on a hit even though the *miss* path's backend HeadObject had them.
+///
+/// Exercised on both a cold GET (a cache miss, so this also pins that the miss
+/// path already agreed with HEAD) and a warm one (a cache hit, the shape that
+/// was actually broken), against the object length band's `Standard` case only
+/// — `pacer_backend::BackendType` doesn't change how a header is built.
+#[tokio::test]
+async fn cached_get_headers_match_head() {
+    let h = harness().await;
+    let len = (MIN_OBJECT_SIZE + 4096) as usize;
+    let body = big_body(9, len);
+    h.client
+        .put_object()
+        .bucket(BUCKET)
+        .key("headers.bin")
+        .body(ByteStream::from(body))
+        .content_type("application/x-pacer-test")
+        .content_encoding("identity")
+        .content_disposition("attachment; filename=\"headers.bin\"")
+        .content_language("en-US")
+        .cache_control("max-age=3600")
+        .expires(aws_sdk_s3::primitives::DateTime::from_secs(2_000_000_000))
+        .metadata("owner", "pacer")
+        .metadata("issue", "25")
+        .send()
+        .await
+        .unwrap();
+    let n_chunks = chunks_for(len);
+
+    let head = h
+        .client
+        .head_object()
+        .bucket(BUCKET)
+        .key("headers.bin")
+        .send()
+        .await
+        .unwrap();
+
+    // Cold GET: a cache miss, whose header comes from the very HeadObject the
+    // call above just made a second copy of.
+    let cold = h
+        .client
+        .get_object()
+        .bucket(BUCKET)
+        .key("headers.bin")
+        .send()
+        .await
+        .unwrap();
+    assert_get_headers_match_head(&head, &cold);
+    cold.body.collect().await.unwrap();
+    wait_for_fills(&h.metrics, n_chunks).await;
+
+    // Warm GET: served from the cached header this fix extends — the shape
+    // issue #25 is about.
+    let warm = h
+        .client
+        .get_object()
+        .bucket(BUCKET)
+        .key("headers.bin")
+        .send()
+        .await
+        .unwrap();
+    assert_get_headers_match_head(&head, &warm);
+    warm.body.collect().await.unwrap();
+    assert_eq!(
+        h.metrics.cache_hits.get(),
+        n_chunks,
+        "the second GET must be a real hit"
+    );
+}
+
+/// The comparison [`cached_get_headers_match_head`] runs against both a cold
+/// and a warm GET. `Expires` compares through `expires_string` (the raw,
+/// unparsed value) rather than the typed `expires` accessor: both SDK types
+/// deprecate the latter in favour of the former, and the workspace's clippy
+/// gate (`dev build lint`) turns that deprecation warning into a build
+/// failure if either side of this comparison used it.
+fn assert_get_headers_match_head(
+    head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+    got: &aws_sdk_s3::operation::get_object::GetObjectOutput,
+) {
+    assert_eq!(got.e_tag(), head.e_tag(), "ETag");
+    assert_eq!(got.content_type(), head.content_type(), "Content-Type");
+    assert_eq!(got.last_modified(), head.last_modified(), "Last-Modified");
+    assert_eq!(
+        got.content_encoding(),
+        head.content_encoding(),
+        "Content-Encoding"
+    );
+    assert_eq!(
+        got.content_disposition(),
+        head.content_disposition(),
+        "Content-Disposition"
+    );
+    assert_eq!(
+        got.content_language(),
+        head.content_language(),
+        "Content-Language"
+    );
+    assert_eq!(got.cache_control(), head.cache_control(), "Cache-Control");
+    assert_eq!(got.expires_string(), head.expires_string(), "Expires");
+    assert_eq!(
+        got.metadata(),
+        head.metadata(),
+        "user metadata (x-amz-meta-*)"
+    );
+}

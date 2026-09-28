@@ -711,7 +711,13 @@ mod tests {
         let chunk_key = object_key("bucket", "obj#100:0");
         cache.insert(
             object_key("bucket", "obj"),
-            CacheValue::Header(ObjectHeader::new(4096, Some("etag".into()), None, None)),
+            CacheValue::Header(ObjectHeader::new(
+                4096,
+                Some("etag".into()),
+                None,
+                None,
+                Default::default(),
+            )),
         );
         cache.insert(chunk_key.clone(), CacheValue::Chunk(chunk_of(3, CHUNK)));
         cache.close().await.unwrap();
@@ -750,6 +756,7 @@ mod tests {
                 Some("etag".into()),
                 None,
                 None,
+                Default::default(),
             )))
             .expect("a disk-only insert must be admitted");
         drop(entry);
@@ -807,7 +814,13 @@ mod tests {
             (chunk_key.clone(), CacheValue::Chunk(chunk_of(0x5a, CHUNK))),
             (
                 header_key.clone(),
-                CacheValue::Header(ObjectHeader::new(4096, Some("etag".into()), None, None)),
+                CacheValue::Header(ObjectHeader::new(
+                    4096,
+                    Some("etag".into()),
+                    None,
+                    None,
+                    Default::default(),
+                )),
             ),
         ] {
             drop(

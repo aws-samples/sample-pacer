@@ -557,6 +557,12 @@ impl PeerTransport for GrpcTransport {
                 e_tag: offer.e_tag.map(ToOwned::to_owned),
                 content_type: offer.content_type.map(ToOwned::to_owned),
                 last_modified_epoch_secs: offer.last_modified_epoch_secs,
+                content_encoding: offer.content_encoding.map(ToOwned::to_owned),
+                content_disposition: offer.content_disposition.map(ToOwned::to_owned),
+                content_language: offer.content_language.map(ToOwned::to_owned),
+                cache_control: offer.cache_control.map(ToOwned::to_owned),
+                expires_epoch_secs: offer.expires_epoch_secs,
+                metadata: offer.metadata.into_iter().collect(),
             })
             .await
             .map_err(|s| TransportError::PeerUnavailable(s.to_string()))?

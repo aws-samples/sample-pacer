@@ -17,11 +17,10 @@
 //! buffer, so there is no ordering constraint to bound the look-ahead with.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
 use pacer_cache::chunk::ObjectHeader;
 use pacer_cache::object_key;
-use s3s::dto::{self, ETag, Timestamp};
+use s3s::dto::{self, ETag};
 use s3s::{S3Response, S3Result};
 use tracing::trace;
 
@@ -32,6 +31,7 @@ use crate::delivery::{
 
 use super::fill::FillCtx;
 use super::place::{digest_delivered, Placement};
+use super::read::{representation_output_fields, timestamp_from_epoch_secs};
 use super::target::ClientMemory;
 use super::PacerProxy;
 
@@ -378,9 +378,6 @@ impl PacerProxy {
         delivered: u64,
         checksum: Option<&str>,
     ) -> S3Response<dto::GetObjectOutput> {
-        let last_modified = header.last_modified_epoch_secs.map(|s| {
-            Timestamp::from(SystemTime::UNIX_EPOCH + Duration::from_secs(s.max(0) as u64))
-        });
         let mut resp = S3Response::new(dto::GetObjectOutput {
             body: None,
             accept_ranges: Some("bytes".to_owned()),
@@ -395,8 +392,10 @@ impl PacerProxy {
             }),
             content_type: header.content_type.clone(),
             e_tag: header.e_tag.clone().map(ETag::Strong),
-            last_modified,
-            ..Default::default()
+            last_modified: header
+                .last_modified_epoch_secs
+                .map(timestamp_from_epoch_secs),
+            ..representation_output_fields(&header.representation)
         });
         resp.headers.insert(
             hyper::header::HeaderName::from_static(DELIVERED_HEADER),

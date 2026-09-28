@@ -478,15 +478,31 @@ message StoreHeaderRequest {
   // Object cache key, "{bucket}/{key}" — the plain key, no `#{size}:{index}`
   // suffix, so it never collides with a chunk key (see pacer-cache::chunk).
   string cache_key = 1;
-  // The four ObjectHeader fields (pacer-cache::chunk::ObjectHeader): enough to
-  // compute a covering chunk set and replay the GET response headers.
+  // ObjectHeader's own fields (pacer-cache::chunk::ObjectHeader), plus its
+  // RepresentationHeaders below (issue #25): enough to compute a covering
+  // chunk set and replay every GET response header this cache is entitled to
+  // reproduce.
   uint64 object_len = 2;
   // The composite ETag Complete minted ("…-N"), the header's version witness.
   optional string e_tag = 3;
   optional string content_type = 4;
-  // Seconds since epoch. Absent today: CompleteMultipartUpload does not return
-  // Last-Modified (issue #25 tracks recovering it).
+  // Seconds since epoch. The sender resolves this (and every field below)
+  // from a post-Complete `HeadObject` it confirmed against `e_tag` above
+  // before building this message at all (issue #25) — `None` here means the
+  // backend's Last-Modified was itself absent, not that nothing tried.
   optional int64 last_modified_epoch_secs = 5;
+  // RepresentationHeaders (issue #25) — pacer-cache::chunk::RepresentationHeaders,
+  // field for field. New in this message: a peer built before these existed
+  // sends none of them, and proto3's defaults (unset optional, empty map) are
+  // exactly what an old sender's absence should decode to — never an error,
+  // and never confused with an object that truly carries none of them, which
+  // decodes identically.
+  optional string content_encoding = 6;
+  optional string content_disposition = 7;
+  optional string content_language = 8;
+  optional string cache_control = 9;
+  optional int64 expires_epoch_secs = 10;
+  map<string, string> metadata = 11;
 }
 
 message StoreHeaderResponse {

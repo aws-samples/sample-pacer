@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures::StreamExt;
-use pacer_cache::chunk::{CachedChunk, ObjectHeader};
+use pacer_cache::chunk::{CachedChunk, ObjectHeader, RepresentationHeaders};
 use pacer_cache::tier::ChunkTier;
 use pacer_cache::{
     object_key, read_decision, resolve_range, should_admit, CacheValue, ReadDecision,
@@ -97,14 +97,85 @@ pub(super) async fn header_for(
         .content_length()
         .and_then(|l| u64::try_from(l).ok())
         .ok_or_else(|| s3_error!(InternalError, "backend HeadObject without content length"))?;
-    let header = ObjectHeader::new(
+    Ok((object_header_from_head(&head, object_len), false))
+}
+
+/// Map a backend `HeadObjectOutput` onto an [`ObjectHeader`], `object_len`
+/// taken separately because a scatter's inline post-Complete `HeadObject`
+/// ([`crate::coordinate`]) already knows it from the multipart upload and a
+/// `HeadObject` run concurrently with a client's own overwrite could
+/// otherwise report a length for a *different* version than the ETag this
+/// header is about to carry.
+///
+/// The one mapping every caller shares: [`header_for`]'s cache-miss HEAD and
+/// the scatter path's inline post-Complete `HeadObject` both need it, and issue #25 is
+/// exactly the bug that opened up when a second call site built an
+/// `ObjectHeader` by hand instead of reusing this one.
+pub(crate) fn object_header_from_head(
+    head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+    object_len: u64,
+) -> ObjectHeader {
+    let representation = RepresentationHeaders {
+        metadata: head
+            .metadata()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default(),
+        content_encoding: head.content_encoding().map(str::to_owned),
+        content_disposition: head.content_disposition().map(str::to_owned),
+        content_language: head.content_language().map(str::to_owned),
+        cache_control: head.cache_control().map(str::to_owned),
+        // `expires_string`, not the deprecated `expires`: the raw value, reparsed
+        // through the same HTTP-date grammar `header_from_probe` uses, so a
+        // header built from a `HeadObjectOutput` and one built from raw HTTP
+        // headers agree on what an unparseable Expires means (`None`, not a
+        // deprecation warning promoted to an error under `-D warnings`).
+        expires_epoch_secs: head.expires_string().and_then(parse_http_date),
+    };
+    ObjectHeader::new(
         object_len,
         head.e_tag().map(|e| e.trim_matches('"').to_owned()),
         head.content_type().map(str::to_owned),
         head.last_modified()
             .map(aws_sdk_s3::primitives::DateTime::secs),
-    );
-    Ok((header, false))
+        representation,
+    )
+}
+
+/// Convert epoch seconds — how [`ObjectHeader`] stores both Last-Modified and
+/// Expires — into an s3s [`Timestamp`]. Shared by the two fields precisely
+/// because they use the same on-disk encoding.
+pub(crate) fn timestamp_from_epoch_secs(secs: i64) -> Timestamp {
+    Timestamp::from(SystemTime::UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64))
+}
+
+/// The issue #25 fields of a `GetObjectOutput`, built from `header`'s
+/// representation headers. Meant as a `..` base for a caller that also sets
+/// `body`/`content_range`/`content_type`/`e_tag`/`last_modified` — [`get_output`]
+/// and `deliver::delivered_output` both do — so this mapping is written once.
+///
+/// An empty metadata map becomes `None`, matching a real backend, which sends
+/// no `x-amz-meta-*` header at all when an object carries none.
+pub(crate) fn representation_output_fields(
+    representation: &RepresentationHeaders,
+) -> dto::GetObjectOutput {
+    let metadata = (!representation.metadata.is_empty()).then(|| {
+        representation
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    });
+    dto::GetObjectOutput {
+        metadata,
+        content_encoding: representation.content_encoding.clone(),
+        content_disposition: representation.content_disposition.clone(),
+        content_language: representation.content_language.clone(),
+        cache_control: representation.cache_control.clone(),
+        expires: representation
+            .expires_epoch_secs
+            .map(timestamp_from_epoch_secs),
+        ..Default::default()
+    }
 }
 
 /// Whether a GET's `If-Match` permits serving from the cache, given the ETag this node
@@ -323,9 +394,6 @@ impl PacerProxy {
         let content_length = end - start;
         let content_range =
             ranged.then(|| format!("bytes {}-{}/{}", start, end - 1, header.object_len));
-        let last_modified = header.last_modified_epoch_secs.map(|s| {
-            Timestamp::from(SystemTime::UNIX_EPOCH + Duration::from_secs(s.max(0) as u64))
-        });
         let output = dto::GetObjectOutput {
             body: Some(body),
             accept_ranges: Some("bytes".to_owned()),
@@ -333,8 +401,10 @@ impl PacerProxy {
             content_range,
             content_type: header.content_type.clone(),
             e_tag: header.e_tag.clone().map(ETag::Strong),
-            last_modified,
-            ..Default::default()
+            last_modified: header
+                .last_modified_epoch_secs
+                .map(timestamp_from_epoch_secs),
+            ..representation_output_fields(&header.representation)
         };
         S3Response::new(output)
     }
@@ -764,24 +834,84 @@ fn header_from_probe(resp: &crate::authz::HeldResponse) -> S3Result<ObjectHeader
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let last_modified_epoch_secs = resp
-        .headers
-        .get(hyper::header::LAST_MODIFIED)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            aws_sdk_s3::primitives::DateTime::from_str(
-                v,
-                aws_sdk_s3::primitives::DateTimeFormat::HttpDate,
-            )
-            .ok()
-        })
-        .map(|dt| dt.secs());
+    let last_modified_epoch_secs =
+        http_date_epoch_secs(&resp.headers, hyper::header::LAST_MODIFIED);
     Ok(ObjectHeader::new(
         object_len,
         e_tag,
         content_type,
         last_modified_epoch_secs,
+        representation_from_headers(&resp.headers),
     ))
+}
+
+/// Parse an HTTP-date header (RFC 9110 § 5.6.7) into epoch seconds — the shape
+/// [`RepresentationHeaders::expires_epoch_secs`] and this function's own
+/// Last-Modified caller both want, so the date grammar is accepted in exactly
+/// one place.
+fn http_date_epoch_secs(
+    headers: &hyper::HeaderMap,
+    name: hyper::header::HeaderName,
+) -> Option<i64> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_http_date)
+}
+
+/// Parse one HTTP-date value (RFC 9110 § 5.6.7) into epoch seconds. The one
+/// place this grammar is accepted: [`http_date_epoch_secs`] (a header map) and
+/// [`object_header_from_head`] (a `HeadObjectOutput`'s raw `expires_string`,
+/// read that way specifically to avoid the deprecated, pre-parsed `expires`)
+/// both go through it, so a value neither can parse means the same thing —
+/// `None` — everywhere.
+fn parse_http_date(value: &str) -> Option<i64> {
+    aws_sdk_s3::primitives::DateTime::from_str(
+        value,
+        aws_sdk_s3::primitives::DateTimeFormat::HttpDate,
+    )
+    .ok()
+    .map(|dt| dt.secs())
+}
+
+/// [`RepresentationHeaders`] read off a raw HTTP response — the shape a
+/// requester-mode authorization probe returns
+/// ([`crate::authz::HeldResponse`]), as opposed to the typed
+/// `HeadObjectOutput` [`object_header_from_head`] reads. The probe is a real
+/// ranged GET forwarded with the caller's own signature (ADR-0041 § 2.4), so
+/// the backend's full header set — including `x-amz-meta-*` — arrives on
+/// `resp.headers` exactly as S3 sent it; this is that response's counterpart
+/// to [`object_header_from_head`], not a lesser version of it.
+///
+/// `x-amz-meta-*` is matched by prefix and stored by its suffix, the same
+/// shape `HeadObjectOutput::metadata` already normalises to.
+fn representation_from_headers(headers: &hyper::HeaderMap) -> RepresentationHeaders {
+    /// The one HTTP header prefix S3 uses for user metadata. Matched
+    /// case-sensitively because every header name reaching this proxy over
+    /// HTTP/1.1 or HTTP/2 already arrives lower-cased (RFC 9113 § 8.2.1;
+    /// `hyper` lower-cases HTTP/1.1 names on receipt too).
+    const AMZ_META_PREFIX: &str = "x-amz-meta-";
+    let metadata = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let suffix = name.as_str().strip_prefix(AMZ_META_PREFIX)?;
+            Some((suffix.to_owned(), value.to_str().ok()?.to_owned()))
+        })
+        .collect();
+    let header_str = |name: hyper::header::HeaderName| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    RepresentationHeaders {
+        metadata,
+        content_encoding: header_str(hyper::header::CONTENT_ENCODING),
+        content_disposition: header_str(hyper::header::CONTENT_DISPOSITION),
+        content_language: header_str(hyper::header::CONTENT_LANGUAGE),
+        cache_control: header_str(hyper::header::CACHE_CONTROL),
+        expires_epoch_secs: http_date_epoch_secs(headers, hyper::header::EXPIRES),
+    }
 }
 
 /// Resolve a request's optional HTTP range into a byte range `[start, end)`

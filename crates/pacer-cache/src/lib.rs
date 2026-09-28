@@ -797,6 +797,7 @@ mod tests {
             e_tag: Some("etag".into()),
             content_type: None,
             last_modified_epoch_secs: None,
+            representation: chunk::RepresentationHeaders::default(),
         });
         let body = Bytes::from(vec![0u8; 4096]);
         let chunk = CacheValue::Chunk(chunk::CachedChunk::new(body));

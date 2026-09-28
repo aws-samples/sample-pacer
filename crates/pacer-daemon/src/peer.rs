@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use pacer_cache::chunk::{CachedChunk, ChunkConfig, ObjectHeader};
+use pacer_cache::chunk::{CachedChunk, ChunkConfig, ObjectHeader, RepresentationHeaders};
 use pacer_cache::tier::ChunkTier;
 use pacer_cache::{object_key_parts, CacheValue, Promotion};
 use pacer_proto::v1::peer_server::{Peer, PeerServer};
@@ -1250,11 +1250,25 @@ impl Peer for PacerPeer {
             debug!(key = %req.cache_key, "declined a header this node does not home");
             return Ok(Response::new(StoreHeaderResponse { stored: false }));
         }
+        // proto3's own defaults are the compatibility story here: a peer built
+        // before issue #25 added these fields never sets them, so an unset
+        // `optional` decodes to `None` and the absent `map` decodes empty —
+        // this reconstructs the same `RepresentationHeaders::default()` an old
+        // sender's offer always meant, never an error.
+        let representation = RepresentationHeaders {
+            metadata: req.metadata.into_iter().collect(),
+            content_encoding: req.content_encoding,
+            content_disposition: req.content_disposition,
+            content_language: req.content_language,
+            cache_control: req.cache_control,
+            expires_epoch_secs: req.expires_epoch_secs,
+        };
         let header = ObjectHeader::new(
             req.object_len,
             req.e_tag,
             req.content_type,
             req.last_modified_epoch_secs,
+            representation,
         );
         self.tier
             .cache()

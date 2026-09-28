@@ -245,7 +245,7 @@ mod tests {
         let cache = foyer_cache(dir.path()).await;
         let tier = ChunkTier::with_store(cache, store_of(dir.path()).await, Promotion::OnDiskHit);
         let key = object_key("bucket", "obj");
-        let header = ObjectHeader::new(4096, Some("etag".into()), None, None);
+        let header = ObjectHeader::new(4096, Some("etag".into()), None, None, Default::default());
         tier.cache()
             .insert(key.clone(), CacheValue::Header(header.clone()));
         let got = tier.cache().get(&key).await.unwrap().unwrap();

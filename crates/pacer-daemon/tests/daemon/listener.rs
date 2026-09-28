@@ -19,7 +19,10 @@ use pacer_daemon::listen::ListenLimits;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::common::{self, daemon_core, CacheSpec, Daemon, DaemonSpec, BUCKET, PATIENCE, SETTLE};
+use crate::common::{
+    self, daemon_core, wait_for_fills, CacheSpec, Daemon, DaemonCore, DaemonSpec, BUCKET, PATIENCE,
+    SETTLE,
+};
 
 /// Below every object these tests write, so nothing is bypassed as "too small to
 /// cache" — the point is to exercise the socket, not the admission policy.
@@ -85,6 +88,11 @@ const IN_FLIGHT_CHUNKS: u64 = 8;
 /// [`STREAMED_CHUNKS`] chunks and none of its assertions is about residency, so a
 /// tighter tier keeps the arm cheap without changing what it proves.
 async fn server(limits: ListenLimits) -> Daemon {
+    core().await.served(limits).await
+}
+
+/// The stack [`server`] serves, before a shape is chosen.
+async fn core() -> DaemonCore {
     daemon_core(DaemonSpec {
         min_object_size: MIN_OBJECT_SIZE,
         max_object_size: None,
@@ -96,8 +104,6 @@ async fn server(limits: ListenLimits) -> Daemon {
         },
         ..DaemonSpec::default()
     })
-    .await
-    .served(limits)
     .await
 }
 
@@ -265,18 +271,28 @@ async fn incomplete_request_head_is_closed() {
 /// before a single piece arrived, which is a property of the fill path and not the
 /// thing this arm tests. One unpaced GET first puts every chunk in the memory tier
 /// (sized to hold the whole object), so the paced run measures the socket layer.
+///
+/// **The warm-up goes in process, not over the port.** Over the port it was itself
+/// under [`IDLE_UNDER_LOAD`], so the cold fill the paragraph above moves out of the
+/// paced run still had to finish inside the deadline — and on a shared CI runner
+/// running the whole daemon binary at once it took ~8 s and cut the warm-up (GitHub
+/// Actions run 36406223928). The direct client reaches the same proxy and tier with no
+/// socket, so the fill's duration can no longer fail this arm; the wait for its fills
+/// to settle keeps the paced GET from racing a tee that has not landed yet.
 #[tokio::test]
 async fn active_transfer_survives_a_short_idle_deadline() {
-    let mut server = server(ListenLimits {
-        max_connections: 8,
-        header_timeout: LONG_TIMEOUT,
-        idle_timeout: IDLE_UNDER_LOAD,
-    })
-    .await;
+    let (mut server, direct) = core()
+        .await
+        .served_with_direct_client(ListenLimits {
+            max_connections: 8,
+            header_timeout: LONG_TIMEOUT,
+            idle_timeout: IDLE_UNDER_LOAD,
+        })
+        .await;
     let body = server.seed_chunks("streamed", STREAMED_CHUNKS).await;
     let client = server.client.clone();
 
-    let warm = client
+    let warm = direct
         .get_object()
         .bucket(BUCKET)
         .key("streamed")
@@ -289,6 +305,8 @@ async fn active_transfer_survives_a_short_idle_deadline() {
         .expect("warm-up body must arrive")
         .into_bytes();
     assert_eq!(warm, body, "warm-up must return the object unchanged");
+    wait_for_fills(&server.metrics, STREAMED_CHUNKS).await;
+    let fills_after_warm_up = server.metrics.fills_completed.get();
 
     let response = client
         .get_object()
@@ -317,6 +335,11 @@ async fn active_transfer_survives_a_short_idle_deadline() {
     );
     assert_eq!(received.len(), body.len(), "whole object must arrive");
     assert_eq!(Bytes::from(received), body, "bytes must be unchanged");
+    assert_eq!(
+        server.metrics.fills_completed.get(),
+        fills_after_warm_up,
+        "the paced GET must be served warm, or it is measuring the fill path again"
+    );
 
     server.shutdown_quietly().await;
 }

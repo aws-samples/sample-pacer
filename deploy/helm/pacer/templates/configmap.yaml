@@ -275,6 +275,10 @@ data:
         {{- range .Values.auth.requester.s3Domains }}
         - {{ . | quote }}
         {{- end }}
+      {{- if not (include "pacer.populateOnWrite" .) }}
+      # The write tee is off: writes are forwarded and populate nothing (planning/30).
+      populate-on-write: false
+      {{- end }}
       {{- if include "pacer.tlsEnabled" . }}
       # The daemon's own certificate, from auth.requester.tls.secretName (ADR-0041 § 9).
       tls:

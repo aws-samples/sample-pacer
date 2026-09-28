@@ -32,6 +32,8 @@
 //!   signature ever crossing the peer plane.
 //! * [`authz_forward`] — ADR-0041 step 2: `requester` mode's `CONNECT` refusal and its
 //!   byte-transparent forward, over real TCP against an in-process fake upstream.
+//! * [`authz_requester_write`] — planning/30: requester mode's write tee, against a fake S3
+//!   that stores what it is sent — PUT, multipart, aws-chunked, failed Complete, overwrite.
 //! * [`authz_requester_get`] — ADR-0041 step 3: strip-and-hold, the authorization
 //!   probe, the held-signature chunk fill, and the signed-range bypass — a full
 //!   `requester`-mode daemon over real TCP against an in-process fake S3.
@@ -63,6 +65,8 @@ mod authz_cluster;
 mod authz_forward;
 #[path = "daemon/authz_requester_get.rs"]
 mod authz_requester_get;
+#[path = "daemon/authz_requester_write.rs"]
+mod authz_requester_write;
 #[path = "daemon/backend_matrix_s3.rs"]
 mod backend_matrix_s3;
 #[path = "daemon/backend_retry.rs"]

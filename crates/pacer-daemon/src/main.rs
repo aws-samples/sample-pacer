@@ -325,12 +325,13 @@ async fn run(
     // drains instead of severing in-flight requests (ADR-0036).
     let shutdown = shutdown::Shutdown::new();
     let mut tasks = ClusterTasks::default();
+    let staging = scatter_staging(&cfg);
     if let Some(cluster_cfg) = &cfg.cluster {
         (proxy, tasks) = enable_cluster(
             &cfg,
             cluster_cfg,
             proxy,
-            (tier.clone(), backend),
+            (tier.clone(), backend, staging.clone()),
             &metrics,
             &rdma_runtime,
             shutdown.signal(),
@@ -343,7 +344,12 @@ async fn run(
     assert_store_has_a_slab(&tier)?;
 
     let admin = tokio::spawn(health::serve(cfg.admin_addr.clone(), metrics.clone()));
-    let mut s3 = spawn_s3_listener(proxy, &cfg, metrics.clone(), shutdown.signal())?;
+    let mut s3 = spawn_s3_listener(
+        proxy,
+        &cfg,
+        (metrics.clone(), shutdown.signal()),
+        (tier.clone(), staging),
+    )?;
 
     info!(admin = %cfg.admin_addr, s3 = %cfg.listen_addr, "pacer-daemon up");
     // A shutdown signal is the ONE orderly exit. Any server task ending on its
@@ -596,7 +602,11 @@ fn enable_cluster(
     cfg: &config::Config,
     cluster_cfg: &config::ClusterConfig,
     proxy: proxy::PacerProxy,
-    (tier, backend): (pacer_cache::tier::ChunkTier, aws_sdk_s3::Client),
+    (tier, backend, staging): (
+        pacer_cache::tier::ChunkTier,
+        aws_sdk_s3::Client,
+        Option<Arc<StagingArea>>,
+    ),
     metrics: &metrics::Metrics,
     #[cfg_attr(not(feature = "efa"), allow(unused_variables))]
     rdma_runtime: &tokio::runtime::Handle,
@@ -672,7 +682,6 @@ fn enable_cluster(
         #[cfg(feature = "efa")]
         efa: efa.clone(),
     };
-    let staging = scatter_staging(cfg);
     let proxy = attach_scatter(
         proxy
             .with_chunk_fill(chunk_fill.clone())
@@ -1119,8 +1128,8 @@ fn build_s3_service(proxy: proxy::PacerProxy, cfg: &config::Config) -> s3s::serv
 fn spawn_s3_listener(
     proxy: proxy::PacerProxy,
     cfg: &config::Config,
-    metrics: metrics::Metrics,
-    shutdown: shutdown::ShutdownSignal,
+    (metrics, shutdown): (metrics::Metrics, shutdown::ShutdownSignal),
+    (tier, staging): (pacer_cache::tier::ChunkTier, Option<Arc<StagingArea>>),
 ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
     match cfg.auth_mode {
         auth::AuthMode::Node => {
@@ -1133,8 +1142,41 @@ fn spawn_s3_listener(
                 shutdown,
             )))
         }
-        auth::AuthMode::Requester => spawn_requester_listener(proxy, cfg, metrics, shutdown),
+        auth::AuthMode::Requester => {
+            let tee = write_tee(&proxy, cfg, tier, staging, &metrics);
+            spawn_requester_listener(proxy, cfg, (metrics, shutdown), tee)
+        }
     }
+}
+
+/// Requester mode's write tee (planning/30), when `populate_on_write` is on and a staging
+/// area exists for it. It shares that area with the peer server on a cluster, where the peer
+/// server's reaper guards it; a single node starts its own reaper here, or windows of uploads
+/// that never completed would hold the budget until restart.
+fn write_tee(
+    proxy: &proxy::PacerProxy,
+    cfg: &config::Config,
+    tier: pacer_cache::tier::ChunkTier,
+    staging: Option<Arc<StagingArea>>,
+    metrics: &metrics::Metrics,
+) -> Option<pacer_daemon::populate::WriteTee> {
+    let staging = staging.filter(|_| cfg.populate_on_write)?;
+    if cfg.cluster.is_none() {
+        tokio::spawn(reap_staged(Arc::clone(&staging), cfg.scatter.staging_ttl));
+    }
+    info!(
+        windows_in_flight = cfg.scatter.windows_in_flight,
+        "requester mode: teeing writes into the cache (planning/30)"
+    );
+    Some(pacer_daemon::populate::WriteTee::new(
+        staging,
+        proxy.cluster().cloned(),
+        tier,
+        cfg.chunk,
+        cfg.scatter.windows_in_flight,
+        cfg.scatter.staging_ttl,
+        metrics.clone(),
+    ))
 }
 
 /// `requester` mode's variant of [`spawn_s3_listener`] (ADR-0041): wrap
@@ -1150,8 +1192,8 @@ fn spawn_s3_listener(
 fn spawn_requester_listener(
     proxy: proxy::PacerProxy,
     cfg: &config::Config,
-    metrics: metrics::Metrics,
-    shutdown: shutdown::ShutdownSignal,
+    (metrics, shutdown): (metrics::Metrics, shutdown::ShutdownSignal),
+    tee: Option<pacer_daemon::populate::WriteTee>,
 ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
     let build_domains = || -> anyhow::Result<s3s::host::MultiDomain> {
         s3s::host::MultiDomain::new(&cfg.auth_s3_domains)
@@ -1163,12 +1205,15 @@ fn spawn_requester_listener(
     let mut b = S3ServiceBuilder::new(proxy::RequesterS3::new(proxy, Arc::clone(&forwarder)));
     b.set_host(build_domains()?);
     let inner = b.build();
-    let front = authz::RequesterFront::new(
+    let mut front = authz::RequesterFront::new(
         inner,
         Arc::new(build_domains()?),
         forwarder,
         metrics.clone(),
     );
+    if let Some(tee) = tee {
+        front = front.with_write_tee(tee);
+    }
     let plain = listen::serve_s3(
         cfg.listen_addr.clone(),
         front.clone(),
@@ -1367,7 +1412,12 @@ fn attach_staging(
 fn scatter_staging(config: &config::Config) -> Option<Arc<StagingArea>> {
     let cfg = &config.scatter;
     let requester = config.auth_mode == auth::AuthMode::Requester;
-    if !cfg.enabled && !requester {
+    let clustered = config.cluster.is_some();
+    // A cluster node stages for the scatter or for requester mode's peers; any requester
+    // node stages for its own write tee (planning/30).
+    let wanted =
+        (clustered && (cfg.enabled || requester)) || (requester && config.populate_on_write);
+    if !wanted {
         return None;
     }
     info!(

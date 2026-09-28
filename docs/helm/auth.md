@@ -162,10 +162,44 @@ read, but the integrity of cached bytes rests, as in node mode, on only the rele
 daemon pods being able to reach the peer port. A compromised daemon pod can serve or push
 forged bytes to its peers.
 
+## Writes
+
+Every write is forwarded to S3 exactly as the client sent it, signed by the client — the
+daemon never uploads anything itself. With `auth.requester.populateOnWrite: true` (the
+default) the bytes of a `PutObject` and of each `UploadPart` are also copied onto the chunk
+grid as they stream through and staged at each chunk's home node. They become visible only
+once S3 says the object exists — a 2xx on the PUT, or a successful
+`CompleteMultipartUpload` — and every staged chunk records the new ETag, so the next read of a
+checkpoint just saved is served from the cache.
+
+What populates:
+
+| Write | Cached afterwards |
+|---|---|
+| `PutObject` | every chunk |
+| multipart upload, part size a **multiple of the chunk size** (16 MiB by default) | every chunk except the object's last one |
+| multipart upload, any other part size | nothing — the object is written and read correctly, just not pre-warmed |
+| a part retried, a part S3 refused, parts of unequal size, a failed or aborted upload | nothing (the staged chunks are discarded) |
+| `UploadPartCopy`, `CopyObject` | nothing (the bytes never pass through the daemon) |
+
+So a writer that wants its uploads cached sets its part size to the chunk size or a multiple
+of it. boto3's default is 8 MiB, which populates nothing against 16 MiB chunks:
+
+```python
+from boto3.s3.transfer import TransferConfig
+s3.upload_file(path, bucket, key, Config=TransferConfig(multipart_chunksize=16 << 20))
+```
+
+Bodies sent in the `aws-chunked` encoding — the SDKs' streaming and trailing-checksum uploads
+— are decoded before they are cached; a body that does not decode cleanly populates nothing.
+
+**The tee never slows a write.** It holds at most `scatter.windowsInFlight` chunks between a
+body and its staging and drops a chunk rather than wait for room
+(`pacer_populate_windows_total{outcome="skipped"}`), and it tees at most as many bodies at once;
+anything beyond that is forwarded without being cached.
+
 ## What is not available in requester mode yet
 
-- **Writes do not populate the cache.** They are forwarded to S3 unmodified and succeed; the
-  first read of a newly written object is a miss.
 - **Delivery into client memory** (`delivery.*`, [delivery.md](delivery.md)) is off; a client
   that asks for it receives an ordinary response body. The delivery pre-flight query is
   refused.
@@ -181,8 +215,10 @@ forged bytes to its peers.
 - **One S3 request per GET against the request rate.** S3 Standard allows 5,500 GET/s per
   prefix, which a fleet-wide restore can approach; S3 Express One Zone allows far more per
   directory bucket.
-- **Memory.** On a cluster each node holds a staging area for chunks pushed to it by peers
-  (`scatter.stagingBytes`, 2 GiB by default). The chart adds it to the container's memory limit.
+- **Memory.** Each node holds a staging area for chunks waiting to be committed — pushed to it
+  by peers, or written through it (`scatter.stagingBytes`, 2 GiB by default) — and, with
+  `populateOnWrite`, up to `2 × scatter.windowsInFlight × chunkSize` (512 MiB by default) of
+  chunks in flight from write bodies. The chart adds both to the container's memory limit.
 
 ## Metrics
 
@@ -191,7 +227,7 @@ forged bytes to its peers.
 | `pacer_authz_probe_total{result}` | authorization requests, by `allow` / `deny` / `error` |
 | `pacer_authz_probe_seconds` | their latency — the added cost of every GET |
 | `pacer_authz_signed_range_bypass_total` | GETs forwarded uncached because the caller signed `range` |
-| `pacer_populate_windows_total{outcome}` | chunks pushed to their home node, by `committed` / `refused` / `failed` |
+| `pacer_populate_windows_total{outcome}` | chunks populated without a read of their own — pushed to their home after a read, or teed from a write — by `committed` / `refused` / `failed` / `skipped` (no room; the write was not slowed) / `discarded` (the write failed or did not verify) |
 | `pacer_cache_bypass_total` | includes every requester-mode pass-through |
 
 A rising `pacer_authz_signed_range_bypass_total` means a client is not following rule 3 and

@@ -305,6 +305,13 @@ impl PacerProxy {
         self
     }
 
+    /// The cluster view this proxy runs against, `None` single-node — for the write tee
+    /// (planning/30), which stages windows at the same homes the read path fills.
+    #[must_use]
+    pub fn cluster(&self) -> Option<&Cluster> {
+        self.cluster.as_ref()
+    }
+
     /// The in-flight-fill registry, shared with the peer server so a client GET
     /// and a peer FetchBlob never fill the same key concurrently.
     pub fn filling(&self) -> FillRegistry {

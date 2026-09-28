@@ -177,3 +177,24 @@ tests:
       - failedTemplate:
           errorPattern: "collides with one of ports.s3/admin/peer"
         template: daemonset.yaml
+
+  - it: "the write tee is on by default and renders nothing, since that is the daemon's default"
+    set:
+      auth.mode: requester
+      auth.requester.s3Domains: [s3.us-east-2.amazonaws.com]
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: 'populate-on-write'
+        template: configmap.yaml
+
+  - it: "turning the write tee off reaches the daemon"
+    set:
+      auth.mode: requester
+      auth.requester.s3Domains: [s3.us-east-2.amazonaws.com]
+      auth.requester.populateOnWrite: false
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'populate-on-write: false'
+        template: configmap.yaml

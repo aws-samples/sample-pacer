@@ -298,7 +298,8 @@ rule does and does not cover, are in
 This is the `node`-mode contract. Under `auth.mode: requester` clients instead configure the
 daemon as their **proxy**, keep their own credentials and real bucket names, and leave the
 `Range` header unsigned — [docs/helm/auth.md](docs/helm/auth.md#the-client-contract) has the
-boto3 recipe.
+boto3 recipe. Writes are cached as they pass through when a multipart upload's part size is
+a multiple of the chunk size ([docs/helm/auth.md](docs/helm/auth.md#writes)).
 
 Point any S3 SDK at the node-local Service and sign with the placeholder credentials
 (default `pacer`/`pacer` — not a secret; the daemon checks that signature only to reject

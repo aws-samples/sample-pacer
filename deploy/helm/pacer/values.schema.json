@@ -190,7 +190,8 @@
                 "secretName": { "description": "kubernetes.io/tls Secret with the daemon's own certificate; empty = no TLS listener.", "type": "string" },
                 "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
               }
-            }
+            },
+            "populateOnWrite": { "description": "Tee write bodies into the cache (planning/30). Requester mode only.", "type": "boolean" }
           }
         }
       }

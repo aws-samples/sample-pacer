@@ -16,6 +16,7 @@
 //! | [`gate_concurrency`] | 3.4, 3.5 |
 //! | [`gate_placement`] | 3.10 (size half), 3.11 |
 //! | [`gate_pipeline`] | the `windows_in_flight` memory bound, and phase attribution |
+//! | [`gate_cache_fresh`] | #21 / ADR-0043: a fallen-back window invalidates its home |
 //! | [`probe`] | the suite's own checksum oracle |
 //! | [`populate_only`] | planning/30 § 4.1's T3: the owner's `StoreChunk` branch for
 //!   `populate_only` offers (ADR-0041's read-path populate and write-tee share it) |
@@ -58,6 +59,7 @@ use crate::common::{
 };
 
 mod gate_budget;
+mod gate_cache_fresh;
 mod gate_concurrency;
 mod gate_integrity;
 mod gate_pipeline;
@@ -197,14 +199,24 @@ fn scatter_config(staging_bytes: u64) -> ScatterConfig {
     }
 }
 
-/// [`NODES`] daemon nodes with the scatter on, each with a `staging_bytes` budget,
-/// over one probe-wrapped backend.
+/// [`NODES`] daemon nodes with the scatter on, replication R = [`REPLICATION_R`],
+/// each with a `staging_bytes` budget, over one probe-wrapped backend.
+async fn fleet(staging_bytes: u64) -> Harness {
+    fleet_with_replication(staging_bytes, REPLICATION_R).await
+}
+
+/// [`fleet`], at an explicit replication factor rather than the suite's default
+/// R = 1. Every gate but ADR-0043's co-home invalidation regression
+/// (`gate_cache_fresh`) runs at R = 1, where "a chunk's home" and "a chunk's only
+/// home" are the same claim; that regression needs R > 1 to exercise a co-home
+/// nobody ever offers a window to — a scattered PUT's plan lists R homes per
+/// window (`PlannedWindow::homes`), but only `homes[0]` is ever contacted.
 ///
 /// The loop is here and the per-node assembly is [`common::node_parts`] +
 /// [`scatter_node`] + [`common::serve_node`], which is what keeps this under a
 /// screenful: the 429-line original was that assembly inlined, and `cluster.rs` had
 /// the same code again without the staging area.
-async fn fleet(staging_bytes: u64) -> Harness {
+async fn fleet_with_replication(staging_bytes: u64, replication_r: usize) -> Harness {
     let backend_dir = tempfile::tempdir().unwrap();
     let faults = Arc::new(Faults::default());
     let (service, creds) = backend_service(ProbeFs::new(
@@ -221,7 +233,7 @@ async fn fleet(staging_bytes: u64) -> Harness {
     for name in NODES {
         let spec = NodeSpec {
             name,
-            replication_r: REPLICATION_R,
+            replication_r,
             min_object_size: MIN_OBJECT_SIZE,
             max_object_size: MAX_OBJECT_SIZE,
             chunk,
@@ -272,15 +284,6 @@ fn scatter_node(
         usize::try_from(staging_bytes).unwrap(),
         STAGING_TTL,
     ));
-    let coordinator = Arc::new(ScatterCoordinator::new(
-        parts.backend.clone(),
-        parts.tier.clone(),
-        chunk,
-        parts.cluster.clone(),
-        &scatter_config(staging_bytes),
-        Arc::clone(&staging),
-        parts.metrics.clone(),
-    ));
     let proxy = PacerProxy::new(
         parts.backend.clone(),
         parts.tier.clone(),
@@ -293,8 +296,22 @@ fn scatter_node(
     // ADR-0032 § 6: the scatter is a general-purpose-bucket feature, and enabling it
     // on Express is refused at startup.
     .with_backend_type(BackendType::Standard)
-    .with_cluster(parts.cluster.clone())
-    .with_scatter(Arc::clone(&coordinator), MIN_SCATTER_BYTES);
+    .with_cluster(parts.cluster.clone());
+    // Built after the proxy so it can share the proxy's fill registry, as `main`
+    // does (ADR-0044).
+    let coordinator = Arc::new(
+        ScatterCoordinator::new(
+            parts.backend.clone(),
+            parts.tier.clone(),
+            chunk,
+            parts.cluster.clone(),
+            &scatter_config(staging_bytes),
+            Arc::clone(&staging),
+            parts.metrics.clone(),
+        )
+        .with_fill_registry(proxy.filling()),
+    );
+    let proxy = proxy.with_scatter(Arc::clone(&coordinator), MIN_SCATTER_BYTES);
     (proxy, staging, coordinator)
 }
 

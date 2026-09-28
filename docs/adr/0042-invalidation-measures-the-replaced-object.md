@@ -73,8 +73,10 @@ unreachable, so this wasted capacity but never served a wrong answer.
 - **Still racy under concurrent writers to one key.** Two writers can each measure the
   same predecessor. This was already outside 0015's immutable-key precondition, and this
   ADR does not widen it.
-- **Not covered here:** the scattered PUT skips invalidation for a key the backend does not
-  have ([#21](https://github.com/aws-samples/sample-pacer/issues/21)), and it caches the
-  header on the coordinator ([#19](https://github.com/aws-samples/sample-pacer/issues/19)).
-  Until those are fixed, 0015's statement that invalidation "bounds the window to in-flight
-  reads regardless" holds for every write except the scatter.
+- **Not covered here:** the scattered PUT caches its object header on the coordinator
+  rather than at the header's home ([#19](https://github.com/aws-samples/sample-pacer/issues/19)).
+  Its other gap — skipping invalidation for a key the backend does not have
+  ([#21](https://github.com/aws-samples/sample-pacer/issues/21)) — is
+  [0043](0043-scatter-fallback-invalidates-its-home.md). Until #19 is fixed, 0015's
+  statement that invalidation "bounds the window to in-flight reads regardless" holds for
+  every write except the scatter's header.

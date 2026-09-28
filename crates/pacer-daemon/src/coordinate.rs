@@ -16,6 +16,15 @@
 //! instead. Only a failure of the multipart upload itself (Create or Complete) is
 //! fatal, and it fails the client's PUT exactly as a failed plain PUT would.
 //!
+//! "New to the backend" is not "new to the cache", though: a window's fresh bytes
+//! land at exactly one node — the accepting owner, or this node when nobody
+//! accepted it — while `replication_r` (ADR-0016 layer 2) can list more than one
+//! home for that same chunk key, and every home this write did not land on can
+//! still be caching an older version of it. `ScatterCoordinator::publish` closes
+//! that gap (ADR-0043, fixing [#21](https://github.com/aws-samples/sample-pacer/issues/21))
+//! by invalidating every one of a window's co-homes but the one holding the fresh
+//! copy, before anything becomes visible.
+//!
 //! # What bounds a coordinator's memory
 //!
 //! One semaphore, acquired by the body reader before it hands a window to a task
@@ -49,7 +58,7 @@ use s3s::dto::StreamingBlob;
 use tokio::sync::{AcquireError, Semaphore};
 use tracing::{debug, warn};
 
-use crate::proxy::Cluster;
+use crate::proxy::{Cluster, FillRegistry};
 use crate::scatter::{SaturationTracker, ScatterConfig, ScatterPlan, WindowSplitter};
 use crate::staging::{StageOutcome, StagingArea};
 
@@ -300,6 +309,21 @@ impl WindowSlots {
     }
 }
 
+/// Co-home invalidations one `publish` runs at once (ADR-0043).
+///
+/// `Invalidate` carries no payload — a control message, not a chunk transfer — so
+/// this bounds RPC fan-out and latency, not bandwidth, which is why it can be a
+/// small fixed number rather than a knob sized against `chunk_size`. It is
+/// awaited before `publish` commits anything, which puts it on the client's PUT
+/// response — the same position the existing per-owner commit loop already
+/// occupies below it — so a fully serial round per co-home would add one more
+/// tail-latency term of exactly the shape
+/// [#23](https://github.com/aws-samples/sample-pacer/issues/23) is about. Picked,
+/// not measured: `replication_r` is small (2 by default), so most objects owe at
+/// most one extra invalidation per window and this bound rarely binds; a large R
+/// or a wide object is exactly where it matters.
+const INVALIDATION_CONCURRENCY: usize = 8;
+
 /// Drives scattered PUTs for this node.
 pub struct ScatterCoordinator {
     shared: Arc<Shared>,
@@ -326,6 +350,11 @@ pub struct ScatterCoordinator {
     /// on hardware**: it carries the limit and the high-water mark the scrape publishes
     /// as `pacer_scatter_windows_in_flight`, `_peak` and `_limit`.
     windows: Arc<WindowSlots>,
+    /// This node's ADR-0040 fill registry — the proxy's own, not a copy — so that
+    /// invalidating a co-home that is this node fences a local fill of that chunk
+    /// the same way a peer's `Invalidate` would (ADR-0044). Set by
+    /// [`Self::with_fill_registry`].
+    filling: FillRegistry,
 }
 
 impl ScatterCoordinator {
@@ -356,7 +385,21 @@ impl ScatterCoordinator {
             tier,
             chunk,
             windows: Arc::new(WindowSlots::new(cfg.windows_in_flight)),
+            filling: FillRegistry::new(),
         }
+    }
+
+    /// Share the proxy's fill registry with this coordinator (ADR-0044).
+    ///
+    /// A builder step rather than an eighth argument to [`Self::new`], which is at
+    /// the workspace's argument limit. Every daemon wiring must call it with
+    /// `PacerProxy::filling()`: without it the coordinator fences a private
+    /// registry no fill ever claims, and a local fill racing a co-home
+    /// invalidation could re-insert the pre-write chunk.
+    #[must_use]
+    pub fn with_fill_registry(mut self, filling: FillRegistry) -> Self {
+        self.filling = filling;
+        self
     }
 
     /// This coordinator's window slots, for the metrics scrape to read.
@@ -411,7 +454,7 @@ impl ScatterCoordinator {
                     }
                 }
                 match self.complete(&target, &upload_id, &parts, crc32).await {
-                    Ok(e_tag) => Ok(self.publish(&target, &upload_id, parts, e_tag).await),
+                    Ok(e_tag) => Ok(self.publish(&plan, &target, &upload_id, parts, e_tag).await),
                     Err(e) => {
                         self.unwind(&plan, &target, &upload_id).await;
                         Err(e.into())
@@ -695,15 +738,25 @@ impl ScatterCoordinator {
             .ok_or_else(|| anyhow::anyhow!("CompleteMultipartUpload returned no ETag"))
     }
 
-    /// Make everything visible: commit at each owner, commit this node's own staged
-    /// windows, and write the object header.
+    /// Make everything visible: invalidate every co-home a window's fresh bytes did
+    /// NOT land on, commit at each owner, commit this node's own staged windows, and
+    /// write the object header at its home.
     ///
-    /// Deliberately after Complete and deliberately not awaited for correctness —
-    /// each step turns a guaranteed miss into a possible hit, so a failure costs
-    /// warmth and never a wrong answer (ADR-0032 § 3). Errors are logged, not
-    /// propagated: the client's write already succeeded.
+    /// The co-home invalidation is the step that guards **this** write's own
+    /// correctness — a co-home this write never told about a window can still be
+    /// holding an older, wrong copy under that chunk's key (ADR-0043), so it is
+    /// awaited, the same as ADR-0007's own invalidation, and runs first: a reader
+    /// must never observe the fresh commit below before the stale copy it could race
+    /// against is gone. The commit loop below only turns a guaranteed miss into a
+    /// possible hit, so a failure there costs warmth, never a wrong answer.
+    /// `write_header` is awaited for a different reason — not this write's own
+    /// correctness, but the *next* write's: see its own doc for why a header that
+    /// landed after that write's invalidation ran would resurrect a value this write
+    /// already replaced. Errors from any step are logged, not propagated: the
+    /// client's write already succeeded.
     async fn publish(
         &self,
+        plan: &ScatterPlan,
         target: &ScatterTarget<'_>,
         upload_id: &str,
         parts: Vec<DonePart>,
@@ -714,6 +767,7 @@ impl ScatterCoordinator {
         let local_windows = parts.len() - scattered_windows;
         let owners = distinct_owners(&parts);
 
+        self.invalidate_stale_co_homes(plan, &parts).await;
         for owner in &owners {
             if let Err(e) = self
                 .shared
@@ -734,6 +788,83 @@ impl ScatterCoordinator {
             local_windows,
             uncached_windows,
             distinct_owners: owners.len(),
+        }
+    }
+
+    /// Every co-home invalidation this write owes, before anything below makes the
+    /// fresh copies visible (ADR-0043, fixing
+    /// [#21](https://github.com/aws-samples/sample-pacer/issues/21)).
+    ///
+    /// A window's fresh bytes land at exactly one node: the accepting owner
+    /// (`window.homes[0]`, when `part.owner` is `Some`), or this node when nobody
+    /// accepted it. `window.homes` can list more than one node —
+    /// `replication_r` co-homes, ADR-0016 layer 2 — and every other entry heard
+    /// nothing about this write at all, whether or not the offer was accepted:
+    /// only the offered home (`homes[0]`) is ever contacted. ADR-0032 § 2's fast
+    /// path treats a key that is merely new *to the backend* as having "no holders
+    /// to invalidate at any R", which is false whenever a co-home still caches an
+    /// older version this write's own `HeadObject` could not see (an evicted
+    /// invalidation, one that missed an unreachable node, or #20's now-fixed gap).
+    ///
+    /// Every target is collected up front, then invalidated with bounded
+    /// concurrency ([`INVALIDATION_CONCURRENCY`]) rather than one chunk key at a
+    /// time — the serial-per-chunk shape [#23](https://github.com/aws-samples/sample-pacer/issues/23)
+    /// asks not to repeat here.
+    async fn invalidate_stale_co_homes(&self, plan: &ScatterPlan, parts: &[DonePart]) {
+        let mut targets: Vec<(NodeId, String)> = Vec::new();
+        for part in parts {
+            let Some(index) = usize::try_from(part.part_number - 1).ok() else {
+                continue;
+            };
+            let Some(window) = plan.windows.get(index) else {
+                continue;
+            };
+            // The one node holding this window's fresh bytes: the accepting owner, or
+            // this node when the coordinator uploaded it. Every OTHER co-home in the
+            // plan is a stale-invalidation target, whether or not `homes[0]` accepted.
+            let fresh_holder = part
+                .owner
+                .as_ref()
+                .map(NodeId::name)
+                .unwrap_or(self.shared.cluster.local_node.as_str());
+            for home in &window.homes {
+                if home.name() != fresh_holder {
+                    targets.push((home.clone(), window.chunk_key.clone()));
+                }
+            }
+        }
+        futures::stream::iter(targets)
+            .for_each_concurrent(INVALIDATION_CONCURRENCY, |(home, chunk_key)| async move {
+                self.invalidate_one_co_home(&home, &chunk_key).await;
+            })
+            .await;
+    }
+
+    /// Invalidate one stale co-home's copy of `chunk_key`.
+    ///
+    /// Local with no RPC when `home` names this node — the same shortcut
+    /// `PacerProxy::invalidate_key` takes for an ordinary overwrite (ADR-0007),
+    /// and fenced the same way, through `forget_fenced` on the proxy's fill
+    /// registry (ADR-0044) — otherwise the same awaited peer `Invalidate`.
+    /// Best-effort like every other invalidation this daemon issues: a home that
+    /// cannot be reached is logged, never fails the write, and is corrected by
+    /// that home's own later eviction or the next write this design does
+    /// invalidate — unchanged from ADR-0007, and not something this ADR closes.
+    async fn invalidate_one_co_home(&self, home: &NodeId, chunk_key: &str) {
+        if home.name() == self.shared.cluster.local_node {
+            crate::proxy::forget_fenced(&self.filling, &self.tier, chunk_key).await;
+            return;
+        }
+        if let Err(e) = self
+            .shared
+            .cluster
+            .transport
+            .invalidate(home, chunk_key)
+            .await
+        {
+            warn!(key = %chunk_key, home = %home.name(), error = %e,
+                "invalidating a stale co-home failed; stale until that home's own \
+                 eviction or a later write");
         }
     }
 

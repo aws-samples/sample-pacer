@@ -178,6 +178,14 @@ correctness precondition for everything below is that the key is *new*, not that
 `replication_r` is 1 or that admission is off. A fresh key has no holders to
 invalidate at any R. ADR-0015 already requires checkpoint writers to write a new name
 per version, which is what makes the fast path the common one.
+**Amended by [0043](0043-scatter-fallback-invalidates-its-home.md):** "new" here was decided
+by one backend `HeadObject`, which answers whether the key is new to the backend, not
+whether it is cache-fresh, at any `replication_r`. A home an earlier invalidation missed can
+still hold a stale chunk under it — whether that home refused this write's offer, could not
+be reached, or (at R > 1) was never offered anything at all, since only `homes[0]` ever is.
+Publish now invalidates every co-home a window's fresh bytes did not land on before
+committing or writing the header, so the precondition this fast path actually needs is that
+no reachable co-home is left holding a copy this write never told it about.
 
 ### 3. One fence, and commit needs neither atomicity nor an await
 

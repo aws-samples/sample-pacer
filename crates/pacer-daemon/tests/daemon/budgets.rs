@@ -299,15 +299,18 @@ fn enable_scatter(
         usize::try_from(budget_bytes).unwrap(),
         STAGING_TTL,
     ));
-    let coordinator = Arc::new(ScatterCoordinator::new(
-        backend,
-        tier.clone(),
-        chunk,
-        cluster.clone(),
-        &cfg,
-        Arc::clone(&staging),
-        metrics.clone(),
-    ));
+    let coordinator = Arc::new(
+        ScatterCoordinator::new(
+            backend,
+            tier.clone(),
+            chunk,
+            cluster.clone(),
+            &cfg,
+            Arc::clone(&staging),
+            metrics.clone(),
+        )
+        .with_fill_registry(proxy.filling()),
+    );
     metrics.set_scatter_bounds(staging, Arc::clone(coordinator.window_slots()));
     proxy
         // ADR-0032 § 6: the scatter is a general-purpose-bucket feature, and enabling

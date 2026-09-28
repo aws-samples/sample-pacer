@@ -1361,15 +1361,20 @@ fn attach_scatter(
     let Some(staging) = staging.filter(|_| cfg.scatter.enabled) else {
         return proxy;
     };
-    let coordinator = Arc::new(coordinate::ScatterCoordinator::new(
-        backend,
-        tier,
-        cfg.chunk,
-        cluster,
-        &cfg.scatter,
-        Arc::clone(&staging),
-        metrics.clone(),
-    ));
+    let coordinator = Arc::new(
+        coordinate::ScatterCoordinator::new(
+            backend,
+            tier,
+            cfg.chunk,
+            cluster,
+            &cfg.scatter,
+            Arc::clone(&staging),
+            metrics.clone(),
+        )
+        // ADR-0044: the proxy's own registry, so a co-home invalidation of this
+        // node fences the fills this proxy is running.
+        .with_fill_registry(proxy.filling()),
+    );
     metrics.set_scatter_bounds(staging, Arc::clone(coordinator.window_slots()));
     proxy.with_scatter(coordinator, cfg.scatter.min_object_bytes)
 }

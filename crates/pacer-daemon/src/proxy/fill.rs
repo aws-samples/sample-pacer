@@ -597,6 +597,25 @@ pub(crate) async fn insert_fenced(
     true
 }
 
+/// Drop this node's copy of `key` for a write's invalidation, fencing any fill
+/// of it still in flight first (ADR-0044) — the local half of every `Invalidate`.
+///
+/// The other side of [`insert_fenced`], and shared for the same reason: three
+/// callers must not disagree. The peer handler (`PacerPeer::invalidate`), the
+/// writer's own `PacerProxy::invalidate_key`, and the scatter coordinator
+/// invalidating a co-home that is this node (ADR-0043) all remove a key a fill
+/// could be racing. A caller that forgot without poisoning would let a fill
+/// already past its backend read re-insert the pre-write bytes after this
+/// returns — #22's race, on whichever node skipped the fence.
+///
+/// Poison **before** forget: a fill whose insert lands between the two is
+/// undone by `insert_fenced`'s after-check; one that finished and released its
+/// claim before this call is covered by the forget.
+pub(crate) async fn forget_fenced(filling: &FillRegistry, tier: &ChunkTier, key: &str) {
+    filling.poison(key);
+    tier.forget(key).await;
+}
+
 impl FillCtx {
     /// Claim `chunk_key` exclusively, or `None` if another fill for it is already
     /// running. See [`FillGuard`] for why this replaces the bare `HashSet::insert`
@@ -1535,6 +1554,66 @@ mod tests {
             matches!(registry.claim_fill(&metrics, A_CHUNK_KEY), FillClaim::Busy),
             "an arrival after the poison must not take bytes parked from before it, \
              even though an arrival before the poison would have"
+        );
+    }
+
+    /// `forget_fenced` — the local half every invalidation shares, including the
+    /// scatter's co-home invalidation of this node (ADR-0043) — must fence a fill
+    /// still in flight, not only drop the tier entry: a leader that finishes its
+    /// read afterwards has to find its claim poisoned, so `insert_fenced` leaves
+    /// the pre-write bytes out of the tier.
+    #[tokio::test]
+    async fn forget_fenced_poisons_a_live_fill_and_drops_the_tier_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = pacer_cache::build_chunk_cache(&pacer_cache::CacheConfig {
+            dir: dir.path().to_path_buf(),
+            mem_capacity: 16 << 20,
+            disk_capacity: 64 << 20,
+            block_size: 4 << 20,
+            flush_buffer_size: 0,
+            io_engine: pacer_cache::IoEngine::Psync,
+            uring: pacer_cache::UringConfig::default(),
+            tuning: pacer_cache::StorageTuning::default(),
+            max_object_bytes: None,
+        })
+        .await
+        .unwrap();
+        let tier = ChunkTier::foyer(cache, Default::default());
+        let registry = FillRegistry::new();
+        let metrics = fill_metrics();
+        tier.put_chunk(
+            A_CHUNK_KEY,
+            CachedChunk::new(Bytes::from_static(b"an older copy")),
+        )
+        .await
+        .unwrap();
+
+        let FillClaim::Lead(leader) = registry.claim_fill(&metrics, A_CHUNK_KEY) else {
+            panic!("the first claim of a free key must lead");
+        };
+        forget_fenced(&registry, &tier, A_CHUNK_KEY).await;
+
+        assert!(
+            leader.is_poisoned(),
+            "a fill in flight when the key is invalidated must see its claim poisoned"
+        );
+        assert!(
+            tier.get_chunk(A_CHUNK_KEY).await.unwrap().is_none(),
+            "the invalidated copy must be gone from the tier"
+        );
+        assert!(
+            !insert_fenced(
+                &tier,
+                A_CHUNK_KEY,
+                CachedChunk::new(Bytes::from_static(b"pre-write bytes")),
+                &leader,
+            )
+            .await,
+            "the poisoned leader's insert must be refused"
+        );
+        assert!(
+            tier.get_chunk(A_CHUNK_KEY).await.unwrap().is_none(),
+            "nothing the poisoned leader read may reach the tier"
         );
     }
 }

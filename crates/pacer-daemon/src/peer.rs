@@ -1277,8 +1277,7 @@ impl Peer for PacerPeer {
         // the insert or undoes it, and `tier.forget` below then covers the one
         // case neither check can: a fill that had already finished and released
         // its claim before this call ever ran.
-        self.filling.poison(&req.cache_key);
-        self.tier.forget(&req.cache_key).await;
+        crate::proxy::forget_fenced(&self.filling, &self.tier, &req.cache_key).await;
         // ADR-0017: a write's invalidation clears the home's directory entry
         // too, not just this node's own cache copy — the sharer set for a
         // rewritten key must not outlive the write.

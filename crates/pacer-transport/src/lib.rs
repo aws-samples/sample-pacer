@@ -202,6 +202,44 @@ pub trait PeerTransport: Send + Sync {
     /// Transport failures only. An unreachable owner keeps its staged bytes
     /// until its TTL reaps them, which is why that reaper exists.
     async fn discard_upload(&self, owner: &NodeId, upload_id: &str) -> Result<u32, TransportError>;
+
+    /// Store a scattered object's header at `home` (ADR-0032 § 2). Control-plane,
+    /// always gRPC (mirrors [`Self::invalidate`]). Returns whether the home cached
+    /// it: `false` means the receiver no longer homes the key and declined, so the
+    /// header is cached nowhere and readers resolve it per request.
+    ///
+    /// Awaited by the caller, unlike an announce: a fire-and-forget store could
+    /// land after a subsequent write's invalidation and resurrect a stale header.
+    ///
+    /// # Errors
+    ///
+    /// Transport failures only; the caller logs and continues without caching the
+    /// header anywhere (a header miss is a HEAD per read, never a wrong answer).
+    async fn store_header(
+        &self,
+        home: &NodeId,
+        offer: HeaderOffer<'_>,
+    ) -> Result<bool, TransportError>;
+}
+
+/// A scattered object's header, offered to the object key's home
+/// (ADR-0032 § 2 — the header lives where invalidation can find it).
+///
+/// The four fields mirror `pacer-cache`'s `ObjectHeader`, carried loose because
+/// this crate does not depend on the cache; the daemon maps them on both ends.
+#[derive(Debug, Clone, Copy)]
+pub struct HeaderOffer<'a> {
+    /// Object cache key, `"{bucket}/{key}"` — the plain key, no chunk suffix.
+    pub cache_key: &'a str,
+    /// Total object length in bytes.
+    pub object_len: u64,
+    /// The composite ETag Complete minted (`"…-N"`).
+    pub e_tag: Option<&'a str>,
+    /// Content type to replay on a cache hit, if the client sent one.
+    pub content_type: Option<&'a str>,
+    /// Seconds since epoch. `None` today: Complete does not return
+    /// Last-Modified.
+    pub last_modified_epoch_secs: Option<i64>,
 }
 
 /// One window offered to its chunk's home.

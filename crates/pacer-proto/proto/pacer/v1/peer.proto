@@ -88,6 +88,14 @@ service Peer {
   // Drop an upload's staged chunks: Complete failed or the upload was aborted,
   // so those bytes describe an object that will never exist.
   rpc DiscardUpload(DiscardUploadRequest) returns (DiscardUploadResponse);
+
+  // Store a scattered object's header at its home (ADR-0032 § 2). A header has
+  // to live where a later write's invalidation can find it — the key's R
+  // co-homes, or a directory-listed sharer — and a scatter's coordinator is
+  // usually neither, so caching the header locally would leave a copy no
+  // invalidation reaches. Awaited by the sender: a fire-and-forget store could
+  // land AFTER a subsequent write's invalidation and resurrect a stale header.
+  rpc StoreHeader(StoreHeaderRequest) returns (StoreHeaderResponse);
 }
 
 message StoreChunkRequest {
@@ -464,4 +472,28 @@ message BlobMeta {
   // be read back, so the digest comes from the side that holds the bytes).
   // Absent on every other path, where the requester digests for itself.
   optional uint32 written_crc32 = 8;
+}
+
+message StoreHeaderRequest {
+  // Object cache key, "{bucket}/{key}" — the plain key, no `#{size}:{index}`
+  // suffix, so it never collides with a chunk key (see pacer-cache::chunk).
+  string cache_key = 1;
+  // The four ObjectHeader fields (pacer-cache::chunk::ObjectHeader): enough to
+  // compute a covering chunk set and replay the GET response headers.
+  uint64 object_len = 2;
+  // The composite ETag Complete minted ("…-N"), the header's version witness.
+  optional string e_tag = 3;
+  optional string content_type = 4;
+  // Seconds since epoch. Absent today: CompleteMultipartUpload does not return
+  // Last-Modified (issue #25 tracks recovering it).
+  optional int64 last_modified_epoch_secs = 5;
+}
+
+message StoreHeaderResponse {
+  // False = the receiver is not a home for this key (the ring moved between
+  // the sender's placement and this call) and declined the insert, because a
+  // non-home copy is exactly the unreachable-by-invalidation state this RPC
+  // exists to avoid. The sender treats false as "nothing cached": readers
+  // resolve the header per request via HEAD until one lands on a home.
+  bool stored = 1;
 }

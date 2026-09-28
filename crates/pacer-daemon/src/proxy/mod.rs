@@ -492,3 +492,36 @@ impl S3 for PacerProxy {
         self.inner.list_parts(req).await
     }
 }
+
+/// `auth.mode: requester`'s `S3` implementation (ADR-0041 § 2.4): **only**
+/// `get_object` is overridden. Every other operation is refused by the `S3`
+/// trait's own default (`NotImplemented`) rather than reaching
+/// [`PacerProxy`]'s usual passthrough, which re-signs with this node's own
+/// identity — that path must be unreachable here no matter what the front
+/// door's classification let through, because reaching it would mean an
+/// unauthenticated request executed with this node's own S3 access. The
+/// front door ([`crate::authz::RequesterFront`]) is what keeps non-`GetObject`
+/// traffic away from this type at all; this is the second, independent gate.
+pub struct RequesterS3 {
+    proxy: PacerProxy,
+    forwarder: Arc<crate::authz::Forwarder>,
+}
+
+impl RequesterS3 {
+    /// Wrap `proxy` for `requester` mode. `forwarder` is the same instance
+    /// [`crate::authz::RequesterFront`] forwards through, so the probe, a
+    /// chunk fill and a raw forward all share one connection pool to S3.
+    pub fn new(proxy: PacerProxy, forwarder: Arc<crate::authz::Forwarder>) -> Self {
+        Self { proxy, forwarder }
+    }
+}
+
+#[async_trait::async_trait]
+impl S3 for RequesterS3 {
+    async fn get_object(
+        &self,
+        req: S3Request<dto::GetObjectInput>,
+    ) -> S3Result<S3Response<dto::GetObjectOutput>> {
+        self.proxy.serve_get_requester(req, &self.forwarder).await
+    }
+}

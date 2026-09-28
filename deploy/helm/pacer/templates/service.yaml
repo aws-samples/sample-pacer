@@ -15,6 +15,11 @@ spec:
     - name: s3
       port: {{ .Values.ports.s3 }}
       targetPort: s3
+    {{- if include "pacer.tlsEnabled" . }}
+    - name: s3-tls
+      port: {{ .Values.auth.requester.tls.port }}
+      targetPort: s3-tls
+    {{- end }}
     - name: admin
       port: {{ .Values.ports.admin }}
       targetPort: admin

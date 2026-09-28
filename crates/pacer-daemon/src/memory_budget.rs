@@ -488,6 +488,11 @@ pub fn pinned_budget(cfg: &Config, arenas: EfaArenas) -> MemoryBudget {
             Term::ScatterCoordinator,
             cfg.scatter.windows_in_flight as u64 * chunk,
         );
+    } else if cfg.auth_mode == crate::auth::AuthMode::Requester && cfg.cluster.is_some() {
+        // A requester-mode node homes peers' populate-only windows in the same staging
+        // area with the scatter off (ADR-0041), so the budget is held; it coordinates
+        // nothing, so no coordinator term. Mirrors `pacer.scatterStagingBytes`.
+        set(Term::ScatterStaging, cfg.scatter.staging_bytes);
     }
     set(
         Term::FoyerFlushBuffers,
@@ -840,6 +845,60 @@ delivery:
     /// passed through, because nothing pinned is on.
     const CHART_DEFAULT_LIMIT: u64 = 4 * GIB;
 
+    /// `helm template --set cluster.enabled=true --set auth.mode=requester --set
+    /// auth.requester.s3Domains={s3.us-east-2.amazonaws.com}`, config.yaml, comments
+    /// dropped. The scatter is off and the staging area is held anyway (ADR-0041).
+    const CHART_REQUESTER_CLUSTER_CONFIG: &str = r#"
+listen-addr: "0.0.0.0:9000"
+admin-addr: "0.0.0.0:9090"
+log:
+  format: "json"
+cache:
+  dir: "/var/cache/pacer"
+  mem-capacity: "1GiB"
+  disk-capacity: "100GiB"
+  block-size: "1GiB"
+  io-engine: "psync"
+  uring:
+    threads: 4
+    io-depth: 256
+  tuning:
+    flushers: 32
+    reclaimers: 8
+    submit-queue-threshold: "2147483648"
+runtime:
+  worker-threads: 0
+  rdma-worker-threads: 0
+memory:
+  check: "enforce"
+policy:
+  min-object-size: "4MiB"
+  disk-tier: "foyer"
+backend:
+  backend-type: "express"
+  endpoint: ""
+  force-path-style: false
+auth:
+  mode: requester
+  s3-domains:
+    - "s3.us-east-2.amazonaws.com"
+cluster:
+  peer-listen-addr: "0.0.0.0:9100"
+  channel-capacity: 8
+delivery:
+  enabled: true
+  max-target-bytes: "4Gi"
+  pinned-bytes-max: "4Gi"
+scatter:
+  enabled: false
+  staging-bytes: "2147483648"
+"#;
+
+    /// `limits.memory` the chart renders for [`CHART_REQUESTER_CLUSTER_CONFIG`]: the
+    /// same release in node mode renders 9 GiB, and requester mode adds exactly the
+    /// 2 GiB staging area.
+    const CHART_REQUESTER_CLUSTER_LIMIT: u64 = 11_811_160_064;
+
     /// `limits.memory` the chart renders for `--set efa.enabled=true --set
     /// delivery.enabled=true`: 4 (base) + 8 (`efa.pinnedPoolReservation`) + 8
     /// (`delivery.pinnedReservation`) + 1 (`pacer.deliveryWorkingSetBytes`) = 21 GiB.
@@ -944,6 +1003,28 @@ delivery:
         // this is a fact about the two numbers, checked when the crate compiles, not a
         // runtime condition.
         const { assert!(DEFAULT_HEADROOM_FRACTION < 21.0 / 18.0 - 1.0) };
+    }
+
+    /// Requester mode on a cluster holds a staging area with the scatter off (ADR-0041):
+    /// the daemon must charge it, charge no coordinator, and agree with the limit the
+    /// chart rendered for the same values — the number that would otherwise have been
+    /// 2 GiB short and OOMKilled under a populate burst.
+    #[test]
+    fn budget_mirrors_the_chart_requester_cluster_render() {
+        let b = budget_of(CHART_REQUESTER_CLUSTER_CONFIG, EfaArenas::Absent);
+        assert_eq!(
+            b.get(Term::ScatterStaging),
+            2 * GIB,
+            "pacer.scatterStagingBytes"
+        );
+        assert_eq!(
+            b.get(Term::ScatterCoordinator),
+            0,
+            "requester mode coordinates nothing"
+        );
+        assert_eq!(CHART_REQUESTER_CLUSTER_LIMIT, 11 * GIB);
+        check(&b, Some(CHART_REQUESTER_CLUSTER_LIMIT), Headroom::DEFAULT)
+            .expect("the chart's own requester-mode cluster render must start");
     }
 
     /// The one recorded incident a configured-budget check can catch, replayed:

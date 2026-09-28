@@ -1,0 +1,179 @@
+# auth.mode (ADR-0041): what requester mode renders, and every render it refuses.
+#
+# The node-mode half of the contract — that every existing release renders byte-identical
+# — is not asserted here, because no single render can show it: it is checked by rendering
+# every overlay in deploy/helm/pacer and bench/ladder/values against the previous chart.
+suite: auth mode (ADR-0041)
+templates:
+  - configmap.yaml
+  - daemonset.yaml
+  - NOTES.txt
+  - service.yaml
+  - networkpolicy.yaml
+tests:
+  - it: "node mode's NOTES still say reachability is the authorization"
+    asserts:
+      - matchRegexRaw:
+          pattern: "re-signs every request with the NODE's IAM identity"
+        template: NOTES.txt
+      - notMatchRegexRaw:
+          pattern: "auth.mode=requester"
+        template: NOTES.txt
+
+  - it: "requester mode's NOTES give the proxy contract instead, and never the placeholder one"
+    set:
+      auth.mode: requester
+      auth.requester.s3Domains: [s3.us-east-2.amazonaws.com]
+    asserts:
+      - matchRegexRaw:
+          pattern: "S3 authorizes each caller's OWN signature"
+        template: NOTES.txt
+      - notMatchRegexRaw:
+          pattern: "placeholder credentials"
+        template: NOTES.txt
+
+  - it: "node mode renders no auth block"
+    # The daemon defaults to node mode, so an absent block is the node-mode block.
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^\s*auth:'
+        template: configmap.yaml
+
+  - it: "requester mode renders the mode and its domain list"
+    set:
+      auth.mode: requester
+      auth.requester.s3Domains: [s3.us-east-2.amazonaws.com, s3express-use2-az1.us-east-2.amazonaws.com]
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'auth:\n\s+mode: requester\n\s+s3-domains:\n\s+- "s3.us-east-2.amazonaws.com"\n\s+- "s3express-use2-az1.us-east-2.amazonaws.com"'
+        template: configmap.yaml
+
+  - it: "requester mode on a Standard backend leaves the scatter OFF by default"
+    # In node mode an unset scatter.enabled means ON for Standard. In requester mode it must
+    # resolve to off, and say so explicitly — an omitted block would let the daemon apply
+    # its own default, which the daemon also resolves to off, but the chart does not rely on it.
+    set:
+      auth.mode: requester
+      auth.requester.s3Domains: [s3.us-east-2.amazonaws.com]
+      config.backendType: standard
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'scatter:\n\s+enabled: false'
+        template: configmap.yaml
+
+  - it: "requester mode on a cluster holds a staging area, and the daemon is told its size"
+    # A requester-mode node homes peers' populate-only windows in a staging area with the
+    # scatter off. pacer.memoryLimit budgets for that area, and emitting the size is what
+    # holds the daemon to the number that was budgeted.
+    set:
+      auth.mode: requester
+      auth.requester.s3Domains: [s3.us-east-2.amazonaws.com]
+      cluster.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'scatter:\n\s+enabled: false\n(\s+#.*\n)*\s+staging-bytes: "2147483648"'
+        template: configmap.yaml
+
+  - it: "an unknown mode is refused"
+    # The schema's enum refuses it first; asserted as a schema failure for that reason.
+    set: {auth.mode: anonymous}
+    asserts:
+      - failedTemplate: {}
+        template: daemonset.yaml
+
+  - it: "requester mode with no domain list is refused"
+    set: {auth.mode: requester}
+    asserts:
+      - failedTemplate:
+          errorPattern: "auth.requester.s3Domains is empty"
+        template: daemonset.yaml
+
+  - it: "requester mode with a bucket alias is refused"
+    set:
+      auth.mode: requester
+      auth.requester.s3Domains: [s3.us-east-2.amazonaws.com]
+      config.bucketMap: {cache: real-bucket}
+    asserts:
+      - failedTemplate:
+          errorPattern: "a caller cannot sign for an alias"
+        template: daemonset.yaml
+
+  - it: "requester mode with the scatter explicitly on is refused"
+    set:
+      auth.mode: requester
+      auth.requester.s3Domains: [s3.us-east-2.amazonaws.com]
+      config.backendType: standard
+      scatter.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "scatter.enabled is true"
+        template: daemonset.yaml
+
+  - it: "the TLS listener mounts its Secret, opens its port everywhere :9000 is, and tells the daemon"
+    set:
+      auth.mode: requester
+      auth.requester.s3Domains: [s3.us-east-2.amazonaws.com]
+      auth.requester.tls.secretName: pacer-tls
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'tls:\n\s+cert: "/etc/pacer-tls/tls.crt"\n\s+key: "/etc/pacer-tls/tls.key"\n\s+listen-addr: "0.0.0.0:9443"'
+        template: configmap.yaml
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tls
+            secret:
+              secretName: pacer-tls
+              items:
+                - {key: tls.crt, path: tls.crt}
+                - {key: tls.key, path: tls.key}
+        template: daemonset.yaml
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content: {name: s3-tls, containerPort: 9443}
+        template: daemonset.yaml
+      - contains:
+          path: spec.ports
+          content: {name: s3-tls, port: 9443, targetPort: s3-tls}
+        template: service.yaml
+      - contains:
+          path: spec.ingress[0].ports
+          content: {port: 9443, protocol: TCP}
+        template: networkpolicy.yaml
+
+  - it: "no Secret, no TLS listener anywhere"
+    set:
+      auth.mode: requester
+      auth.requester.s3Domains: [s3.us-east-2.amazonaws.com]
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: 'pacer-tls'
+        template: configmap.yaml
+      - notContains:
+          path: spec.ports
+          content: {name: s3-tls, port: 9443, targetPort: s3-tls}
+        template: service.yaml
+
+  - it: "a TLS Secret in node mode is refused"
+    set: {auth.requester.tls.secretName: pacer-tls}
+    asserts:
+      - failedTemplate:
+          errorPattern: "auth.mode is node"
+        template: daemonset.yaml
+
+  - it: "a TLS port that collides with another listener is refused"
+    set:
+      auth.mode: requester
+      auth.requester.s3Domains: [s3.us-east-2.amazonaws.com]
+      auth.requester.tls.secretName: pacer-tls
+      auth.requester.tls.port: 9090
+    asserts:
+      - failedTemplate:
+          errorPattern: "collides with one of ports.s3/admin/peer"
+        template: daemonset.yaml

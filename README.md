@@ -240,6 +240,13 @@ See [docs/helm/write-scatter.md](docs/helm/write-scatter.md).
 
 ## Securing access
 
+PACER has two authorization modes, chosen per release with `auth.mode`. This section
+describes the default, `node`. With **`auth.mode: requester`** the daemon becomes an HTTP
+proxy that forwards each caller's own signature, S3 authorizes every request, and the
+NetworkPolicy below is defence in depth rather than the boundary — at the cost of one extra
+S3 round trip per GET. When pods with different S3 permissions share nodes, read
+[docs/helm/auth.md](docs/helm/auth.md).
+
 **Reachability is authorization.** The daemon strips the caller's signature and re-signs
 outbound with the **node's** IAM identity, so whatever can reach `:9000` holds that
 identity's S3 access — a deliberate confused deputy, the same shape as `aws-sigv4-proxy`.
@@ -287,6 +294,11 @@ rule does and does not cover, are in
 [docs/helm/network-policy.md](docs/helm/network-policy.md).
 
 ## Configuring clients
+
+This is the `node`-mode contract. Under `auth.mode: requester` clients instead configure the
+daemon as their **proxy**, keep their own credentials and real bucket names, and leave the
+`Range` header unsigned — [docs/helm/auth.md](docs/helm/auth.md#the-client-contract) has the
+boto3 recipe.
 
 Point any S3 SDK at the node-local Service and sign with the placeholder credentials
 (default `pacer`/`pacer` — not a secret; the daemon checks that signature only to reject

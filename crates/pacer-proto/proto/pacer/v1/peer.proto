@@ -117,6 +117,15 @@ message StoreChunkRequest {
   // UploadPart rather than assembled into the object (rejection verified in
   // spike/mpu-scatter, gate 0.2c).
   string checksum_crc32 = 7;
+  // Stage without uploading — the client is the uploader (ADR-0041,
+  // planning/30 § 4.1): `auth.mode: requester` has no S3 identity to call
+  // UploadPart with, so the owner only caches the bytes under this upload id
+  // and answers `staged` instead of `e_tag`. Also the shape of a requester-
+  // mode GET's own cross-node populate (planning/29 § 2.4 point 6), where the
+  // "upload" is a synthetic single-window one the sender commits immediately
+  // because the read that produced the bytes already confirmed the object
+  // exists.
+  bool populate_only = 8;
 }
 
 message StoreChunkResponse {
@@ -125,6 +134,10 @@ message StoreChunkResponse {
   optional string e_tag = 1;
   // Present iff the owner refused. Exactly one of these two fields is set.
   optional StoreRefusal refusal = 2;
+  // Set iff the owner staged a `populate_only` window (skipping UploadPart).
+  // A responder must agree with the request: `staged` answers a
+  // `populate_only` offer, `e_tag` answers one that was not.
+  bool staged = 3;
 }
 
 // Why an owner would not take a window. Never an error status: the coordinator

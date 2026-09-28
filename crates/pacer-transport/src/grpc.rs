@@ -495,6 +495,7 @@ impl PeerTransport for GrpcTransport {
         offer: StoreOffer<'_>,
     ) -> Result<StoreOutcome, TransportError> {
         let mut client = self.client(owner).await?;
+        let populate_only = offer.populate_only;
         let resp = client
             .store_chunk(StoreChunkRequest {
                 chunk_key: offer.chunk_key.to_owned(),
@@ -504,11 +505,12 @@ impl PeerTransport for GrpcTransport {
                 part_number: offer.part_number,
                 data: offer.body.to_vec(),
                 checksum_crc32: offer.checksum_crc32.to_owned(),
+                populate_only,
             })
             .await
             .map_err(|s| TransportError::PeerUnavailable(s.to_string()))?
             .into_inner();
-        store_outcome_from_wire(resp)
+        store_outcome_from_wire(populate_only, resp)
     }
 
     async fn commit_upload(
@@ -548,9 +550,27 @@ impl PeerTransport for GrpcTransport {
 /// refusal, and is surfaced as an error so it lands in the transport-failure
 /// metric instead of being silently counted as a busy peer — the two have very
 /// different meanings for whether the scatter is working.
-fn store_outcome_from_wire(resp: StoreChunkResponse) -> Result<StoreOutcome, TransportError> {
+fn store_outcome_from_wire(
+    offer_populate_only: bool,
+    resp: StoreChunkResponse,
+) -> Result<StoreOutcome, TransportError> {
+    if resp.staged {
+        return if offer_populate_only {
+            Ok(StoreOutcome::Staged)
+        } else {
+            Err(TransportError::Other(anyhow::anyhow!(
+                "StoreChunk answered staged for an offer that was not populate_only"
+            )))
+        };
+    }
     if let Some(e_tag) = resp.e_tag {
-        return Ok(StoreOutcome::Uploaded { e_tag });
+        return if offer_populate_only {
+            Err(TransportError::Other(anyhow::anyhow!(
+                "StoreChunk answered an ETag for a populate_only offer"
+            )))
+        } else {
+            Ok(StoreOutcome::Uploaded { e_tag })
+        };
     }
     let Some(refusal) = resp.refusal else {
         return Err(TransportError::Other(anyhow::anyhow!(

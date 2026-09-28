@@ -54,7 +54,7 @@ mod single;
 // Flattened back into `common::` so a call site never has to know which file of the
 // fixture a helper lives in — the split is here to keep three subjects apart, not to
 // make the callers spell it out.
-pub use fleet::{node_parts, serve_node, NodeParts, NodeSpec};
+pub use fleet::{node_parts, serve_node, serve_peer, NodeParts, NodeSpec};
 pub use single::{
     daemon_core, daemon_core_over, wait_until_connection_refused, BackendPair, Daemon, DaemonCore,
     DaemonSpec,

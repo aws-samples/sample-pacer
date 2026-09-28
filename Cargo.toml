@@ -28,10 +28,16 @@ members = [
 # workspace lints a probe would only fight. Listed here for the stray-`cargo`
 # reason above rather than because CI would otherwise build it — nothing does.
 # See spike/allocfault/README.md, which also records what has been settled since.
+#
+# The forward-proxy spike (spike/authz-forward, ADR-0041) is a throwaway hyper + s3s
+# proxy that was run against real S3 to validate the requester-identity auth mode
+# before any of it was written into the daemon. Same shape: rig code, its own
+# workspace, nothing of the daemon linked.
 exclude = [
     "spike/efa",
     "spike/gds",
     "spike/allocfault",
+    "spike/authz-forward",
 ]
 
 [workspace.package]
@@ -72,6 +78,24 @@ tokio-stream = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
+http-body = "1"
+http = "1"
+# Requester mode's byte-transparent forward (ADR-0041 § 2.2): the client
+# signed for the real S3 host, so the daemon must reach it over real TLS
+# rather than terminate it. `native-roots` reads the container image's system CA
+# bundle — the same one the AWS SDK's own HTTPS client already loads through
+# rustls-native-certs, so there is no new store to provision.
+hyper-rustls = { version = "0.27", default-features = false, features = [
+    "http1",
+    "native-tokio",
+    "aws-lc-rs",
+] }
+# Requester mode's TLS listener (ADR-0041 § 9) and an EXPLICIT crypto provider for it and
+# for the forwarder above: rustls' process-default provider is ambiguous — and a startup
+# panic — the moment any dependency also enables its `ring` backend. Both already in the
+# tree through the AWS SDK and hyper-rustls; listed here only to name the provider.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 tonic = "0.12"
 tonic-build = "0.12"
 prost = "0.13"

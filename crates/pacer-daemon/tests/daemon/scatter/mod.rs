@@ -17,6 +17,8 @@
 //! | [`gate_placement`] | 3.10 (size half), 3.11 |
 //! | [`gate_pipeline`] | the `windows_in_flight` memory bound, and phase attribution |
 //! | [`probe`] | the suite's own checksum oracle |
+//! | [`populate_only`] | planning/30 § 4.1's T3: the owner's `StoreChunk` branch for
+//!   `populate_only` offers (ADR-0041's read-path populate and write-tee share it) |
 //!
 //! Still owed: gate 3.1's hardware arm (a real checkpoint shard on a real cluster) and
 //! every Phase-4 bench arm. Gate 3.10's Express half is a *startup* refusal, so it
@@ -58,6 +60,7 @@ mod gate_concurrency;
 mod gate_integrity;
 mod gate_pipeline;
 mod gate_placement;
+mod populate_only;
 mod probe;
 
 use probe::{base64_crc32, Faults, ProbeFs};
@@ -514,6 +517,7 @@ impl Harness {
                         part_number: w.part_number,
                         body: window,
                         checksum_crc32: &checksum,
+                        populate_only: false,
                     },
                 )
                 .await

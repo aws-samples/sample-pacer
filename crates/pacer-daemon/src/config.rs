@@ -356,6 +356,42 @@ const BUCKET_MAP: EnvVar = EnvVar {
     name: "PACER_BUCKET_MAP",
     default: "",
 };
+/// Which identity authorizes a request against S3: `node` (ADR-0006, the
+/// daemon re-signs with its own identity) or `requester` (ADR-0041, S3
+/// authorizes the caller's own signature). One value per release.
+const AUTH_MODE: EnvVar = EnvVar {
+    name: "PACER_AUTH_MODE",
+    default: "node",
+};
+/// Comma list of base domains `auth.mode=requester` parses virtual-hosted
+/// requests against (ADR-0041 § 2.3, `s3s::host::MultiDomain`) — e.g.
+/// `s3.us-east-2.amazonaws.com,s3express-use2-az1.us-east-2.amazonaws.com`.
+///
+/// Required rather than derived: the ADR's own design note warns that a
+/// mis-derived list produces a plausible bucket name and a 404 from S3, not
+/// a parse error, so this daemon asks an operator to state the list rather
+/// than guess one from a region it does not otherwise carry as config.
+const AUTH_S3_DOMAINS: EnvVar = EnvVar {
+    name: "PACER_AUTH_S3_DOMAINS",
+    default: "",
+};
+/// PEM certificate chain for requester mode's TLS listener (ADR-0041 § 9) — the
+/// daemon's OWN certificate, never S3's. Empty = no TLS listener.
+const TLS_CERT: EnvVar = EnvVar {
+    name: "PACER_TLS_CERT",
+    default: "",
+};
+/// PEM private key matching [`TLS_CERT`].
+const TLS_KEY: EnvVar = EnvVar {
+    name: "PACER_TLS_KEY",
+    default: "",
+};
+/// Where the TLS listener binds. 9443 because planning/29 § 1 and the chart's
+/// `auth.requester.tls.port` default name it; the plaintext listener keeps 9000.
+const TLS_LISTEN_ADDR: EnvVar = EnvVar {
+    name: "PACER_TLS_LISTEN_ADDR",
+    default: "0.0.0.0:9443",
+};
 /// This node's Kubernetes node name (downward API). Set = cluster mode on.
 /// Env-only: it is per-pod, so it can never live in the shared ConfigMap.
 const NODE_NAME: EnvVar = EnvVar {
@@ -923,6 +959,18 @@ pub struct Config {
     /// signing scope) aimed at the proxy, which cannot honor it. The alias
     /// also picks the same-AZ bucket for this node (ADR-0002).
     pub bucket_map: HashMap<String, String>,
+    /// Which identity authorizes a request against S3 (ADR-0041). `node` reads
+    /// `placeholder_*`/`bucket_map`; `requester` refuses both being set, since a
+    /// bucket alias cannot be signed for by the caller and the write scatter
+    /// cannot re-sign a part with an identity this mode does not have.
+    pub auth_mode: crate::auth::AuthMode,
+    /// Base domains `requester` mode parses virtual-hosted requests against
+    /// (ADR-0041 § 2.3). Empty in `node` mode; required and non-empty in
+    /// `requester` mode — see `PACER_AUTH_S3_DOMAINS`.
+    pub auth_s3_domains: Vec<String>,
+    /// Requester mode's second, TLS listener (ADR-0041 § 9); `None` = plaintext only.
+    /// Refused in node mode, where there is no proxy for it to serve.
+    pub auth_tls: Option<TlsListenConfig>,
     /// Cluster tier (Phase 2). None = single-node (Phase 1 behavior).
     pub cluster: Option<ClusterConfig>,
     /// Client-memory delivery (ADR-0026): whether `x-pacer-target` is honoured,
@@ -1186,6 +1234,29 @@ struct FileBackend {
 struct FileAuth {
     placeholder_access_key: Option<String>,
     placeholder_secret_key: Option<String>,
+    mode: Option<String>,
+    s3_domains: Option<Vec<String>>,
+    tls: Option<FileAuthTls>,
+}
+
+/// `auth.tls:` block — requester mode's TLS listener (ADR-0041 § 9).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct FileAuthTls {
+    cert: Option<String>,
+    key: Option<String>,
+    listen_addr: Option<String>,
+}
+
+/// Requester mode's TLS listener: the daemon's own certificate, and where it binds.
+#[derive(Debug, Clone)]
+pub struct TlsListenConfig {
+    /// PEM certificate chain.
+    pub cert: std::path::PathBuf,
+    /// PEM private key.
+    pub key: std::path::PathBuf,
+    /// Socket address the TLS listener binds.
+    pub listen_addr: String,
 }
 
 /// `cluster:` block. Only the release-wide knobs live here; the per-pod
@@ -1244,6 +1315,37 @@ fn read_file_config(env: EnvFn) -> anyhow::Result<FileConfig> {
     serde_yaml_ng::from_str(&text).map_err(|e| anyhow::anyhow!("parsing config file {path}: {e}"))
 }
 
+/// Refuse the two ways `auth.mode=requester` can be asked to do something it
+/// structurally cannot (ADR-0041): sign for a bucket alias, or parse a
+/// virtual-hosted request with no domain list to parse it against.
+fn assert_requester_mode_configured(
+    auth_mode: crate::auth::AuthMode,
+    bucket_map: &HashMap<String, String>,
+    auth_s3_domains: &[String],
+) -> anyhow::Result<()> {
+    if auth_mode != crate::auth::AuthMode::Requester {
+        return Ok(());
+    }
+    if !bucket_map.is_empty() {
+        anyhow::bail!(
+            "{} is set but {}=requester; a bucket alias cannot be signed for by the \
+             caller (ADR-0041). Unset it, or use auth.mode=node.",
+            BUCKET_MAP.name,
+            AUTH_MODE.name,
+        );
+    }
+    if auth_s3_domains.is_empty() {
+        anyhow::bail!(
+            "{}=requester needs {} set: the base domains this node parses virtual-hosted \
+             requests against (ADR-0041 § 2.3) — e.g. s3.<region>.amazonaws.com, plus the \
+             zonal Express domain if this backend is express.",
+            AUTH_MODE.name,
+            AUTH_S3_DOMAINS.name,
+        );
+    }
+    Ok(())
+}
+
 /// Merge the three layers into a [`Config`]. The single home of precedence:
 /// pure over `(file, env)` so it is testable without process-global state.
 ///
@@ -1252,6 +1354,13 @@ fn read_file_config(env: EnvFn) -> anyhow::Result<FileConfig> {
 /// Propagates size/number parse failures and the cluster-without-membership
 /// error (see [`cluster_config`]).
 fn resolve(file: &FileConfig, env: EnvFn) -> anyhow::Result<Config> {
+    let auth_mode: crate::auth::AuthMode = AUTH_MODE
+        .resolve(env, auth_field(file, |a| a.mode.clone()))
+        .parse()?;
+    let bucket_map = bucket_map(file, env);
+    let auth_s3_domains = auth_s3_domains(file, env);
+    assert_requester_mode_configured(auth_mode, &bucket_map, &auth_s3_domains)?;
+    let auth_tls = auth_tls(file, env, auth_mode)?;
     let cfg = Config {
         listen_addr: LISTEN_ADDR.resolve(env, file.listen_addr.clone()),
         admin_addr: ADMIN_ADDR.resolve(env, file.admin_addr.clone()),
@@ -1311,10 +1420,13 @@ fn resolve(file: &FileConfig, env: EnvFn) -> anyhow::Result<Config> {
             .resolve(env, auth_field(file, |a| a.placeholder_access_key.clone())),
         placeholder_secret_key: PLACEHOLDER_SECRET_KEY
             .resolve(env, auth_field(file, |a| a.placeholder_secret_key.clone())),
-        bucket_map: bucket_map(file, env),
+        bucket_map,
+        auth_mode,
+        auth_s3_domains,
+        auth_tls,
         cluster: cluster_config(file, env)?,
         delivery: delivery_config(file, env)?,
-        scatter: scatter_config(file, env, backend_type(file, env)?)?,
+        scatter: scatter_config(file, env, backend_type(file, env)?, auth_mode)?,
         memory: memory_check_config(file, env)?,
     };
     Ok(cfg.warn_unpersistable_chunks())
@@ -1422,15 +1534,46 @@ impl Config {
 ///
 /// # Errors
 ///
-/// Enabling the scatter on an Express backend is refused rather than downgraded:
-/// ADR-0032 § 6 scopes the design to general-purpose buckets, so a ConfigMap
-/// asking for it on a directory bucket is asking for something that cannot
-/// happen, and silently proxying instead would leave an operator believing the
-/// path was live. Any unparseable size or duration also fails startup.
+/// Enabling the scatter on an Express backend, or under `auth.mode=requester`
+/// (ADR-0041 — the daemon has no identity there to re-sign a part with), is
+/// refused rather than downgraded: ADR-0032 § 6 scopes the design to
+/// general-purpose buckets, so a ConfigMap asking for either is asking for
+/// something that cannot happen, and silently proxying instead would leave an
+/// operator believing the path was live. Any unparseable size or duration also
+/// fails startup.
+/// Refuse a requested scatter that cannot happen: on an Express backend
+/// (ADR-0032 § 6) or under `auth.mode=requester` (ADR-0041), since neither
+/// downgrades sensibly — see `scatter_config`'s own doc for why.
+fn assert_scatter_compatible(
+    enabled: bool,
+    backend_type: BackendType,
+    auth_mode: crate::auth::AuthMode,
+) -> anyhow::Result<()> {
+    if enabled && backend_type.is_express() {
+        anyhow::bail!(
+            "{} is set but the backend is an Express directory bucket; the write scatter \
+             is scoped to general-purpose buckets (ADR-0032 § 6). Unset it, or set the \
+             backend type to `standard`.",
+            SCATTER_ENABLED.name,
+        );
+    }
+    if enabled && auth_mode == crate::auth::AuthMode::Requester {
+        anyhow::bail!(
+            "{} is set but {}=requester; the write scatter re-signs each home's part \
+             with the node identity, which requester mode does not have (ADR-0041). \
+             Unset it, or use auth.mode=node.",
+            SCATTER_ENABLED.name,
+            AUTH_MODE.name,
+        );
+    }
+    Ok(())
+}
+
 fn scatter_config(
     file: &FileConfig,
     env: EnvFn,
     backend_type: BackendType,
+    auth_mode: crate::auth::AuthMode,
 ) -> anyhow::Result<crate::scatter::ScatterConfig> {
     use crate::scatter::{
         ScatterConfig, DEFAULT_MIN_SCATTER_BYTES, DEFAULT_SATURATED_COOLDOWN_SECS,
@@ -1450,18 +1593,11 @@ fn scatter_config(
         SCATTER_ENABLED.resolve(env, fs.and_then(|s| s.enabled).map(|on| on.to_string()));
     let requested = requested.trim();
     let enabled = if requested.is_empty() {
-        !backend_type.is_express()
+        !backend_type.is_express() && auth_mode != crate::auth::AuthMode::Requester
     } else {
         matches!(requested, "1" | "true" | "on" | "yes")
     };
-    if enabled && backend_type.is_express() {
-        anyhow::bail!(
-            "{} is set but the backend is an Express directory bucket; the write scatter \
-             is scoped to general-purpose buckets (ADR-0032 § 6). Unset it, or set the \
-             backend type to `standard`.",
-            SCATTER_ENABLED.name,
-        );
-    }
+    assert_scatter_compatible(enabled, backend_type, auth_mode)?;
     let bytes_or = |var: &EnvVar, from_file: Option<String>, default: u64| -> anyhow::Result<u64> {
         match var.resolve_opt(env, from_file) {
             Some(raw) => parse_bytes(&raw),
@@ -1927,6 +2063,65 @@ fn policy_field_num(file: &FileConfig, f: impl Fn(&FilePolicy) -> Option<usize>)
 /// Read one `auth:` string field, or `None` when the block is absent.
 fn auth_field(file: &FileConfig, f: impl Fn(&FileAuth) -> Option<String>) -> Option<String> {
     file.auth.as_ref().and_then(f)
+}
+
+/// Resolve requester mode's TLS listener (ADR-0041 § 9). `None` when neither half of
+/// the key pair is set.
+///
+/// # Errors
+///
+/// One half of the pair without the other — a listener that could never start — and
+/// any TLS setting in node mode, where there is no proxy for the listener to serve and
+/// ignoring it would leave an operator believing clients were being served over TLS.
+fn auth_tls(
+    file: &FileConfig,
+    env: EnvFn,
+    auth_mode: crate::auth::AuthMode,
+) -> anyhow::Result<Option<TlsListenConfig>> {
+    let block = file.auth.as_ref().and_then(|a| a.tls.as_ref());
+    let cert = TLS_CERT.resolve_opt(env, block.and_then(|t| t.cert.clone()));
+    let key = TLS_KEY.resolve_opt(env, block.and_then(|t| t.key.clone()));
+    let (cert, key) = match (cert, key) {
+        (None, None) => return Ok(None),
+        (Some(cert), Some(key)) => (cert, key),
+        _ => anyhow::bail!(
+            "{} and {} must be set together: the TLS listener needs both halves of the key pair",
+            TLS_CERT.name,
+            TLS_KEY.name,
+        ),
+    };
+    if auth_mode != crate::auth::AuthMode::Requester {
+        anyhow::bail!(
+            "{} is set but {} is not requester: the TLS listener serves requester mode's \
+             proxy clients (ADR-0041 § 9), and node mode has none. Unset it.",
+            TLS_CERT.name,
+            AUTH_MODE.name,
+        );
+    }
+    Ok(Some(TlsListenConfig {
+        cert: cert.into(),
+        key: key.into(),
+        listen_addr: TLS_LISTEN_ADDR.resolve(env, block.and_then(|t| t.listen_addr.clone())),
+    }))
+}
+
+/// Resolve `auth.s3-domains`: env (comma list) wins, else the file's native
+/// YAML array, joined the same way so one `EnvVar::resolve` still applies.
+/// Empty entries from stray commas or whitespace are dropped rather than
+/// producing a domain `MultiDomain::new` would reject.
+fn auth_s3_domains(file: &FileConfig, env: EnvFn) -> Vec<String> {
+    let from_file = file
+        .auth
+        .as_ref()
+        .and_then(|a| a.s3_domains.as_ref())
+        .map(|domains| domains.join(","));
+    AUTH_S3_DOMAINS
+        .resolve(env, from_file)
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Build the cluster config. Cluster mode is on iff `PACER_NODE_NAME` is set
@@ -3300,6 +3495,178 @@ bucket-map:
             &fake_env(&[("PACER_SCATTER_ENABLED", "1")]),
         )
         .is_err());
+    }
+
+    /// ADR-0041: `node` is the default, byte for byte, and `requester` is one
+    /// env var away.
+    #[test]
+    fn auth_mode_defaults_to_node_and_parses_requester() {
+        let cfg = resolve(&FileConfig::default(), &fake_env(&[])).unwrap();
+        assert_eq!(cfg.auth_mode, crate::auth::AuthMode::Node);
+
+        let cfg = resolve(
+            &FileConfig::default(),
+            &fake_env(&[
+                ("PACER_AUTH_MODE", "requester"),
+                ("PACER_AUTH_S3_DOMAINS", "s3.us-east-2.amazonaws.com"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(cfg.auth_mode, crate::auth::AuthMode::Requester);
+    }
+
+    #[test]
+    fn unknown_auth_mode_fails_startup() {
+        let err = resolve(
+            &FileConfig::default(),
+            &fake_env(&[("PACER_AUTH_MODE", "bogus")]),
+        )
+        .expect_err("an unknown mode must not resolve");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    /// ADR-0041: a bucket alias cannot be signed for by the caller, so
+    /// `requester` mode with a non-empty alias map must fail startup rather
+    /// than silently ignore the alias.
+    #[test]
+    fn requester_mode_refuses_bucket_map() {
+        let err = resolve(
+            &FileConfig::default(),
+            &fake_env(&[
+                ("PACER_AUTH_MODE", "requester"),
+                ("PACER_BUCKET_MAP", "alias=real"),
+            ]),
+        )
+        .expect_err("requester + bucket_map must not resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("PACER_BUCKET_MAP"), "{msg}");
+        assert!(msg.contains("PACER_AUTH_MODE"), "{msg}");
+    }
+
+    /// ADR-0041: the write scatter re-signs each home's part with the node
+    /// identity, which `requester` mode does not have. An explicit request
+    /// for it fails startup; left unset, it resolves to off rather than
+    /// inheriting the general-purpose-backend default.
+    #[test]
+    fn requester_mode_refuses_explicit_scatter_and_defaults_off() {
+        let err = resolve(
+            &FileConfig::default(),
+            &fake_env(&[
+                ("PACER_BACKEND_TYPE", "standard"),
+                ("PACER_AUTH_MODE", "requester"),
+                ("PACER_AUTH_S3_DOMAINS", "s3.us-east-2.amazonaws.com"),
+                ("PACER_SCATTER_ENABLED", "1"),
+            ]),
+        )
+        .expect_err("requester + explicit scatter must not resolve");
+        assert!(err.to_string().contains("PACER_SCATTER_ENABLED"), "{err}");
+
+        let cfg = resolve(
+            &FileConfig::default(),
+            &fake_env(&[
+                ("PACER_BACKEND_TYPE", "standard"),
+                ("PACER_AUTH_MODE", "requester"),
+                ("PACER_AUTH_S3_DOMAINS", "s3.us-east-2.amazonaws.com"),
+            ]),
+        )
+        .unwrap();
+        assert!(!cfg.scatter.enabled);
+    }
+
+    /// ADR-0041 § 2.3: `requester` mode needs the base domains it parses
+    /// virtual-hosted requests against, and this daemon refuses to guess
+    /// them from a region it does not otherwise carry as config.
+    #[test]
+    fn requester_mode_refuses_startup_without_s3_domains() {
+        let err = resolve(
+            &FileConfig::default(),
+            &fake_env(&[("PACER_AUTH_MODE", "requester")]),
+        )
+        .expect_err("requester with no domain list must not resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("PACER_AUTH_S3_DOMAINS"), "{msg}");
+        assert!(msg.contains("PACER_AUTH_MODE"), "{msg}");
+    }
+
+    /// ADR-0041 § 9: the TLS listener needs both halves of its key pair, and is refused
+    /// outside requester mode rather than silently not started.
+    #[test]
+    fn tls_listener_needs_both_halves_and_requester_mode() {
+        let requester = [
+            ("PACER_AUTH_MODE", "requester"),
+            ("PACER_AUTH_S3_DOMAINS", "s3.us-east-2.amazonaws.com"),
+        ];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut env = requester.to_vec();
+            env.extend_from_slice(extra);
+            resolve(&FileConfig::default(), &fake_env(&env))
+        };
+
+        let cfg = with(&[]).unwrap();
+        assert!(cfg.auth_tls.is_none(), "no pair, no TLS listener");
+
+        let cfg = with(&[("PACER_TLS_CERT", "/c.pem"), ("PACER_TLS_KEY", "/k.pem")]).unwrap();
+        let tls = cfg.auth_tls.expect("a pair starts the TLS listener");
+        assert_eq!(tls.listen_addr, "0.0.0.0:9443");
+
+        let err = with(&[("PACER_TLS_CERT", "/c.pem")]).expect_err("a cert with no key");
+        assert!(err.to_string().contains("PACER_TLS_KEY"), "{err}");
+
+        let err = resolve(
+            &FileConfig::default(),
+            &fake_env(&[("PACER_TLS_CERT", "/c.pem"), ("PACER_TLS_KEY", "/k.pem")]),
+        )
+        .expect_err("node mode has no proxy for a TLS listener to serve");
+        assert!(err.to_string().contains("PACER_AUTH_MODE"), "{err}");
+    }
+
+    /// The `auth:` block exactly as the chart renders it with a TLS Secret set. The file
+    /// schema denies unknown keys, so a key-name drift between chart and daemon would be
+    /// a pod that never starts; this keeps them the same names.
+    #[test]
+    fn the_charts_requester_tls_block_resolves() {
+        let yaml = r#"
+auth:
+  mode: requester
+  s3-domains:
+    - "s3.us-east-2.amazonaws.com"
+  tls:
+    cert: "/etc/pacer-tls/tls.crt"
+    key: "/etc/pacer-tls/tls.key"
+    listen-addr: "0.0.0.0:9443"
+"#;
+        let cfg = resolve_for_test(yaml, &[]).expect("the chart's auth block must resolve");
+        assert_eq!(cfg.auth_mode, crate::auth::AuthMode::Requester);
+        assert_eq!(
+            cfg.auth_s3_domains,
+            vec!["s3.us-east-2.amazonaws.com".to_owned()]
+        );
+        let tls = cfg.auth_tls.expect("a TLS listener");
+        assert_eq!(tls.cert, std::path::PathBuf::from("/etc/pacer-tls/tls.crt"));
+        assert_eq!(tls.key, std::path::PathBuf::from("/etc/pacer-tls/tls.key"));
+        assert_eq!(tls.listen_addr, "0.0.0.0:9443");
+    }
+
+    #[test]
+    fn auth_s3_domains_parses_the_comma_list_and_drops_empties() {
+        let cfg = resolve(
+            &FileConfig::default(),
+            &fake_env(&[
+                ("PACER_AUTH_MODE", "requester"),
+                (
+                    "PACER_AUTH_S3_DOMAINS",
+                    "s3.us-east-2.amazonaws.com, ,s3express-use2-az1.us-east-2.amazonaws.com,",
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.auth_s3_domains,
+            vec![
+                "s3.us-east-2.amazonaws.com".to_owned(),
+                "s3express-use2-az1.us-east-2.amazonaws.com".to_owned(),
+            ]
+        );
     }
 
     #[test]

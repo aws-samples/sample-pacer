@@ -56,6 +56,11 @@ spec:
     - ports:
         - port: {{ $.Values.ports.s3 }}
           protocol: TCP
+        {{- if include "pacer.tlsEnabled" $ }}
+        # Requester mode's TLS listener: the same clients, the same front door.
+        - port: {{ $.Values.auth.requester.tls.port }}
+          protocol: TCP
+        {{- end }}
       from:
         {{- toYaml . | nindent 8 }}
     {{- end }}

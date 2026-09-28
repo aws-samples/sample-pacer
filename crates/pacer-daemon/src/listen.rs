@@ -162,6 +162,11 @@ impl ListenLimits {
 /// Serve the S3 API on `addr` until `shutdown` is raised, then stop accepting
 /// and let watched connections finish.
 ///
+/// Generic over the per-connection service so `node` mode can serve
+/// `s3s::service::S3Service` directly and `requester` mode can serve
+/// [`crate::authz::RequesterFront`] on the same listener — the bounds are
+/// exactly what `hyper_util`'s connection builder itself requires.
+///
 /// Returns once every connection this listener accepted has completed. The
 /// caller decides how long that may take — see `main`'s drain deadline, which is
 /// paired with the chart's `terminationGracePeriodSeconds`.
@@ -172,13 +177,26 @@ impl ListenLimits {
 /// failures (a listener that is not merely under pressure but unusable — the pod
 /// should restart rather than pass its liveness probe while serving nothing).
 /// Per-connection errors are logged and absorbed.
-pub async fn serve_s3(
+pub async fn serve_s3<S, B>(
     addr: String,
-    service: s3s::service::S3Service,
+    service: S,
     limits: ListenLimits,
     metrics: Metrics,
     shutdown: ShutdownSignal,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: hyper::service::Service<
+            hyper::Request<hyper::body::Incoming>,
+            Response = hyper::Response<B>,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let listener = TcpListener::bind(&addr).await?;
     serve_s3_on(listener, service, limits, metrics, shutdown).await
 }
@@ -193,13 +211,86 @@ pub async fn serve_s3(
 /// # Errors
 ///
 /// As [`serve_s3`], minus the bind.
-pub async fn serve_s3_on(
+pub async fn serve_s3_on<S, B>(
     listener: TcpListener,
-    service: s3s::service::S3Service,
+    service: S,
     limits: ListenLimits,
     metrics: Metrics,
     shutdown: ShutdownSignal,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: hyper::service::Service<
+            hyper::Request<hyper::body::Incoming>,
+            Response = hyper::Response<B>,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    serve_listener(listener, None, service, limits, metrics, shutdown).await
+}
+
+/// [`serve_s3_on`] with every connection wrapped in TLS to this daemon's OWN certificate
+/// — `auth.mode: requester`'s recommended client shape (ADR-0041 § 9): botocore's
+/// `proxy_use_forwarding_for_https` sends the absolute-form request inside this session
+/// rather than tunnelling, so the proxy still sees it, and S3's certificate is never
+/// impersonated. The same caps, deadlines and drain apply; the handshake runs inside the
+/// connection's own task, bounded by the header deadline, so a slow one never stalls the
+/// accept loop.
+///
+/// # Errors
+///
+/// As [`serve_s3_on`].
+pub async fn serve_s3_tls_on<S, B>(
+    listener: TcpListener,
+    tls: tokio_rustls::TlsAcceptor,
+    service: S,
+    limits: ListenLimits,
+    metrics: Metrics,
+    shutdown: ShutdownSignal,
+) -> anyhow::Result<()>
+where
+    S: hyper::service::Service<
+            hyper::Request<hyper::body::Incoming>,
+            Response = hyper::Response<B>,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    serve_listener(listener, Some(tls), service, limits, metrics, shutdown).await
+}
+
+/// The accept loop [`serve_s3_on`] and [`serve_s3_tls_on`] share.
+async fn serve_listener<S, B>(
+    listener: TcpListener,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    service: S,
+    limits: ListenLimits,
+    metrics: Metrics,
+    shutdown: ShutdownSignal,
+) -> anyhow::Result<()>
+where
+    S: hyper::service::Service<
+            hyper::Request<hyper::body::Incoming>,
+            Response = hyper::Response<B>,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let addr = listener.local_addr()?.to_string();
     let permits = Arc::new(Semaphore::new(limits.max_connections));
     let graceful = GracefulShutdown::new();
@@ -209,6 +300,7 @@ pub async fn serve_s3_on(
         max_connections = limits.max_connections,
         header_timeout_secs = limits.header_timeout.as_secs(),
         idle_timeout_secs = limits.idle_timeout.as_secs(),
+        tls = tls.is_some(),
         "s3 endpoint listening"
     );
     let mut consecutive_errors = 0u32;
@@ -219,24 +311,19 @@ pub async fn serve_s3_on(
         match accept(&listener, &shutdown).await {
             Accepted::Stream(stream) => {
                 consecutive_errors = 0;
-                let watcher = graceful.watcher();
-                let conn = builder
-                    .serve_connection(
-                        TokioIo::new(IdleTimeout::new(stream, limits.idle_timeout)),
-                        service.clone(),
-                    )
-                    .into_owned();
                 metrics.listener.connections_active.inc();
-                let metrics = metrics.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = watcher.watch(conn).await {
-                        warn!(error = %e, "s3 connection error");
-                    }
-                    metrics.listener.connections_active.dec();
-                    // Explicit, and last: the permit is what admits the NEXT
-                    // connection, so it must outlive the served one.
-                    drop(permit);
-                });
+                spawn_connection(
+                    IdleTimeout::new(stream, limits.idle_timeout),
+                    tls.clone(),
+                    Served {
+                        builder: builder.clone(),
+                        service: service.clone(),
+                        watcher: graceful.watcher(),
+                        handshake_timeout: limits.header_timeout,
+                    },
+                    metrics.clone(),
+                    permit,
+                );
             }
             Accepted::Transient(e) => {
                 metrics.listener.accept_errors.inc();
@@ -260,6 +347,70 @@ pub async fn serve_s3_on(
     graceful.shutdown().await;
     info!(%addr, "s3 connections drained");
     Ok(())
+}
+
+/// What one accepted connection is served with.
+struct Served<S> {
+    builder: hyper_util::server::conn::auto::Builder<TokioExecutor>,
+    service: S,
+    watcher: hyper_util::server::graceful::Watcher,
+    /// Bounds a TLS handshake; the header deadline, which is the same question asked of
+    /// a plaintext connection — how long may it take to start saying something.
+    handshake_timeout: Duration,
+}
+
+/// Serve one accepted connection on its own task — over TLS first when `tls` is set —
+/// and release its connection permit only when it is done.
+fn spawn_connection<S, B>(
+    stream: IdleTimeout<TcpStream>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    served: Served<S>,
+    metrics: Metrics,
+    permit: OwnedSemaphorePermit,
+) where
+    S: hyper::service::Service<
+            hyper::Request<hyper::body::Incoming>,
+            Response = hyper::Response<B>,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    tokio::spawn(async move {
+        let Served {
+            builder,
+            service,
+            watcher,
+            handshake_timeout,
+        } = served;
+        let result = match tls {
+            None => {
+                let conn = builder.serve_connection(TokioIo::new(stream), service);
+                watcher.watch(conn.into_owned()).await
+            }
+            Some(acceptor) => {
+                match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                    Ok(Ok(tls_stream)) => {
+                        let conn = builder.serve_connection(TokioIo::new(tls_stream), service);
+                        watcher.watch(conn.into_owned()).await
+                    }
+                    Ok(Err(e)) => Err(e.into()),
+                    Err(_) => Err("TLS handshake timed out".into()),
+                }
+            }
+        };
+        if let Err(e) = result {
+            warn!(error = %e, "s3 connection error");
+        }
+        metrics.listener.connections_active.dec();
+        // Explicit, and last: the permit is what admits the NEXT connection, so it must
+        // outlive the served one.
+        drop(permit);
+    });
 }
 
 /// The three things one turn of the accept loop can produce.

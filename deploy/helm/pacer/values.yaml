@@ -246,6 +246,28 @@ service:
   # Hard node-locality: kube-proxy only routes to endpoints on the same node.
   internalTrafficPolicy: Local
 
+# Which identity authorizes a request against S3 (ADR-0041). docs/helm/auth.md
+auth:
+  # node      — ADR-0006: clients sign with placeholder credentials, the daemon re-signs
+  #             with its own identity, and the NetworkPolicy below IS the authorization.
+  # requester — clients configure the daemon as an HTTP proxy and S3 authorizes each
+  #             caller's own signature. Refuses a non-empty config.bucketMap and an
+  #             explicit scatter.enabled: true (neither can be signed for by the caller).
+  mode: node
+  requester:
+    # Base domains the daemon parses virtual-hosted requests against, e.g.
+    # s3.us-east-2.amazonaws.com and, on express, s3express-use2-az1.us-east-2.amazonaws.com.
+    # Required in requester mode, and deliberately not derived: a wrong list yields a
+    # plausible bucket name and a 404 from S3, not an error.
+    s3Domains: []
+    # A second listener speaking TLS to the daemon's OWN certificate — the recommended
+    # client shape (botocore proxy_use_forwarding_for_https); S3's certificate is never
+    # impersonated. secretName names a kubernetes.io/tls Secret in the release namespace;
+    # empty = plaintext only. Refused in node mode.
+    tls:
+      secretName: ""
+      port: 9443
+
 # ADR-0006's authorization boundary: reaching :9000 IS the authorization to spend the node's
 # IAM identity, so this is the client-side security model, not a hardening extra — which is
 # why it ships ON. ⚠ It enforces NOTHING unless your CNI enforces NetworkPolicy, and the AWS

@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use pacer_daemon::staging::StagingArea;
 use pacer_daemon::{
-    auth, cachefill, config, coordinate, health, listen, memory_budget, metrics, peer, proxy,
-    shutdown,
+    auth, authz, cachefill, config, coordinate, health, listen, memory_budget, metrics, peer,
+    proxy, shutdown,
 };
 use s3s::service::S3ServiceBuilder;
 use tracing::{info, warn};
@@ -342,15 +342,8 @@ async fn run(
     // tier it was configured with must fail to start, not serve half the rate at it.
     assert_store_has_a_slab(&tier)?;
 
-    let s3_service = build_s3_service(proxy, &cfg);
     let admin = tokio::spawn(health::serve(cfg.admin_addr.clone(), metrics.clone()));
-    let mut s3 = tokio::spawn(listen::serve_s3(
-        cfg.listen_addr.clone(),
-        s3_service,
-        cfg.listen,
-        metrics.clone(),
-        shutdown.signal(),
-    ));
+    let mut s3 = spawn_s3_listener(proxy, &cfg, metrics.clone(), shutdown.signal())?;
 
     info!(admin = %cfg.admin_addr, s3 = %cfg.listen_addr, "pacer-daemon up");
     // A shutdown signal is the ONE orderly exit. Any server task ending on its
@@ -679,7 +672,7 @@ fn enable_cluster(
         #[cfg(feature = "efa")]
         efa: efa.clone(),
     };
-    let staging = scatter_staging(&cfg.scatter);
+    let staging = scatter_staging(cfg);
     let proxy = attach_scatter(
         proxy
             .with_chunk_fill(chunk_fill.clone())
@@ -1117,6 +1110,89 @@ fn build_s3_service(proxy: proxy::PacerProxy, cfg: &config::Config) -> s3s::serv
     b.build()
 }
 
+/// Start the S3 listener in whichever mode `cfg.auth_mode` names.
+///
+/// # Errors
+///
+/// `requester` mode's `cfg.auth_s3_domains` failing `MultiDomain::new` (see
+/// [`spawn_requester_listener`]).
+fn spawn_s3_listener(
+    proxy: proxy::PacerProxy,
+    cfg: &config::Config,
+    metrics: metrics::Metrics,
+    shutdown: shutdown::ShutdownSignal,
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+    match cfg.auth_mode {
+        auth::AuthMode::Node => {
+            let s3_service = build_s3_service(proxy, cfg);
+            Ok(tokio::spawn(listen::serve_s3(
+                cfg.listen_addr.clone(),
+                s3_service,
+                cfg.listen,
+                metrics,
+                shutdown,
+            )))
+        }
+        auth::AuthMode::Requester => spawn_requester_listener(proxy, cfg, metrics, shutdown),
+    }
+}
+
+/// `requester` mode's variant of [`spawn_s3_listener`] (ADR-0041): wrap
+/// `proxy` in [`proxy::RequesterS3`] (only `get_object` reachable — see its
+/// own doc for why that matters), build the anonymous `s3s` service
+/// `set_host` needs to parse virtual-hosted requests, and serve
+/// [`authz::RequesterFront`] in front of it.
+///
+/// # Errors
+///
+/// `cfg.auth_s3_domains` failing `MultiDomain::new` — overlapping or
+/// invalid domains; `config::resolve` already refused an empty list.
+fn spawn_requester_listener(
+    proxy: proxy::PacerProxy,
+    cfg: &config::Config,
+    metrics: metrics::Metrics,
+    shutdown: shutdown::ShutdownSignal,
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+    let build_domains = || -> anyhow::Result<s3s::host::MultiDomain> {
+        s3s::host::MultiDomain::new(&cfg.auth_s3_domains)
+            .map_err(|e| anyhow::anyhow!("requester-mode S3 domain list: {e}"))
+    };
+    info!(domains = ?cfg.auth_s3_domains, tls = ?cfg.auth_tls.as_ref().map(|t| &t.listen_addr),
+        "requester mode: resolved S3 host domains");
+    let forwarder = Arc::new(authz::Forwarder::new());
+    let mut b = S3ServiceBuilder::new(proxy::RequesterS3::new(proxy, Arc::clone(&forwarder)));
+    b.set_host(build_domains()?);
+    let inner = b.build();
+    let front = authz::RequesterFront::new(
+        inner,
+        Arc::new(build_domains()?),
+        forwarder,
+        metrics.clone(),
+    );
+    let plain = listen::serve_s3(
+        cfg.listen_addr.clone(),
+        front.clone(),
+        cfg.listen,
+        metrics.clone(),
+        shutdown.clone(),
+    );
+    let Some(tls) = &cfg.auth_tls else {
+        return Ok(tokio::spawn(plain));
+    };
+    // Loaded here, before anything is spawned, so a bad certificate is a startup error
+    // rather than a listener that dies later with the plaintext one still up.
+    let acceptor = authz::tls_acceptor(tls)?;
+    let (addr, limits) = (tls.listen_addr.clone(), cfg.listen);
+    // One task for both, so the process treats them as one front door: either one ending
+    // on its own is fatal, and a drain waits for both. Each listener holds its own
+    // connection cap, so the node-wide ceiling is twice `listen.max_connections`.
+    Ok(tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        let tls = listen::serve_s3_tls_on(listener, acceptor, front, limits, metrics, shutdown);
+        tokio::try_join!(plain, tls).map(|_| ())
+    }))
+}
+
 /// Start the peer gRPC server on this node's peer address.
 ///
 /// `serve_with_shutdown` rather than `serve` (ADR-0036): the peer plane carries a
@@ -1210,6 +1286,7 @@ fn build_peer_server(
     // The same value the proxy gets: one node must not promote on one read path
     // and not the other.
     .with_promotion(cfg.promotion)
+    .with_requester_mode(cfg.auth_mode == auth::AuthMode::Requester)
 }
 
 /// Give the proxy a scatter coordinator, when the scatter is on (ADR-0032).
@@ -1234,7 +1311,9 @@ fn attach_scatter(
     (backend, tier): (aws_sdk_s3::Client, pacer_cache::tier::ChunkTier),
     metrics: &metrics::Metrics,
 ) -> proxy::PacerProxy {
-    let Some(staging) = staging else {
+    // A staging area also exists in requester mode, where the scatter is off
+    // (ADR-0041): that node homes populated windows but coordinates nothing.
+    let Some(staging) = staging.filter(|_| cfg.scatter.enabled) else {
         return proxy;
     };
     let coordinator = Arc::new(coordinate::ScatterCoordinator::new(
@@ -1281,8 +1360,14 @@ fn attach_staging(
 /// retrying. A zero-budget area would refuse every offer as though the node were
 /// merely busy, and the coordinator would keep coming back to a node that will
 /// never accept.
-fn scatter_staging(cfg: &pacer_daemon::scatter::ScatterConfig) -> Option<Arc<StagingArea>> {
-    if !cfg.enabled {
+///
+/// `requester` mode (ADR-0041) needs one too, with the scatter off: it is where a
+/// peer's populate-only window lands. Same budget and TTL knobs, so a fleet's
+/// memory model gains no term (planning/30 § 5).
+fn scatter_staging(config: &config::Config) -> Option<Arc<StagingArea>> {
+    let cfg = &config.scatter;
+    let requester = config.auth_mode == auth::AuthMode::Requester;
+    if !cfg.enabled && !requester {
         return None;
     }
     info!(
@@ -1290,7 +1375,9 @@ fn scatter_staging(cfg: &pacer_daemon::scatter::ScatterConfig) -> Option<Arc<Sta
         ttl_secs = cfg.staging_ttl.as_secs(),
         windows_in_flight = cfg.windows_in_flight,
         min_object_bytes = cfg.min_object_bytes,
-        "write scatter enabled (ADR-0032)"
+        scatter = cfg.enabled,
+        requester_populate = requester,
+        "staging area enabled (ADR-0032 / ADR-0041)"
     );
     Some(Arc::new(StagingArea::new(
         usize::try_from(cfg.staging_bytes).unwrap_or(usize::MAX),

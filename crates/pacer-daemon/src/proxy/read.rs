@@ -40,7 +40,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
 use super::cluster::is_home;
-use super::fill::FillCtx;
+use super::fill::{FillCtx, RequesterRead};
 use super::PacerProxy;
 
 /// Resolve the object header (length + response metadata) needed to compute
@@ -443,7 +443,7 @@ impl PacerProxy {
 
         // 4. Serve the covering chunks in order through the bounded look-ahead
         //    pipeline, filling misses per chunk.
-        let ctx = self.fill_ctx(object_key, bucket, key, header.object_len, decision);
+        let ctx = self.fill_ctx(object_key, bucket, key, header.object_len, decision, None);
 
         // 5. ADR-0026: a client that named memory it owns gets the bytes
         //    delivered into it and a header-only 200. Everything below this
@@ -461,6 +461,327 @@ impl PacerProxy {
         let body = self.chunked_body(ctx, start, end);
         Ok(Self::get_output(&header, start, end, ranged, body))
     }
+
+    /// `auth.mode: requester`'s `get_object` (ADR-0041 § 2.4): the caller's
+    /// own signature authorizes every request instead of this node's
+    /// identity — the probe answers "is this caller allowed", never
+    /// `self.backend`.
+    ///
+    /// Every shape node mode hands to `inner` — a `Cache-Control` bypass, an `If-Match`
+    /// the cache cannot honour, an object outside the admitted size band — is a
+    /// [`Self::pass_through`] of the caller's own request instead. One simplification
+    /// against the full design, stated rather than hidden: the probe runs before the
+    /// cache is touched, never overlapped with it, so a hit costs one S3 round trip.
+    ///
+    /// # Errors
+    ///
+    /// `InternalError` if the front door did not hold the request (a classification
+    /// bug — see [`crate::authz::RequesterFront`]), and whatever the probe transport or
+    /// the first unresolvable chunk fails with. The probe's own denial (403/404/…) is
+    /// mapped to the matching S3 error; a pass-through returns S3's.
+    pub(super) async fn serve_get_requester(
+        &self,
+        mut req: S3Request<dto::GetObjectInput>,
+        forwarder: &Arc<crate::authz::Forwarder>,
+    ) -> S3Result<S3Response<dto::GetObjectOutput>> {
+        self.map_bucket(&mut req.input.bucket);
+        // ADR-0030's pre-flight is refused here, not answered: node mode answers it
+        // before any authorization and learns the object's length with this node's
+        // own `HeadObject`, so in this mode it would tell an unauthorized caller
+        // whether an object exists, how long it is and who holds it — under the
+        // node's identity. It only serves client-memory delivery, which this mode
+        // does not offer yet (see below).
+        if self.requested_endpoints(&req.headers).is_some() {
+            return Err(s3_error!(
+                NotImplemented,
+                "requester mode does not serve the delivery pre-flight"
+            ));
+        }
+        self.count("get_object");
+        let held = req
+            .extensions
+            .get::<Arc<crate::authz::HeldRequest>>()
+            .cloned()
+            .ok_or_else(|| {
+                s3_error!(
+                    InternalError,
+                    "requester mode: no held request — a front-door classification bug"
+                )
+            })?;
+        let cache_control = req
+            .headers
+            .get(hyper::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok());
+        let decision = read_decision(cache_control, req.input.part_number);
+        if decision == ReadDecision::Bypass || !Self::cacheable_shape(&req.input) {
+            return self.pass_through(&held, forwarder).await;
+        }
+
+        let header = self.probe_header(&held, forwarder).await?;
+        if !self.requester_may_cache(&req, &header) {
+            return self.pass_through(&held, forwarder).await;
+        }
+
+        let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+        let object_key = object_key(&bucket, &key);
+        let admit = decision == ReadDecision::CacheAndFill;
+        self.remember_header(&object_key, &header, false, admit);
+
+        let ranged = req.input.range.is_some();
+        let (start, end) = match resolve_input_range(req.input.range.as_ref(), header.object_len) {
+            Some(r) => (r.start, r.end),
+            None => {
+                return Err(s3_error!(
+                    InvalidRange,
+                    "The requested range is not satisfiable"
+                ))
+            }
+        };
+        let ctx = self.fill_ctx(
+            object_key,
+            bucket,
+            key,
+            header.object_len,
+            decision,
+            Some(RequesterRead {
+                held,
+                forwarder: Arc::clone(forwarder),
+                e_tag: header.e_tag.clone(),
+            }),
+        );
+        // No ADR-0026 delivery into client memory in this mode, yet: its placement
+        // path reads the tier directly and would bypass the version-witness check
+        // `FillCtx::resolve_chunk` applies. A client that names a target simply gets
+        // an ordinary body, which is the documented fallback for that header.
+        let body = self.chunked_body(ctx, start, end);
+        Ok(Self::get_output(&header, start, end, ranged, body))
+    }
+
+    /// Run the authorization probe and derive the object header from it
+    /// (ADR-0041 § 2.4 points 3–4): `HeadObject` is never issued in this
+    /// mode. Split out of [`Self::serve_get_requester`] to keep that
+    /// function under the line budget, and because the three probe metrics
+    /// belong with the request that produced them, not spread across two
+    /// call sites.
+    async fn probe_header(
+        &self,
+        held: &crate::authz::HeldRequest,
+        forwarder: &crate::authz::Forwarder,
+    ) -> S3Result<ObjectHeader> {
+        let t0 = std::time::Instant::now();
+        let probe = forwarder.send_range(held, "bytes=0-0").await;
+        self.metrics
+            .authz
+            .probe_seconds
+            .with_label_values::<&str>(&[])
+            .observe(t0.elapsed().as_secs_f64());
+        let probe = probe.map_err(|e| {
+            self.metrics
+                .authz
+                .probe_total
+                .with_label_values(&["error"])
+                .inc();
+            warn!(error = %e, "requester mode: authorization probe failed");
+            s3_error!(InternalError, "authorization probe failed")
+        })?;
+        if !probe_allows(probe.status.as_u16()) {
+            self.metrics
+                .authz
+                .probe_total
+                .with_label_values(&["deny"])
+                .inc();
+            return Err(probe_denial(probe.status.as_u16()));
+        }
+        self.metrics
+            .authz
+            .probe_total
+            .with_label_values(&["allow"])
+            .inc();
+        header_from_probe(&probe)
+    }
+
+    /// Whether a probed GET may be served through the cache: node mode's own post-header
+    /// admission — an `If-Match` the cache can honour (ADR-0039), an object inside the
+    /// admitted size band (ADR-0002). `false` means [`Self::pass_through`], exactly as
+    /// node mode passes the same shapes through to `inner`.
+    fn requester_may_cache(
+        &self,
+        req: &S3Request<dto::GetObjectInput>,
+        header: &ObjectHeader,
+    ) -> bool {
+        let if_match = req.input.if_match.as_ref();
+        if if_match.is_some() && !self.conditional_get_from_cache {
+            return false;
+        }
+        if !if_match_allows_cache(if_match, header.e_tag.as_deref()) {
+            return false;
+        }
+        if !should_admit(
+            Some(header.object_len),
+            self.min_object_size,
+            self.max_object_size,
+        ) {
+            return false;
+        }
+        if if_match.is_some() {
+            self.metrics.conditional_get_served.inc();
+        }
+        true
+    }
+
+    /// Serve a GET the cache does not serve by re-emitting the caller's request exactly
+    /// as it arrived and streaming S3's answer back — status, headers and body — so the
+    /// caller gets what S3 would have sent it, authorized by its own signature. The
+    /// requester-mode counterpart of node mode's `inner` passthrough; nothing is cached.
+    ///
+    /// # Errors
+    ///
+    /// S3's own error for a non-2xx answer, with its status and code; `InternalError`
+    /// when S3 could not be reached at all.
+    async fn pass_through(
+        &self,
+        held: &crate::authz::HeldRequest,
+        forwarder: &crate::authz::Forwarder,
+    ) -> S3Result<S3Response<dto::GetObjectOutput>> {
+        self.metrics.cache_bypass.inc();
+        let resp = forwarder.send_held(held).await.map_err(|e| {
+            warn!(error = %e, "requester mode: pass-through failed");
+            s3_error!(InternalError, "pass-through to S3 failed")
+        })?;
+        let (parts, body) = resp.into_parts();
+        let mut headers = parts.headers;
+        let hop_by_hop: Vec<_> = headers
+            .keys()
+            .filter(|n| crate::authz::is_hop_by_hop(n.as_str()))
+            .cloned()
+            .collect();
+        for name in hop_by_hop {
+            headers.remove(name);
+        }
+        if !parts.status.is_success() {
+            return Err(s3_error_from(parts.status, body).await);
+        }
+        let output = dto::GetObjectOutput {
+            body: Some(StreamingBlob::from(s3s::Body::http_body(body))),
+            // Present exactly when S3 answered 206; it is what makes s3s answer 206 too.
+            content_range: headers
+                .get(hyper::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            ..Default::default()
+        };
+        // Replaces every header s3s would derive, so `x-amz-meta-*`, checksums and the
+        // version id reach the caller exactly as S3 sent them.
+        Ok(S3Response::with_headers(output, headers))
+    }
+}
+
+/// Upper bound on an S3 error body a pass-through reads to learn the error code. S3's
+/// error documents are a few hundred bytes of XML; anything larger is not one, and the
+/// status alone is returned.
+const MAX_ERROR_BODY: usize = 16 << 10;
+
+/// S3's error answer to a pass-through, as the `S3Error` s3s will serialize: S3's
+/// status, and its `<Code>` when the body is the small XML document S3 sends. A body
+/// that is not one keeps the status and falls back to a code derived from it.
+async fn s3_error_from(status: hyper::StatusCode, body: hyper::body::Incoming) -> s3s::S3Error {
+    use http_body_util::BodyExt;
+    let limited = http_body_util::Limited::new(body, MAX_ERROR_BODY);
+    let text = match limited.collect().await {
+        Ok(collected) => String::from_utf8_lossy(&collected.to_bytes()).into_owned(),
+        Err(_) => String::new(),
+    };
+    let code = text
+        .split_once("<Code>")
+        .and_then(|(_, rest)| rest.split_once("</Code>"))
+        .and_then(|(code, _)| s3s::S3ErrorCode::from_bytes(code.trim().as_bytes()))
+        .or_else(|| {
+            s3s::S3ErrorCode::from_bytes(
+                status
+                    .canonical_reason()
+                    .unwrap_or("")
+                    .replace(' ', "")
+                    .as_bytes(),
+            )
+        })
+        .unwrap_or(s3s::S3ErrorCode::InternalError);
+    let mut err = s3s::S3Error::with_message(code, "returned by S3");
+    err.set_status_code(status);
+    err
+}
+
+/// Whether the probe's status means the caller is authorized (ADR-0041 §
+/// 2.4 point 4): `2xx`/`206` is a normal answer, and `416` is a zero-byte
+/// object — S3 evaluates authorization before range satisfiability, so a
+/// `416` here is "authorized but unsatisfiable", not a deny.
+fn probe_allows(status: u16) -> bool {
+    matches!(status, 200..=299 | 416)
+}
+
+/// Map the probe's denial to the S3 error a client would recognize for it.
+/// Anything other than the two modeled codes stays `InternalError` rather
+/// than guessing at a code S3 never actually returned.
+fn probe_denial(status: u16) -> s3s::S3Error {
+    match status {
+        403 => s3_error!(AccessDenied, "Access Denied"),
+        404 => s3_error!(NoSuchKey, "The specified key does not exist."),
+        _ => s3_error!(InternalError, "authorization probe denied"),
+    }
+}
+
+/// Derive an [`ObjectHeader`] from the probe's response headers (ADR-0041 §
+/// 2.4 point 4): its `Content-Range` total is the object length — the only
+/// source of it in this mode, since `HeadObject` is never issued — and its
+/// `ETag`/`Content-Type`/`Last-Modified` are the object's own.
+///
+/// # Errors
+///
+/// The probe response carried no `Content-Range`, or it did not parse: a
+/// probe response in a shape this daemon cannot derive a header from.
+fn header_from_probe(resp: &crate::authz::HeldResponse) -> S3Result<ObjectHeader> {
+    let content_range = resp
+        .headers
+        .get(hyper::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| s3_error!(InternalError, "probe response had no Content-Range"))?;
+    let object_len = content_range
+        .rsplit('/')
+        .next()
+        .and_then(|total| total.parse::<u64>().ok())
+        .ok_or_else(|| {
+            s3_error!(
+                InternalError,
+                "probe response's Content-Range did not parse"
+            )
+        })?;
+    let e_tag = resp
+        .headers
+        .get(hyper::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim_matches('"').to_owned());
+    let content_type = resp
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let last_modified_epoch_secs = resp
+        .headers
+        .get(hyper::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            aws_sdk_s3::primitives::DateTime::from_str(
+                v,
+                aws_sdk_s3::primitives::DateTimeFormat::HttpDate,
+            )
+            .ok()
+        })
+        .map(|dt| dt.secs());
+    Ok(ObjectHeader::new(
+        object_len,
+        e_tag,
+        content_type,
+        last_modified_epoch_secs,
+    ))
 }
 
 /// Resolve a request's optional HTTP range into a byte range `[start, end)`

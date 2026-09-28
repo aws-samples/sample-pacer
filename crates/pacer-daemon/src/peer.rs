@@ -196,6 +196,12 @@ pub struct PacerPeer {
     /// not a general-purpose bucket (§ 6) — which is what makes
     /// [`RefusalReason::NotAccepting`] distinguishable from a load refusal.
     staging: Option<Arc<StagingArea>>,
+    /// `auth.mode: requester` (ADR-0041): this node holds no S3 identity it may
+    /// use on anyone's behalf, so a `FetchBlob` miss is never read through and a
+    /// `StoreChunk` is only ever staged, never uploaded. Enforced here rather than
+    /// trusted to the requester's `no_fill`/`populate_only` flags, because the
+    /// peer plane authenticates nobody.
+    requester_mode: bool,
 }
 
 /// Everything [`PacerPeer::new`] cannot default: the handles and policy values a
@@ -299,6 +305,7 @@ impl PacerPeer {
             #[cfg(feature = "efa")]
             rdma_runtime: parts.rdma_runtime,
             staging: None,
+            requester_mode: false,
         }
     }
 
@@ -406,6 +413,14 @@ impl PacerPeer {
         self
     }
 
+    /// Serve under `auth.mode: requester` (ADR-0041): never read S3 through on a
+    /// miss and never upload a part, whatever the caller's flags say.
+    #[must_use]
+    pub fn with_requester_mode(mut self, requester_mode: bool) -> Self {
+        self.requester_mode = requester_mode;
+        self
+    }
+
     /// Set whether a serve's local disk hit promotes into the RAM tier.
     ///
     /// Builder-style rather than a [`PeerParts`] field, and it must be given
@@ -449,10 +464,12 @@ impl PacerPeer {
         let written = self.try_serve_via_write(req, &body).await;
         let served_via_rdma = written.served;
         // Chunk bodies carry no per-object metadata (it lives in the header
-        // entry, fetched separately). The requester reads only the bytes.
+        // entry, fetched separately) — except the chunk's own version witness,
+        // which a requester-mode reader checks against its probe's ETag before
+        // serving these bytes (ADR-0041). Node mode ignores it.
         let meta = BlobMeta {
             total_len: body.len() as u64,
-            e_tag: None,
+            e_tag: chunk.e_tag.clone(),
             object_len: body.len() as u64,
             body_start: 0,
             content_type: None,
@@ -1056,7 +1073,10 @@ impl Peer for PacerPeer {
         // (layer 2: all R homes fill on read-through).
         let homes = self.ring.homes(&req.cache_key, self.replication_r);
         let owns = homes.iter().any(|n| n.name() == self.local_node);
-        if req.no_fill || !owns {
+        // Requester mode (ADR-0041 § 2.4 point 6): a home never reads S3 on a
+        // requester's behalf — it has no caller signature to do it with, and
+        // reading with its own identity is the confused deputy the mode removes.
+        if req.no_fill || !owns || self.requester_mode {
             self.metrics.peer_misses.inc();
             return Err(Status::not_found("blob not cached"));
         }
@@ -1088,6 +1108,12 @@ impl Peer for PacerPeer {
         request: Request<StoreChunkRequest>,
     ) -> Result<Response<StoreChunkResponse>, Status> {
         let mut req = request.into_inner();
+        // Requester mode holds no identity to `UploadPart` with (ADR-0041), so an
+        // offer that asks for an upload is refused before anything is staged.
+        if self.requester_mode && !req.populate_only {
+            self.note_refusal(&StoreRefusal::NotAccepting);
+            return Ok(Response::new(refused(RefusalReason::NotAccepting, 0, 0)));
+        }
         let Some(staging) = self.staging.clone() else {
             self.note_refusal(&StoreRefusal::NotAccepting);
             return Ok(Response::new(refused(RefusalReason::NotAccepting, 0, 0)));
@@ -1117,10 +1143,24 @@ impl Peer for PacerPeer {
             // coordinator is missing the ETag it needs for Complete — S3 takes a
             // repeated part number for the same bytes without complaint.
             StageOutcome::Staged | StageOutcome::AlreadyStaged => {
+                // `populate_only` (ADR-0041, planning/30 § 4.1): the offerer has
+                // no S3 identity to upload with, or the bytes are already
+                // confirmed to exist by a read rather than a write in progress.
+                // The bytes are staged (above) exactly as a real upload's are;
+                // what does NOT happen is `UploadPart` — commit/discard make
+                // them visible or drop them, unchanged either way.
+                if req.populate_only {
+                    return Ok(Response::new(StoreChunkResponse {
+                        e_tag: None,
+                        refusal: None,
+                        staged: true,
+                    }));
+                }
                 match self.timed_scattered_part(&req, body).await {
                     Ok(e_tag) => Ok(Response::new(StoreChunkResponse {
                         e_tag: Some(e_tag),
                         refusal: None,
+                        staged: false,
                     })),
                     Err(e) => {
                         // Release at once rather than letting the reservation sit
@@ -1262,6 +1302,7 @@ fn refused(reason: RefusalReason, staged_bytes: u64, budget_bytes: u64) -> Store
             staged_bytes,
             budget_bytes,
         }),
+        staged: false,
     }
 }
 

@@ -71,6 +71,30 @@ const READ_FAILURE_EXHAUSTED: &str = "exhausted";
 /// credentials, or the request it asked for.
 const READ_FAILURE_PERMANENT: &str = "permanent";
 
+/// Ties a [`FillCtx`]'s backend reads to the caller's own held signature
+/// instead of this node's identity (ADR-0041 § 2.4 point 5) — present only
+/// on a `requester`-mode GET's `FillCtx`; `node` mode's reads via
+/// [`FillCtx::backend`] exactly as before.
+pub(super) struct RequesterRead {
+    pub(super) held: Arc<crate::authz::HeldRequest>,
+    pub(super) forwarder: Arc<crate::authz::Forwarder>,
+    /// The object's ETag as this GET's authorization probe reported it — the
+    /// version witness a populated chunk is committed under at its home.
+    pub(super) e_tag: Option<String>,
+}
+
+/// `outcome` labels of `pacer_populate_windows_total` (ADR-0041 § 2.4 point 6).
+/// The home staged and committed the window: it is now a holder.
+const POPULATE_COMMITTED: &str = "committed";
+/// The home declined (budget, not accepting): the window stays uncached there.
+const POPULATE_REFUSED: &str = "refused";
+/// The offer or the commit failed in transit, or the home broke protocol.
+const POPULATE_FAILED: &str = "failed";
+
+/// Makes each read-path populate's synthetic upload id unique within the
+/// staging areas it reaches — all a staging key has to be (planning/30 § 4.2).
+static POPULATE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Everything a chunk resolution needs, shared (via `Arc`) across the bounded
 /// look-ahead pipeline so each in-flight resolution clones only a refcount.
 pub(super) struct FillCtx {
@@ -114,6 +138,10 @@ pub(super) struct FillCtx {
     /// write client memory has no second path to choose between.
     #[cfg(feature = "efa")]
     pub(super) remote_write: bool,
+    /// `Some` under `auth.mode=requester` (ADR-0041): a chunk's backend read
+    /// re-emits the caller's held signature instead of using
+    /// [`Self::backend`].
+    pub(super) requester: Option<RequesterRead>,
 }
 
 impl PacerProxy {
@@ -132,6 +160,7 @@ impl PacerProxy {
         key: String,
         object_len: u64,
         decision: ReadDecision,
+        requester: Option<RequesterRead>,
     ) -> Arc<FillCtx> {
         Arc::new(FillCtx {
             tier: self.tier.clone(),
@@ -151,6 +180,7 @@ impl PacerProxy {
             no_fill: decision == ReadDecision::CacheNoFill,
             #[cfg(feature = "efa")]
             remote_write: self.delivery.remote_write,
+            requester,
         })
     }
 }
@@ -485,9 +515,13 @@ impl FillCtx {
     pub(super) async fn resolve_chunk(&self, idx: u64) -> S3Result<Bytes> {
         let chunk_key = self.chunk.chunk_key(&self.object_key, idx);
         if let Ok(Some(c)) = self.tier.get_chunk(&chunk_key).await {
-            self.metrics.cache_hits.inc();
-            self.metrics.bytes_from_cache.inc_by(c.body.len() as u64);
-            return Ok(c.body);
+            // A stale entry in requester mode is a miss: resolved below, and a home's
+            // fill overwrites it under the current witness.
+            if self.witness_matches(c.e_tag.as_deref()) {
+                self.metrics.cache_hits.inc();
+                self.metrics.bytes_from_cache.inc_by(c.body.len() as u64);
+                return Ok(c.body);
+            }
         }
         // A chunk this node co-homes (or single-node) is read through the
         // backend and filled here (ADR-0016 layer 2: all R homes fill).
@@ -503,7 +537,71 @@ impl FillCtx {
             self.maybe_admit_local(&chunk_key, &bytes).await;
             return Ok(bytes);
         }
-        self.fetch_from_backend(idx, &chunk_key, false).await
+        let body = self.fetch_from_backend(idx, &chunk_key, false).await?;
+        self.spawn_requester_populate(idx, &chunk_key, &body);
+        Ok(body)
+    }
+
+    /// `requester` mode's cross-node populate (ADR-0041 § 2.4 point 6): the home
+    /// cannot read S3 for a requester, so the node that just did pushes the bytes
+    /// there as a populate-only window and commits it under the probe's ETag.
+    /// Only bytes cross the peer plane — the caller's signature never leaves this
+    /// node.
+    ///
+    /// Fire-and-forget like an ADR-0017 announce: an unpopulated home is a miss on
+    /// the next read, never a wrong byte. The offer's `checksum_crc32` is empty
+    /// because a populate-only owner uploads nothing for S3 to verify it against;
+    /// the hop has exactly the integrity every peer-plane chunk transfer has.
+    fn spawn_requester_populate(&self, idx: u64, chunk_key: &str, body: &Bytes) {
+        let (Some(requester), Some(cluster)) = (&self.requester, &self.cluster) else {
+            return;
+        };
+        let Some(e_tag) = requester.e_tag.clone().filter(|_| self.admit) else {
+            return;
+        };
+        let Some(home) = cluster
+            .ring
+            .homes(chunk_key, cluster.replication_r)
+            .into_iter()
+            .find(|n| n.name() != cluster.local_node)
+        else {
+            return;
+        };
+        let transport = Arc::clone(&cluster.transport);
+        let counter = self.metrics.authz.populate_windows.clone();
+        let sequence = POPULATE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let upload_id = format!("read:{}:{chunk_key}:{sequence}", cluster.local_node);
+        let (chunk_key, bucket, key) =
+            (chunk_key.to_owned(), self.bucket.clone(), self.key.clone());
+        let part_number = i32::try_from(idx + 1).unwrap_or(i32::MAX);
+        let body = body.clone();
+        tokio::spawn(async move {
+            let offer = pacer_transport::StoreOffer {
+                chunk_key: &chunk_key,
+                upload_id: &upload_id,
+                bucket: &bucket,
+                key: &key,
+                part_number,
+                body,
+                checksum_crc32: "",
+                populate_only: true,
+            };
+            let outcome = match transport.store_chunk(&home, offer).await {
+                Ok(pacer_transport::StoreOutcome::Staged) => {
+                    match transport.commit_upload(&home, &upload_id, &e_tag).await {
+                        Ok(_) => POPULATE_COMMITTED,
+                        Err(e) => {
+                            warn!(key = %chunk_key, home = %home.name(), error = %e,
+                                "populate commit failed; the staged window will be reaped");
+                            POPULATE_FAILED
+                        }
+                    }
+                }
+                Ok(pacer_transport::StoreOutcome::Refused(_)) => POPULATE_REFUSED,
+                Ok(pacer_transport::StoreOutcome::Uploaded { .. }) | Err(_) => POPULATE_FAILED,
+            };
+            counter.with_label_values(&[outcome]).inc();
+        });
     }
 
     /// The home's own read of a missed chunk, under ADR-0040's single flight: one
@@ -629,6 +727,9 @@ impl FillCtx {
                 .fetch_blob(source, chunk_key, None, self.no_fill)
                 .await
             {
+                // A holder's copy of an older version (requester mode's witness
+                // check): skip it as if it were not cached, never serve it.
+                Ok(blob) if !self.witness_matches(blob.e_tag.as_deref()) => {}
                 Ok(blob) => match collect_blob(blob).await {
                     Ok(bytes) => {
                         self.metrics.peer_fetches.inc();
@@ -685,11 +786,7 @@ impl FillCtx {
         // its `Bytes`. Note the slab does NOT reintroduce the hazard it looks
         // like it might: a frame is the cache's own memory, sized for the
         // resident set, not a range borrowed from the transport's fetch supply.
-        if let Err(e) = self
-            .tier
-            .put_chunk(chunk_key, CachedChunk::new(self.cached_bytes(data)))
-            .await
-        {
+        if let Err(e) = self.tier.put_chunk(chunk_key, self.to_cached(data)).await {
             warn!(key = %chunk_key, error = %e, "chunk fill could not reach the disk tier");
         }
         self.metrics.local_admits.inc();
@@ -782,15 +879,26 @@ impl FillCtx {
         let read = ChunkRead {
             bucket: &self.bucket,
             key: &self.key,
-            range: bounds,
+            range: bounds.clone(),
             // The chunk index decorrelates concurrent retries: `fill_parallelism`
             // chunks of one read fail together on a backend-wide fault, and
             // retrying all of them on the same schedule would rebuild the burst.
             jitter_index: idx,
         };
-        let got = pacer_backend::retry::read_range(&self.backend, &read, &self.read_retry)
-            .await
-            .map_err(|e| self.note_read_failure(chunk_key, &e))?;
+        let got = match &self.requester {
+            None => pacer_backend::retry::read_range(&self.backend, &read, &self.read_retry).await,
+            Some(r) => {
+                // HTTP Range is inclusive on both ends; `bounds.end` is exclusive.
+                // `chunk_bounds` never returns an empty range, so this cannot
+                // underflow.
+                let range_header = format!("bytes={}-{}", bounds.start, bounds.end - 1);
+                pacer_backend::retry::read_range_with(&read, &self.read_retry, || {
+                    r.forwarder.read_chunk_range(&r.held, &range_header)
+                })
+                .await
+            }
+        }
+        .map_err(|e| self.note_read_failure(chunk_key, &e))?;
         self.note_read_retries(got.attempts);
         Ok(got.body)
     }
@@ -845,6 +953,31 @@ impl FillCtx {
         self.fill.cached_bytes(data, &self.metrics)
     }
 
+    /// The cache entry for `data`. In `requester` mode it carries the probe's ETag
+    /// as its version witness, which [`Self::witness_matches`] checks on every
+    /// later read (ADR-0041, planning/30 § 3.4); node mode is unchanged.
+    fn to_cached(&self, data: &Bytes) -> CachedChunk {
+        let body = self.cached_bytes(data);
+        match self.requester.as_ref().and_then(|r| r.e_tag.clone()) {
+            Some(e_tag) => CachedChunk::versioned(body, e_tag),
+            None => CachedChunk::new(body),
+        }
+    }
+
+    /// Whether a cached chunk whose witness is `e_tag` may be served to this read.
+    ///
+    /// Always, in node mode (ADR-0015's contract, unchanged). In `requester` mode
+    /// only when it matches the ETag this GET's probe just reported: a chunk filled
+    /// under an older version — overwritten through this proxy or around it — is a
+    /// miss and is re-read, never served. A probe with no ETag serves nothing from
+    /// the cache, because there is nothing to compare against.
+    fn witness_matches(&self, e_tag: Option<&str>) -> bool {
+        match &self.requester {
+            None => true,
+            Some(r) => r.e_tag.is_some() && r.e_tag.as_deref() == e_tag,
+        }
+    }
+
     /// Insert a freshly-fetched chunk into the cache, guarded so only one fill
     /// per chunk key is in flight node-wide. A closed guard slot (another fill
     /// running) simply skips the insert — the bytes are still served.
@@ -874,11 +1007,7 @@ impl FillCtx {
         // peers fetch from, so it is exactly the chunk whose serve ADR-0028
         // wants to post without staging. On a build or node with no slab this is
         // the same refcount bump it always was.
-        if let Err(e) = self
-            .tier
-            .put_chunk(chunk_key, CachedChunk::new(self.cached_bytes(data)))
-            .await
-        {
+        if let Err(e) = self.tier.put_chunk(chunk_key, self.to_cached(data)).await {
             warn!(key = %chunk_key, error = %e, "chunk fill could not reach the disk tier");
         }
         self.metrics.fills_completed.inc();

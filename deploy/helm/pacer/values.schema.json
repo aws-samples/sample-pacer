@@ -172,6 +172,29 @@
         "internalTrafficPolicy": { "description": "Local = kube-proxy only routes to endpoints on the same node.", "type": "string", "enum": ["Local", "Cluster"] }
       }
     },
+    "auth": {
+      "description": "Which identity authorizes a request against S3 (ADR-0041). See docs/helm/auth.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "description": "node = ADR-0006 strip-and-re-sign with the node's identity; requester = S3 authorizes each caller's own signature through the daemon as an HTTP proxy.", "type": "string", "enum": ["node", "requester"] },
+        "requester": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "s3Domains": { "description": "S3 base domains virtual-hosted requests are parsed against. Required in requester mode; never derived.", "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z0-9.-]+(:[0-9]+)?$" } },
+            "tls": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "secretName": { "description": "kubernetes.io/tls Secret with the daemon's own certificate; empty = no TLS listener.", "type": "string" },
+                "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+              }
+            }
+          }
+        }
+      }
+    },
     "networkPolicy": {
       "description": "ADR-0006's authorization boundary. See docs/helm/network-policy.md.",
       "type": "object",

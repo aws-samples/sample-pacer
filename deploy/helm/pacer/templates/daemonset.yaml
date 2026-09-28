@@ -7,6 +7,8 @@
 {{- /* ADR-0032's scatter is Standard-only; catch the Express ask here rather than
        as a CrashLoop five minutes into `helm --wait`. */ -}}
 {{- include "pacer.validateScatter" . -}}
+{{- /* ADR-0041's requester-mode refusals, the same ones the daemon makes at startup. */ -}}
+{{- include "pacer.validateAuth" . -}}
 {{- /* ADR-0026's two quotas and the cgroup reservation that has to cover them; a
        mismatch degrades every large target to a body read instead of erroring. */ -}}
 {{- include "pacer.validateDelivery" . -}}
@@ -147,6 +149,10 @@ spec:
               containerPort: {{ .Values.ports.admin }}
             - name: peer
               containerPort: {{ .Values.ports.peer }}
+            {{- if include "pacer.tlsEnabled" . }}
+            - name: s3-tls
+              containerPort: {{ .Values.auth.requester.tls.port }}
+            {{- end }}
           env:
             # Everything tunable now lives in the mounted config file (ADR-0013);
             # env carries only per-pod values (downward API) and a few things
@@ -324,6 +330,11 @@ spec:
             - name: config
               mountPath: /etc/pacer
               readOnly: true
+            {{- if include "pacer.tlsEnabled" . }}
+            - name: tls
+              mountPath: {{ include "pacer.tlsMountPath" . }}
+              readOnly: true
+            {{- end }}
             - name: cache
               mountPath: {{ .Values.config.cacheDir }}
             {{- if .Values.efa.shareHostDevices }}
@@ -368,6 +379,16 @@ spec:
             items:
               - key: config.yaml
                 path: config.yaml
+        {{- if include "pacer.tlsEnabled" . }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.auth.requester.tls.secretName }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        {{- end }}
         - name: cache
           hostPath:
             # instanceStorePolicy: RAID0 mounts the NVMe array here.

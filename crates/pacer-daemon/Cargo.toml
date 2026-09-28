@@ -27,6 +27,11 @@ tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
+http-body.workspace = true
+http.workspace = true
+hyper-rustls.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
 bytes.workspace = true
 futures.workspace = true
 tracing.workspace = true
@@ -77,6 +82,11 @@ aws-smithy-runtime-api = "1"
 # Named, table-driven cases for the integration arms whose tests differ only by a
 # parameter — see the workspace pin for why this rather than a hand-rolled macro.
 rstest.workspace = true
+# Mints a throwaway certificate for requester mode's TLS listener test at runtime, so no
+# private key is ever committed — a fixture key in a public repository trips secret
+# scanners and reads as a leak whatever its purpose. Test-only, from the rustls project,
+# on the same aws-lc-rs backend the daemon uses.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 # ONE integration binary, not one per file. Cargo links a fresh copy of this crate and
 # its whole dependency closure into every `tests/*.rs`, and nine of them was nine link

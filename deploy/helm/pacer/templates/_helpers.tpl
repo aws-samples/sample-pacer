@@ -336,9 +336,36 @@ default from the same rule and would otherwise turn it back on. See
 {{- $raw := .Values.scatter.enabled -}}
 {{- if and (not (kindIs "invalid" $raw)) (ne ($raw | toString | trim) "") -}}
 {{- if has ($raw | toString | trim | lower) (list "1" "true" "on" "yes") -}}true{{- end -}}
-{{- else if ne (.Values.config.backendType | default "express") "express" -}}
+{{- else if and (ne (.Values.config.backendType | default "express") "express") (not (include "pacer.requesterMode" .)) -}}
 true
 {{- end -}}
+{{- end -}}
+
+{{/*
+"true" when auth.mode is requester (ADR-0041), else "". The one place the mode string is
+compared, so a caller cannot disagree with pacer.validateAuth about what counts.
+*/}}
+{{- define "pacer.requesterMode" -}}
+{{- if eq ((.Values.auth).mode | default "node") "requester" -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+"true" when requester mode's TLS listener is on (ADR-0041 § 9), else "". The mount point is
+beside, not under, the read-only ConfigMap mount at /etc/pacer, to avoid a nested mount.
+*/}}
+{{- define "pacer.tlsEnabled" -}}
+{{- if and (include "pacer.requesterMode" .) (((.Values.auth).requester).tls).secretName -}}true{{- end -}}
+{{- end -}}
+{{- define "pacer.tlsMountPath" -}}/etc/pacer-tls{{- end -}}
+
+{{/*
+"true" when this node holds a staging area, else "". The scatter's owners hold one; so does
+every requester-mode node on a cluster (ADR-0041), which homes peers' populate-only windows
+with the scatter off. Every budget that counts staging keys on THIS, not on the scatter —
+equal to pacer.scatterEnabled in node mode, so node-mode renders are unchanged.
+*/}}
+{{- define "pacer.stagingHeld" -}}
+{{- if or (include "pacer.scatterEnabled" .) (and (include "pacer.requesterMode" .) .Values.cluster.enabled) -}}true{{- end -}}
 {{- end -}}
 
 {{/*
@@ -355,7 +382,7 @@ default that does not apply to them.
 */}}
 {{- define "pacer.scatterConfigured" -}}
 {{- $raw := .Values.scatter.enabled -}}
-{{- if or (include "pacer.scatterEnabled" .) (and (not (kindIs "invalid" $raw)) (ne ($raw | toString | trim) "")) -}}
+{{- if or (include "pacer.stagingHeld" .) (and (not (kindIs "invalid" $raw)) (ne ($raw | toString | trim) "")) -}}
 true
 {{- end -}}
 {{- end -}}
@@ -377,7 +404,7 @@ keeps it from drifting silently — a daemon whose default changed would still r
 the size this helper budgeted, not at a size nobody accounted for.
 */}}
 {{- define "pacer.scatterStagingBytes" -}}
-{{- if include "pacer.scatterEnabled" . -}}
+{{- if include "pacer.stagingHeld" . -}}
 {{- $explicit := .Values.scatter.stagingBytes -}}
 {{- if and (not (kindIs "invalid" $explicit)) (ne ($explicit | toString | trim) "") -}}
 {{- include "pacer.toBytes" $explicit -}}
@@ -522,6 +549,36 @@ no longer exists, and it made the 2026-08-27 arm's own shape unrenderable for th
 reason. The three `coordinator*` knobs stay and their arithmetic is unchanged: read the
 headroom argument above pacer.scatterCoordinatorBytes before touching any of them.
 */}}
+{{/*
+ADR-0041's render-time refusals — each also a daemon startup refusal (config.rs), so
+rendering any of them would only buy a CrashLoop.
+*/}}
+{{- define "pacer.validateAuth" -}}
+{{- $mode := (.Values.auth).mode | default "node" -}}
+{{- if not (has $mode (list "node" "requester")) -}}
+{{- fail (printf "auth.mode is %q: it must be node (ADR-0006) or requester (ADR-0041)." $mode) -}}
+{{- end -}}
+{{- $tls := ((.Values.auth).requester).tls | default dict -}}
+{{- if and $tls.secretName (not (include "pacer.requesterMode" .)) -}}
+{{- fail "auth.requester.tls.secretName is set but auth.mode is node: the TLS listener serves requester mode's proxy clients and node mode has none. Unset it, or set auth.mode=requester." -}}
+{{- end -}}
+{{- if and (include "pacer.tlsEnabled" .) (has ($tls.port | int) (list (.Values.ports.s3 | int) (.Values.ports.admin | int) (.Values.ports.peer | int))) -}}
+{{- fail (printf "auth.requester.tls.port %v collides with one of ports.s3/admin/peer: give the TLS listener its own port." $tls.port) -}}
+{{- end -}}
+{{- if include "pacer.requesterMode" . -}}
+{{- $raw := .Values.scatter.enabled -}}
+{{- if and (not (kindIs "invalid" $raw)) (has ($raw | toString | trim | lower) (list "1" "true" "on" "yes")) -}}
+{{- fail "auth.mode is requester but scatter.enabled is true: the write scatter re-signs each home's part with the node's identity, which requester mode does not use (ADR-0041). Leave scatter.enabled unset — it resolves to off in this mode." -}}
+{{- end -}}
+{{- if .Values.config.bucketMap -}}
+{{- fail "auth.mode is requester but config.bucketMap is set: a caller cannot sign for an alias, so clients must address the real bucket (ADR-0041). Empty the map." -}}
+{{- end -}}
+{{- if not .Values.auth.requester.s3Domains -}}
+{{- fail "auth.mode is requester but auth.requester.s3Domains is empty: list the S3 base domains clients sign for, e.g. s3.<region>.amazonaws.com and, on express, s3express-<az-id>.<region>.amazonaws.com (ADR-0041 § 2.3). It is not derived, because a wrong list yields a 404 from S3 rather than an error." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "pacer.validateScatter" -}}
 {{- if and .Values.scatter.enabled (eq (.Values.config.backendType | default "express") "express") -}}
 {{- fail "scatter.enabled is set but config.backendType is \"express\": the write scatter is scoped to general-purpose (Standard) buckets — ADR-0032 § 6 supersedes ADR-0007 only there, and a directory bucket's write path stays the plain proxy. Set config.backendType=standard (and point config.bucketMap.cache at a regional bucket), or leave the scatter off. The daemon refuses this at startup too, so rendering it would only buy you a CrashLoop." -}}
@@ -827,6 +884,10 @@ values.yaml is where the operator sizes it, and pacer_cgroup_memory_file_bytes i
 they watch it.
 */}}
 {{- $bytes = add $bytes (include "pacer.scatterStagingBytes" . | int64) (include "pacer.scatterCoordinatorBytes" . | int64) -}}
+{{- $pinned = true -}}
+{{- else if include "pacer.stagingHeld" . -}}
+{{/* Requester mode on a cluster: the staging area without a coordinator (ADR-0041). */}}
+{{- $bytes = add $bytes (include "pacer.scatterStagingBytes" . | int64) -}}
 {{- $pinned = true -}}
 {{- end -}}
 {{- if $pinned -}}

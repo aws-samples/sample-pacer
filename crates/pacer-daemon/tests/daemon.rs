@@ -27,6 +27,14 @@
 //!
 //! * [`correctness`] — Phase 1 read/write correctness and the ADR-0023 backend parity
 //!   matrix, in process over `s3s-fs`.
+//! * [`authz_cluster`] — ADR-0041 step 4: a requester-mode home never reads S3 for
+//!   anyone, and a cold read populates the homes it does not own without the caller's
+//!   signature ever crossing the peer plane.
+//! * [`authz_forward`] — ADR-0041 step 2: `requester` mode's `CONNECT` refusal and its
+//!   byte-transparent forward, over real TCP against an in-process fake upstream.
+//! * [`authz_requester_get`] — ADR-0041 step 3: strip-and-hold, the authorization
+//!   probe, the held-signature chunk fill, and the signed-range bypass — a full
+//!   `requester`-mode daemon over real TCP against an in-process fake S3.
 //! * [`cluster`] — N nodes over one backend with a real gRPC peer plane: ADR-0012
 //!   ownership, ADR-0016 admission, ADR-0017 directory.
 //! * [`scatter`] — the ADR-0032 write scatter across a five-node fleet, split by gate
@@ -49,6 +57,12 @@
 
 mod common;
 
+#[path = "daemon/authz_cluster.rs"]
+mod authz_cluster;
+#[path = "daemon/authz_forward.rs"]
+mod authz_forward;
+#[path = "daemon/authz_requester_get.rs"]
+mod authz_requester_get;
 #[path = "daemon/backend_matrix_s3.rs"]
 mod backend_matrix_s3;
 #[path = "daemon/backend_retry.rs"]

@@ -45,6 +45,7 @@ everything under the chart directory ships in the `.tgz`.
 | [efa-and-rdma.md](efa-and-rdma.md) | `cluster.*`, `efa.*` |
 | [delivery.md](delivery.md) | `delivery.*` (ADR-0026/0027/0030) |
 | [write-scatter.md](write-scatter.md) | `scatter.*` (ADR-0032) |
+| [auth.md](auth.md) | `auth.*` (ADR-0041): node identity or the caller's own signature, and the client contract for each |
 | [network-policy.md](network-policy.md) | `networkPolicy.*`, `ports`, `service` |
 | [scheduling.md](scheduling.md) | `session`, `nodeSelector`, `tolerations`, `priorityClassName`, `podDisruptionBudget`, `terminationGracePeriodSeconds`, `extraEnv`, `devMode`, `serviceAccount`, `image`, `karpenter` |
 | [monitoring.md](monitoring.md) | `monitoring.prometheusRule.*` |

@@ -184,6 +184,13 @@ being load-bearing in `requester` mode; the NetworkPolicy stays as defence in de
   to compare against.
 * **s3s's own `S3Auth` is bypassed, not replaced.** The requester-mode service is built with no
   auth provider; `PlaceholderAuth` stays in `node` mode only.
+* **Network-address conditions see the daemon, not the caller.** The caller's signature is
+  forwarded, its connection is not: S3 takes `aws:VpcSourceIp` / `aws:SourceIp` from the
+  daemon pod's connection, and SigV4 does not cover the source address, so no forwarded
+  header could carry the caller's. VPC and endpoint perimeters (`aws:SourceVpc`,
+  `aws:SourceVpce`) and subnet-wide `aws:VpcSourceIp` rules evaluate as before; a policy that
+  distinguishes callers by address does not. This is a limitation of the mode, not
+  a gap to close; identity conditions are the per-caller control.
 * **Nothing changes for `node` mode.** Not the wire format, not the client, not a default.
 
 ## What is deliberately not decided here

@@ -8,6 +8,7 @@ members = [
     "crates/pacer-proto",
     "crates/pacer-backend",
     "crates/pacer-client",
+    "crates/pacer-operator",
 ]
 # The EFA hardware spike (planning/09) links libefa via a git-pinned ibverbs and
 # only builds on EFA hardware; it is its OWN workspace (spike/efa/Cargo.toml) so

@@ -1,0 +1,30 @@
+[package]
+name = "pacer-operator"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kubernetes operator: reconciles CacheRing resources into the pacer chart's workloads (ADR-0047)"
+
+[dependencies]
+# Same majors as pacer-ring's membership watch, so the workspace carries one kube stack.
+# `derive` is the CustomResource macro; `schemars` on k8s-openapi is what lets the CRD's
+# status embed the upstream `Condition` type with its schema.
+# `aws-lc-rs` is NOT optional: `rustls-tls` alone selects no rustls crypto backend, and the
+# client then panics on its first TLS config (tests/client.rs). aws-lc-rs matches the daemon.
+kube = { version = "4", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "aws-lc-rs"] }
+k8s-openapi = { version = "0.28", features = ["v1_33", "schemars"] }
+schemars = "1"
+serde.workspace = true
+serde_json = "1"
+serde_yaml_ng.workspace = true
+tokio.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

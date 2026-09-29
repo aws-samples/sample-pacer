@@ -85,3 +85,26 @@ Every object the operator applied for that ring carries an owner reference to it
 - **Reject a bad value before you apply it.** `spec.values` has no structural schema of its
   own yet; an invalid value is accepted by the API server and reported as
   `Rendered=False` at the next reconcile ([#47](https://github.com/aws-samples/sample-pacer/issues/47)).
+
+## Testing a change to the operator
+
+Unit tests and the render tests (`cargo test -p pacer-operator`, plus `-- --ignored` with
+helm installed) check the pure logic and the operator's contract with the chart. They
+cannot see what happens against a real API server, which is where the operator's first
+real defect was: it crash-looped on start while every one of them passed.
+
+[`scripts/e2e/operator-e2e.sh`](../../scripts/e2e/operator-e2e.sh) is the end-to-end test:
+it installs the operator, creates a ring, and checks convergence, a refused value, a
+rollout, pruning, drift repair, membership changes and garbage collection against the live
+cluster. [`scripts/e2e/operator-kind.sh`](../../scripts/e2e/operator-kind.sh) runs it on a
+throwaway three-node kind cluster, which is what CI's `operator-e2e` job does for every
+change to the operator, the chart or the images. To run the same thing locally:
+
+```bash
+docker build -t pacer:e2e .
+docker build -f Dockerfile.operator -t pacer-operator:e2e .
+scripts/e2e/operator-kind.sh          # KIND_KEEP=1 leaves the cluster up to inspect
+```
+
+On any other cluster, run `operator-e2e.sh` directly with your own images and values; its
+header lists what it needs.

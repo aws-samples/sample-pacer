@@ -1,0 +1,4 @@
+# pacer-operator chart values for scripts/e2e/operator-kind.sh: the image is loaded into
+# the kind nodes by the script, never pulled. Repository and tag come from the script.
+image:
+  pullPolicy: Never

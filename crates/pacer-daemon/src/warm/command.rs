@@ -57,12 +57,20 @@ const GIB: f64 = (1u64 << 30) as f64;
 
 /// `--help`.
 const USAGE: &str = "\
-usage: pacer-daemon warm --endpoint URL [options] [s3://bucket/prefix/ | s3://bucket/key]...
+usage: pacer-daemon warm (--endpoint URL | --proxy URL [--proxy-ca PATH]) [options]
+                         [s3://bucket/prefix/ | s3://bucket/key]...
 
 Warm every named object in the cache before it is first read. A URI ending in / (or naming
 only a bucket) is every object under it; anything else is one object.
 
-  --endpoint URL      the PACER daemon to warm through (required)
+How to reach the daemon — exactly one, matching the release's auth.mode:
+  --endpoint URL      auth.mode node: the daemon as the S3 endpoint; name buckets by
+                      their alias, sign with the placeholder credentials
+  --proxy URL         auth.mode requester: the daemon's TLS listener (https:// only), as a
+                      forwarding proxy; name real buckets, sign with your own credentials
+  --proxy-ca PATH     the CA that signed the daemon's certificate (default: system roots)
+
+Options:
   --manifest PATH     also warm every s3:// URI listed in PATH, one per line
   --concurrency N     warm requests in flight at once (default 4)
   --slice SIZE        longest byte range one request covers (default 1Gi)
@@ -72,11 +80,26 @@ only a bucket) is every object under it; anything else is one object.
 SIZE is an integer, optionally with a Ki, Mi, Gi or Ti suffix.
 Credentials and region come from the standard AWS environment.";
 
+/// How requests reach the daemon, which is fixed by the release's `auth.mode`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// `auth.mode: node` — the daemon is the S3 endpoint (ADR-0006).
+    Endpoint(String),
+    /// `auth.mode: requester` — the daemon's TLS listener, forwarding each request inside
+    /// TLS to the real S3 host it names (ADR-0041, [`super::forward`]).
+    Proxy {
+        /// `https://host[:port]` of the daemon's TLS listener.
+        url: String,
+        /// The CA that signed the daemon's certificate; `None` for the system roots.
+        ca: Option<PathBuf>,
+    },
+}
+
 /// What the caller asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WarmArgs {
-    /// The daemon every request goes through.
-    pub endpoint: String,
+    /// How every request reaches the daemon.
+    pub target: Target,
     /// Sources named on the command line.
     pub sources: Vec<Source>,
     /// A manifest of more sources.
@@ -98,9 +121,9 @@ pub struct WarmArgs {
 ///
 /// An unknown flag, a flag without its value, a malformed value, or no source at all.
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Option<WarmArgs>> {
-    let mut endpoint = None;
+    let mut reach = Reach::default();
     let mut parsed = WarmArgs {
-        endpoint: String::new(),
+        target: Target::Endpoint(String::new()),
         sources: Vec::new(),
         manifest: None,
         concurrency: DEFAULT_CONCURRENCY,
@@ -125,7 +148,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Opt
                 println!("{USAGE}");
                 return Ok(None);
             }
-            "--endpoint" => endpoint = Some(value()?),
+            "--endpoint" => reach.endpoint = Some(value()?),
+            "--proxy" => reach.proxy = Some(value()?),
+            "--proxy-ca" => reach.proxy_ca = Some(PathBuf::from(value()?)),
             "--manifest" => parsed.manifest = Some(PathBuf::from(value()?)),
             "--concurrency" => parsed.concurrency = value()?.parse().context("--concurrency")?,
             "--slice" => parsed.slice_bytes = plan::parse_size(&value()?).context("--slice")?,
@@ -137,7 +162,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Opt
             uri => parsed.sources.push(Source::parse(uri)?),
         }
     }
-    parsed.endpoint = endpoint.with_context(|| format!("--endpoint is required\n\n{USAGE}"))?;
+    parsed.target = reach.into_target()?;
     if parsed.sources.is_empty() && parsed.manifest.is_none() {
         bail!("name at least one s3:// source or a --manifest\n\n{USAGE}");
     }
@@ -145,6 +170,31 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<Opt
         bail!("--concurrency and --slice must be at least 1");
     }
     Ok(Some(parsed))
+}
+
+/// The three reach flags as given, before they are checked against each other.
+#[derive(Default)]
+struct Reach {
+    endpoint: Option<String>,
+    proxy: Option<String>,
+    proxy_ca: Option<PathBuf>,
+}
+
+impl Reach {
+    /// Exactly one of `--endpoint` and `--proxy`, and `--proxy-ca` only with `--proxy`: the
+    /// two shapes are two auth modes, and a flag meant for the other one is a mistake to
+    /// report, not a preference to guess at.
+    fn into_target(self) -> anyhow::Result<Target> {
+        match (self.endpoint, self.proxy, self.proxy_ca) {
+            (Some(url), None, None) => Ok(Target::Endpoint(url)),
+            (None, Some(url), ca) => Ok(Target::Proxy { url, ca }),
+            (Some(_), None, Some(_)) => bail!("--proxy-ca goes with --proxy, not --endpoint"),
+            (Some(_), Some(_), _) => {
+                bail!("--endpoint (auth.mode node) and --proxy (auth.mode requester) are exclusive")
+            }
+            (None, None, _) => bail!("--endpoint or --proxy is required\n\n{USAGE}"),
+        }
+    }
 }
 
 /// Run the command: parse, warm, report. The daemon binary's `main` calls this when its
@@ -163,7 +213,10 @@ pub fn main<I: IntoIterator<Item = String>>(args: I) -> anyhow::Result<()> {
         .build()
         .context("building the warm command's runtime")?;
     rt.block_on(async {
-        let client = client_for(&args.endpoint).await;
+        let client = match &args.target {
+            Target::Endpoint(url) => client_for(url).await,
+            Target::Proxy { url, ca } => client_via_proxy(url, ca.as_deref()).await?,
+        };
         let summary = run(&client, &args).await?;
         summary.log();
         summary.into_result()
@@ -182,6 +235,44 @@ pub async fn client_for(endpoint: &str) -> aws_sdk_s3::Client {
         .force_path_style(true)
         .build();
     aws_sdk_s3::Client::from_conf(config)
+}
+
+/// An S3 client that forwards every request through the daemon's TLS listener at `proxy`
+/// (`auth.mode: requester`), signed with the caller's own credentials from the standard AWS
+/// environment and addressed to S3's real hosts by the SDK's own endpoint resolution —
+/// which is what S3 expects, and for an Express directory bucket its zonal endpoint.
+///
+/// Credentials are still fetched directly, never through the daemon: `aws-config`'s
+/// providers use their own client.
+///
+/// # Errors
+///
+/// See [`super::forward::forwarding_client`].
+pub async fn client_via_proxy(
+    proxy: &str,
+    ca_pem: Option<&std::path::Path>,
+) -> anyhow::Result<aws_sdk_s3::Client> {
+    let shared = aws_config::defaults(BehaviorVersion::latest()).load().await;
+    proxied(aws_sdk_s3::config::Builder::from(&shared), proxy, ca_pem)
+}
+
+/// `config`, with its HTTP client replaced by the forwarding client for `proxy` — the half
+/// of [`client_via_proxy`] that takes no AWS environment, so a test can hand it its own
+/// credentials and endpoint.
+///
+/// # Errors
+///
+/// See [`super::forward::forwarding_client`].
+pub fn proxied(
+    config: aws_sdk_s3::config::Builder,
+    proxy: &str,
+    ca_pem: Option<&std::path::Path>,
+) -> anyhow::Result<aws_sdk_s3::Client> {
+    let http = super::forward::forwarding_client(proxy, ca_pem)?;
+    let config = config.http_client(aws_smithy_runtime_api::client::http::SharedHttpClient::new(
+        http,
+    ));
+    Ok(aws_sdk_s3::Client::from_conf(config.build()))
 }
 
 /// Expand, check and warm `args`' sources through `client`.
@@ -528,7 +619,7 @@ mod tests {
         let a = args(&["--endpoint", "http://pacer:8080", "s3://m/llama/"])
             .unwrap()
             .unwrap();
-        assert_eq!(a.endpoint, "http://pacer:8080");
+        assert_eq!(a.target, Target::Endpoint("http://pacer:8080".into()));
         assert_eq!(a.concurrency, DEFAULT_CONCURRENCY);
         assert_eq!(a.slice_bytes, DEFAULT_SLICE_BYTES);
         assert!(!a.dry_run);
@@ -547,6 +638,32 @@ mod tests {
         assert_eq!(b.max_bytes, Some(2 << 40));
         assert!(b.dry_run);
         assert_eq!(b.manifest, Some(PathBuf::from("keys.txt")));
+    }
+
+    #[test]
+    fn a_proxy_is_the_requester_mode_target_and_takes_its_ca() {
+        let a = args(&[
+            "--proxy",
+            "https://pacer:9443",
+            "--proxy-ca",
+            "/etc/pacer-ca/ca.crt",
+            "s3://real-bucket/m/",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            a.target,
+            Target::Proxy {
+                url: "https://pacer:9443".into(),
+                ca: Some(PathBuf::from("/etc/pacer-ca/ca.crt")),
+            }
+        );
+    }
+
+    #[test]
+    fn the_two_auth_mode_shapes_are_exclusive() {
+        assert!(args(&["--endpoint", "http://p", "--proxy", "https://p", "s3://m/a"]).is_err());
+        assert!(args(&["--endpoint", "http://p", "--proxy-ca", "ca.pem", "s3://m/a"]).is_err());
     }
 
     #[test]

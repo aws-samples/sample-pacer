@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <marker id="aK" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#232F3E"/></marker>
+    <marker id="aB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#147EBA"/></marker>
+    <marker id="aG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3F8624"/></marker>
+    <marker id="aR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#DD344C"/></marker>
+  </defs>
+  <rect width="1600" height="900" fill="#FFFFFF"/>
+  <g font-family="Arial, Helvetica, sans-serif" fill="#232F3E">
+
+    <text x="40" y="58" font-size="34" font-weight="bold">Write path: S3 always has it before the client is told</text>
+    <text x="40" y="92" font-size="18" fill="#545B64">Writes are never held in the cache only. On S3 Standard, a large write also warms the cache for whoever reads it next.</text>
+
+    <!-- ===== Left panel: write-through ===== -->
+    <rect x="30" y="115" width="520" height="760" rx="10" fill="#FAFAFA" stroke="#DDDDDD"/>
+    <text x="50" y="148" font-size="20" font-weight="bold">A · Write-through</text>
+    <text x="50" y="172" font-size="15" fill="#545B64">every write on Express · small writes and overwrites on Standard</text>
+
+    <rect x="170" y="195" width="240" height="56" rx="6" fill="#E6F2F8" stroke="#147EBA" stroke-width="1.5"/>
+    <text x="290" y="229" font-size="16" font-weight="bold" text-anchor="middle">Client pod</text>
+    <line x1="290" y1="251" x2="290" y2="298" stroke="#232F3E" stroke-width="2" marker-end="url(#aK)"/>
+    <text x="302" y="280" font-size="13" fill="#545B64">PUT · DELETE · multipart</text>
+
+    <rect x="60" y="300" width="460" height="250" rx="8" fill="#FFF4E5" stroke="#ED7100" stroke-width="2"/>
+    <text x="290" y="330" font-size="17" font-weight="bold" text-anchor="middle">pacer-daemon (the client's node)</text>
+    <g font-size="15">
+      <circle cx="90" cy="366" r="13" fill="#ED7100"/><text x="90" y="371" fill="#FFFFFF" font-weight="bold" text-anchor="middle">1</text>
+      <text x="113" y="371">Find out how big the replaced object is</text>
+      <circle cx="90" cy="412" r="13" fill="#ED7100"/><text x="90" y="417" fill="#FFFFFF" font-weight="bold" text-anchor="middle">2</text>
+      <text x="113" y="410">Invalidate its chunks on every node</text>
+      <text x="113" y="429">that holds them, and wait for all</text>
+      <circle cx="90" cy="466" r="13" fill="#ED7100"/><text x="90" y="471" fill="#FFFFFF" font-weight="bold" text-anchor="middle">3</text>
+      <text x="113" y="471">Forward the write to S3, re-signed</text>
+      <circle cx="90" cy="512" r="13" fill="#ED7100"/><text x="90" y="517" fill="#FFFFFF" font-weight="bold" text-anchor="middle">4</text>
+      <text x="113" y="517">Answer the client once S3 has it</text>
+    </g>
+
+    <rect x="60" y="630" width="200" height="90" rx="8" fill="#FFFFFF" stroke="#879196" stroke-width="1.5"/>
+    <text x="160" y="664" font-size="15" font-weight="bold" text-anchor="middle">Other nodes</text>
+    <text x="160" y="688" font-size="14" text-anchor="middle" fill="#545B64">old copies dropped</text>
+    <text x="160" y="707" font-size="14" text-anchor="middle" fill="#545B64">before S3 is written</text>
+    <line x1="160" y1="550" x2="160" y2="628" stroke="#DD344C" stroke-width="2.5" marker-end="url(#aR)"/>
+    <text x="172" y="595" font-size="13" fill="#DD344C" font-weight="bold">2 · Invalidate</text>
+
+    <rect x="320" y="630" width="200" height="90" rx="8" fill="#EFF6E9" stroke="#3F8624" stroke-width="2"/>
+    <text x="420" y="668" font-size="17" font-weight="bold" text-anchor="middle" fill="#3F8624">Amazon S3</text>
+    <text x="420" y="692" font-size="14" text-anchor="middle" fill="#545B64">Express or Standard</text>
+    <line x1="420" y1="550" x2="420" y2="628" stroke="#3F8624" stroke-width="2.5" marker-end="url(#aG)"/>
+    <text x="432" y="595" font-size="13" fill="#3F8624" font-weight="bold">3 · PUT</text>
+
+    <text x="50" y="770" font-size="15"><tspan font-weight="bold">Read-after-write holds cluster-wide:</tspan></text>
+    <text x="50" y="792" font-size="15" fill="#545B64">no node can serve the old bytes after the ack.</text>
+    <text x="50" y="820" font-size="15" fill="#545B64">Cost: the first read of new data is a cache miss</text>
+    <text x="50" y="842" font-size="15" fill="#545B64">(read path case 3).</text>
+
+    <!-- ===== Right panel: write scatter ===== -->
+    <rect x="570" y="115" width="1000" height="760" rx="10" fill="#FAFAFA" stroke="#DDDDDD"/>
+    <text x="590" y="148" font-size="20" font-weight="bold">B · Write scatter</text>
+    <text x="590" y="172" font-size="15" fill="#545B64">S3 Standard, a PUT of a new key over 128 MiB · on by default · e.g. saving a checkpoint</text>
+
+    <rect x="620" y="195" width="300" height="56" rx="6" fill="#E6F2F8" stroke="#147EBA" stroke-width="1.5"/>
+    <text x="770" y="229" font-size="16" font-weight="bold" text-anchor="middle">Client pod: PUT a 6 GiB shard</text>
+    <line x1="770" y1="251" x2="770" y2="298" stroke="#232F3E" stroke-width="2" marker-end="url(#aK)"/>
+
+    <!-- Coordinator -->
+    <rect x="600" y="300" width="340" height="300" rx="8" fill="#FFF4E5" stroke="#ED7100" stroke-width="2"/>
+    <text x="770" y="330" font-size="17" font-weight="bold" text-anchor="middle">Coordinator</text>
+    <text x="770" y="350" font-size="13" text-anchor="middle" fill="#545B64">pacer-daemon on the client's node</text>
+    <g font-size="15">
+      <circle cx="628" cy="385" r="13" fill="#ED7100"/><text x="628" y="390" fill="#FFFFFF" font-weight="bold" text-anchor="middle">1</text>
+      <text x="650" y="390">Start one multipart upload</text>
+      <circle cx="628" cy="428" r="13" fill="#ED7100"/><text x="628" y="433" fill="#FFFFFF" font-weight="bold" text-anchor="middle">2</text>
+      <text x="650" y="433">Cut the body into 16 MiB windows</text>
+      <circle cx="628" cy="471" r="13" fill="#ED7100"/><text x="628" y="476" fill="#FFFFFF" font-weight="bold" text-anchor="middle">3</text>
+      <text x="650" y="476">Send window i to the home of chunk i</text>
+      <circle cx="628" cy="514" r="13" fill="#ED7100"/><text x="628" y="519" fill="#FFFFFF" font-weight="bold" text-anchor="middle">5</text>
+      <text x="650" y="519">Complete the upload (+ CRC32)</text>
+      <circle cx="628" cy="557" r="13" fill="#ED7100"/><text x="628" y="562" fill="#FFFFFF" font-weight="bold" text-anchor="middle">6</text>
+      <text x="650" y="562">Tell the homes: publish</text>
+    </g>
+
+    <!-- Homes -->
+    <g>
+      <rect x="1060" y="200" width="270" height="100" rx="8" fill="#FFFFFF" stroke="#ED7100" stroke-width="2"/>
+      <text x="1195" y="230" font-size="16" font-weight="bold" text-anchor="middle">Node B · home of c0, c3, …</text>
+      <text x="1195" y="256" font-size="14" text-anchor="middle">4 · UploadPart for its windows</text>
+      <text x="1195" y="278" font-size="14" text-anchor="middle" fill="#ED7100" font-weight="bold">and keeps them cached</text>
+
+      <rect x="1060" y="330" width="270" height="100" rx="8" fill="#FFFFFF" stroke="#ED7100" stroke-width="2"/>
+      <text x="1195" y="360" font-size="16" font-weight="bold" text-anchor="middle">Node C · home of c1, c4, …</text>
+      <text x="1195" y="386" font-size="14" text-anchor="middle">4 · UploadPart for its windows</text>
+      <text x="1195" y="408" font-size="14" text-anchor="middle" fill="#ED7100" font-weight="bold">and keeps them cached</text>
+
+      <rect x="1060" y="460" width="270" height="100" rx="8" fill="#FFFFFF" stroke="#ED7100" stroke-width="2"/>
+      <text x="1195" y="490" font-size="16" font-weight="bold" text-anchor="middle">Node D · home of c2, c5, …</text>
+      <text x="1195" y="516" font-size="14" text-anchor="middle">4 · UploadPart for its windows</text>
+      <text x="1195" y="538" font-size="14" text-anchor="middle" fill="#ED7100" font-weight="bold">and keeps them cached</text>
+    </g>
+
+    <!-- coordinator -> homes -->
+    <line x1="940" y1="440" x2="1058" y2="252" stroke="#147EBA" stroke-width="2.5" marker-end="url(#aB)"/>
+    <line x1="940" y1="455" x2="1058" y2="380" stroke="#147EBA" stroke-width="2.5" marker-end="url(#aB)"/>
+    <line x1="940" y1="470" x2="1058" y2="510" stroke="#147EBA" stroke-width="2.5" marker-end="url(#aB)"/>
+    <text x="948" y="560" font-size="13" fill="#147EBA" font-weight="bold">3 · windows</text>
+    <text x="948" y="577" font-size="13" fill="#147EBA" font-weight="bold">over gRPC</text>
+
+    <!-- S3 -->
+    <rect x="1410" y="200" width="140" height="360" rx="10" fill="#EFF6E9" stroke="#3F8624" stroke-width="2"/>
+    <text x="1480" y="360" font-size="17" font-weight="bold" text-anchor="middle" fill="#3F8624">Amazon S3</text>
+    <text x="1480" y="384" font-size="14" text-anchor="middle" fill="#545B64">Standard</text>
+    <text x="1480" y="408" font-size="13" text-anchor="middle" fill="#545B64">one multipart</text>
+    <text x="1480" y="426" font-size="13" text-anchor="middle" fill="#545B64">upload</text>
+    <line x1="1330" y1="250" x2="1408" y2="250" stroke="#3F8624" stroke-width="2.5" marker-end="url(#aG)"/>
+    <line x1="1330" y1="380" x2="1408" y2="380" stroke="#3F8624" stroke-width="2.5" marker-end="url(#aG)"/>
+    <line x1="1330" y1="510" x2="1408" y2="510" stroke="#3F8624" stroke-width="2.5" marker-end="url(#aG)"/>
+    <text x="1369" y="243" font-size="12" text-anchor="middle" fill="#3F8624">parts</text>
+
+    <!-- coordinator -> S3 (create / complete), routed below -->
+    <path d="M770,600 L770,630 L1480,630 L1480,562" stroke="#3F8624" stroke-width="2.5" fill="none" marker-end="url(#aG)"/>
+    <text x="1125" y="622" font-size="13" text-anchor="middle" fill="#3F8624" font-weight="bold">1 · start upload · 5 · complete upload</text>
+
+    <!-- notes -->
+    <g font-size="15">
+      <text x="600" y="680" font-weight="bold">One fence:</text>
+      <text x="690" y="680" fill="#545B64">nothing is visible to readers until the upload completes in S3.</text>
+      <text x="600" y="712" font-weight="bold">Busy home?</text>
+      <text x="693" y="712" fill="#545B64">It refuses at once; the coordinator uploads that part itself and caches it locally.</text>
+      <text x="600" y="744" font-weight="bold">Overwrites</text>
+      <text x="690" y="744" fill="#545B64">of an existing key take path A instead.</text>
+    </g>
+    <rect x="600" y="772" width="950" height="82" rx="8" fill="#FFF4E5" stroke="#ED7100"/>
+    <text x="620" y="804" font-size="16" font-weight="bold">Result: saving a checkpoint warms the cache for the restore.</text>
+    <text x="620" y="832" font-size="15" fill="#545B64">The parts already sit on the nodes that will serve them, and upload work spreads ~1/N per node instead of one node's NIC.</text>
+  </g>
+</svg>

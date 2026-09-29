@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <marker id="aK" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#232F3E"/></marker>
+  </defs>
+  <rect width="1600" height="900" fill="#FFFFFF"/>
+  <g font-family="Arial, Helvetica, sans-serif" fill="#232F3E">
+
+    <text x="40" y="58" font-size="34" font-weight="bold">Placement: chunks, homes and the directory</text>
+    <text x="40" y="92" font-size="18" fill="#545B64">Where a chunk lives is computed, not looked up, so any node can find any chunk in one hop.</text>
+
+    <!-- Object bar -->
+    <text x="200" y="140" font-size="16" font-weight="bold">One object, e.g. a 4.6 GiB checkpoint shard → ~298 chunks of 16 MiB</text>
+    <g font-size="16" font-weight="bold" fill="#FFFFFF" text-anchor="middle">
+      <rect x="200" y="152" width="125" height="50" fill="#147EBA" stroke="#FFFFFF" stroke-width="2"/><text x="262" y="183">c0</text>
+      <rect x="325" y="152" width="125" height="50" fill="#8C4FFF" stroke="#FFFFFF" stroke-width="2"/><text x="387" y="183">c1</text>
+      <rect x="450" y="152" width="125" height="50" fill="#ED7100" stroke="#FFFFFF" stroke-width="2"/><text x="512" y="183">c2</text>
+      <rect x="575" y="152" width="125" height="50" fill="#01A88D" stroke="#FFFFFF" stroke-width="2"/><text x="637" y="183">c3</text>
+      <rect x="700" y="152" width="125" height="50" fill="#147EBA" stroke="#FFFFFF" stroke-width="2"/><text x="762" y="183">c4</text>
+      <rect x="825" y="152" width="125" height="50" fill="#8C4FFF" stroke="#FFFFFF" stroke-width="2"/><text x="887" y="183">c5</text>
+      <rect x="950" y="152" width="125" height="50" fill="#ED7100" stroke="#FFFFFF" stroke-width="2"/><text x="1012" y="183">c6</text>
+      <rect x="1075" y="152" width="125" height="50" fill="#01A88D" stroke="#FFFFFF" stroke-width="2"/><text x="1137" y="183">c7</text>
+    </g>
+    <text x="1215" y="183" font-size="16" fill="#545B64">… ~290 more</text>
+
+    <!-- Hash step -->
+    <line x1="262" y1="204" x2="262" y2="318" stroke="#232F3E" stroke-width="2.5" marker-end="url(#aK)"/>
+    <text x="290" y="248" font-size="17" font-weight="bold">Rendezvous hash of each chunk key over the Ready nodes</text>
+    <text x="290" y="274" font-size="16" fill="#545B64">Top score = the chunk's home. Runner-up = its second home (2 copies by default).</text>
+    <text x="290" y="298" font-size="16" fill="#545B64">Colour = home node. Solid cell = home copy, faded dashed cell = second copy.</text>
+
+    <!-- Nodes -->
+    <!-- Node 1 (blue): home c0 c4; second c3 c6 -->
+    <g>
+      <rect x="80" y="320" width="330" height="300" rx="8" fill="#FFFFFF" stroke="#147EBA" stroke-width="2.5"/>
+      <text x="100" y="352" font-size="19" font-weight="bold" fill="#147EBA">Node 1</text>
+      <text x="100" y="386" font-size="14" fill="#545B64">home for</text>
+      <rect x="180" y="366" width="64" height="34" rx="3" fill="#147EBA"/><text x="212" y="389" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle">c0</text>
+      <rect x="252" y="366" width="64" height="34" rx="3" fill="#147EBA"/><text x="284" y="389" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle">c4</text>
+      <text x="100" y="436" font-size="14" fill="#545B64">2nd copy</text>
+      <rect x="180" y="416" width="64" height="34" rx="3" fill="#E0F5F1" stroke="#01A88D" stroke-dasharray="4 3" stroke-width="1.5"/><text x="212" y="439" font-size="15" font-weight="bold" fill="#01A88D" text-anchor="middle">c3</text>
+      <rect x="252" y="416" width="64" height="34" rx="3" fill="#FDEBDC" stroke="#ED7100" stroke-dasharray="4 3" stroke-width="1.5"/><text x="284" y="439" font-size="15" font-weight="bold" fill="#ED7100" text-anchor="middle">c6</text>
+      <rect x="100" y="470" width="290" height="130" rx="6" fill="#F7F9FA" stroke="#879196"/>
+      <text x="115" y="495" font-size="15" font-weight="bold">Directory shard</text>
+      <text x="115" y="517" font-size="13" fill="#545B64">who holds the chunks I am home for</text>
+      <text x="115" y="545" font-size="15" font-family="Menlo, Consolas, monospace">c0 → N1, N3</text>
+      <text x="115" y="570" font-size="15" font-family="Menlo, Consolas, monospace">c4 → N1, N2, N4*</text>
+      <text x="115" y="592" font-size="12" fill="#545B64">* a reader that kept a hot copy</text>
+    </g>
+    <!-- Node 2 (orange): home c2 c6; second c1 c4 -->
+    <g>
+      <rect x="450" y="320" width="330" height="300" rx="8" fill="#FFFFFF" stroke="#ED7100" stroke-width="2.5"/>
+      <text x="470" y="352" font-size="19" font-weight="bold" fill="#ED7100">Node 2</text>
+      <text x="470" y="386" font-size="14" fill="#545B64">home for</text>
+      <rect x="550" y="366" width="64" height="34" rx="3" fill="#ED7100"/><text x="582" y="389" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle">c2</text>
+      <rect x="622" y="366" width="64" height="34" rx="3" fill="#ED7100"/><text x="654" y="389" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle">c6</text>
+      <text x="470" y="436" font-size="14" fill="#545B64">2nd copy</text>
+      <rect x="550" y="416" width="64" height="34" rx="3" fill="#EFE6FF" stroke="#8C4FFF" stroke-dasharray="4 3" stroke-width="1.5"/><text x="582" y="439" font-size="15" font-weight="bold" fill="#8C4FFF" text-anchor="middle">c1</text>
+      <rect x="622" y="416" width="64" height="34" rx="3" fill="#DDEEF7" stroke="#147EBA" stroke-dasharray="4 3" stroke-width="1.5"/><text x="654" y="439" font-size="15" font-weight="bold" fill="#147EBA" text-anchor="middle">c4</text>
+      <rect x="470" y="470" width="290" height="130" rx="6" fill="#F7F9FA" stroke="#879196"/>
+      <text x="485" y="495" font-size="15" font-weight="bold">Directory shard</text>
+      <text x="485" y="517" font-size="13" fill="#545B64">who holds the chunks I am home for</text>
+      <text x="485" y="545" font-size="15" font-family="Menlo, Consolas, monospace">c2 → N2, N4</text>
+      <text x="485" y="570" font-size="15" font-family="Menlo, Consolas, monospace">c6 → N2, N1</text>
+    </g>
+    <!-- Node 3 (purple): home c1 c5; second c0 c7 -->
+    <g>
+      <rect x="820" y="320" width="330" height="300" rx="8" fill="#FFFFFF" stroke="#8C4FFF" stroke-width="2.5"/>
+      <text x="840" y="352" font-size="19" font-weight="bold" fill="#8C4FFF">Node 3</text>
+      <text x="840" y="386" font-size="14" fill="#545B64">home for</text>
+      <rect x="920" y="366" width="64" height="34" rx="3" fill="#8C4FFF"/><text x="952" y="389" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle">c1</text>
+      <rect x="992" y="366" width="64" height="34" rx="3" fill="#8C4FFF"/><text x="1024" y="389" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle">c5</text>
+      <text x="840" y="436" font-size="14" fill="#545B64">2nd copy</text>
+      <rect x="920" y="416" width="64" height="34" rx="3" fill="#DDEEF7" stroke="#147EBA" stroke-dasharray="4 3" stroke-width="1.5"/><text x="952" y="439" font-size="15" font-weight="bold" fill="#147EBA" text-anchor="middle">c0</text>
+      <rect x="992" y="416" width="64" height="34" rx="3" fill="#E0F5F1" stroke="#01A88D" stroke-dasharray="4 3" stroke-width="1.5"/><text x="1024" y="439" font-size="15" font-weight="bold" fill="#01A88D" text-anchor="middle">c7</text>
+      <rect x="840" y="470" width="290" height="130" rx="6" fill="#F7F9FA" stroke="#879196"/>
+      <text x="855" y="495" font-size="15" font-weight="bold">Directory shard</text>
+      <text x="855" y="517" font-size="13" fill="#545B64">who holds the chunks I am home for</text>
+      <text x="855" y="545" font-size="15" font-family="Menlo, Consolas, monospace">c1 → N3, N2</text>
+      <text x="855" y="570" font-size="15" font-family="Menlo, Consolas, monospace">c5 → N3, N4</text>
+    </g>
+    <!-- Node 4 (teal): home c3 c7; second c2 c5 -->
+    <g>
+      <rect x="1190" y="320" width="330" height="300" rx="8" fill="#FFFFFF" stroke="#01A88D" stroke-width="2.5"/>
+      <text x="1210" y="352" font-size="19" font-weight="bold" fill="#01A88D">Node 4</text>
+      <text x="1210" y="386" font-size="14" fill="#545B64">home for</text>
+      <rect x="1290" y="366" width="64" height="34" rx="3" fill="#01A88D"/><text x="1322" y="389" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle">c3</text>
+      <rect x="1362" y="366" width="64" height="34" rx="3" fill="#01A88D"/><text x="1394" y="389" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle">c7</text>
+      <text x="1210" y="436" font-size="14" fill="#545B64">2nd copy</text>
+      <rect x="1290" y="416" width="64" height="34" rx="3" fill="#FDEBDC" stroke="#ED7100" stroke-dasharray="4 3" stroke-width="1.5"/><text x="1322" y="439" font-size="15" font-weight="bold" fill="#ED7100" text-anchor="middle">c2</text>
+      <rect x="1362" y="416" width="64" height="34" rx="3" fill="#EFE6FF" stroke="#8C4FFF" stroke-dasharray="4 3" stroke-width="1.5"/><text x="1394" y="439" font-size="15" font-weight="bold" fill="#8C4FFF" text-anchor="middle">c5</text>
+      <rect x="1210" y="470" width="290" height="130" rx="6" fill="#F7F9FA" stroke="#879196"/>
+      <text x="1225" y="495" font-size="15" font-weight="bold">Directory shard</text>
+      <text x="1225" y="517" font-size="13" fill="#545B64">who holds the chunks I am home for</text>
+      <text x="1225" y="545" font-size="15" font-family="Menlo, Consolas, monospace">c3 → N4, N1</text>
+      <text x="1225" y="570" font-size="15" font-family="Menlo, Consolas, monospace">c7 → N4, N3</text>
+    </g>
+
+    <!-- Property cards -->
+    <g>
+      <rect x="80" y="660" width="345" height="160" rx="8" fill="#F7F9FA" stroke="#DDDDDD"/>
+      <text x="100" y="695" font-size="18" font-weight="bold">No coordinator</text>
+      <text x="100" y="728" font-size="15" fill="#545B64">Every node computes the same home</text>
+      <text x="100" y="750" font-size="15" fill="#545B64">from the chunk key alone. No metadata</text>
+      <text x="100" y="772" font-size="15" fill="#545B64">service, no consensus, nothing to run</text>
+      <text x="100" y="794" font-size="15" fill="#545B64">besides the daemons.</text>
+
+      <rect x="445" y="660" width="345" height="160" rx="8" fill="#F7F9FA" stroke="#DDDDDD"/>
+      <text x="465" y="695" font-size="18" font-weight="bold">Changes move little</text>
+      <text x="465" y="728" font-size="15" fill="#545B64">A node joining or leaving moves only</text>
+      <text x="465" y="750" font-size="15" fill="#545B64">the chunks it is home for. Membership</text>
+      <text x="465" y="772" font-size="15" fill="#545B64">= the Ready daemons in the Kubernetes</text>
+      <text x="465" y="794" font-size="15" fill="#545B64">EndpointSlice.</text>
+
+      <rect x="810" y="660" width="345" height="160" rx="8" fill="#F7F9FA" stroke="#DDDDDD"/>
+      <text x="830" y="695" font-size="18" font-weight="bold">Directory is soft state</text>
+      <text x="830" y="728" font-size="15" fill="#545B64">Holders tell the home when they admit</text>
+      <text x="830" y="750" font-size="15" fill="#545B64">or evict. Lost on a crash and rebuilt</text>
+      <text x="830" y="772" font-size="15" fill="#545B64">by traffic; a stale entry costs one</text>
+      <text x="830" y="794" font-size="15" fill="#545B64">retry, never a wrong byte.</text>
+
+      <rect x="1175" y="660" width="345" height="160" rx="8" fill="#F7F9FA" stroke="#DDDDDD"/>
+      <text x="1195" y="695" font-size="18" font-weight="bold">Bandwidth scales with nodes</text>
+      <text x="1195" y="728" font-size="15" fill="#545B64">Each node serves ~1/N of the chunks,</text>
+      <text x="1195" y="750" font-size="15" fill="#545B64">so a whole fleet restoring the same</text>
+      <text x="1195" y="772" font-size="15" fill="#545B64">checkpoint spreads across the cluster</text>
+      <text x="1195" y="794" font-size="15" fill="#545B64">instead of hammering the bucket.</text>
+    </g>
+  </g>
+</svg>

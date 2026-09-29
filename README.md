@@ -27,12 +27,19 @@ It is built for workloads where many nodes read the same large objects: model we
 checkpoints, training shards. Read bandwidth grows with the number of nodes instead of being
 capped by the bucket.
 
+![One pacer-daemon per node in the cache nodepool, a node-local S3 endpoint for workload pods, an EFA RDMA and gRPC peer plane between the daemons, and Amazon S3 in the same Availability Zone](docs/architecture/01-system-overview.svg)
+
 - **3.6× regional S3** on warm-cache reads over plain HTTP with an unmodified client: 26.97
   GiB/s against 7.52 GiB/s on two `p5.48xlarge` ([benchmark](docs/benchmarks/README.md)).
 - **A 131.4 GiB Llama-3.3-70B checkpoint into eight GPUs in about 6.3 s**, written directly
   into GPU memory over RDMA ([details and caveats](docs/status.md#performance)).
 
 PACER is beta, v0.1.0. [docs/status.md](docs/status.md) lists what is shipped and what is not.
+
+![Swimlanes for three read cases: a local hit served from RAM or NVMe; a peer hit where the holder RDMA-writes into the reader's buffer and replies over gRPC; a cold read where the home reads S3 once, fills its cache and serves the reader](docs/architecture/02-read-path.svg)
+
+More diagrams — chunk placement, the write path, delivery into GPU memory — are in
+[docs/architecture/](docs/architecture/README.md), each linked to the ADR behind it.
 
 ## Quick start
 
@@ -76,6 +83,7 @@ s3.download_file("cache", "checkpoints/model.safetensors", "/tmp/model.safetenso
 
 | Page | Covers |
 |---|---|
+| [Architecture diagrams](docs/architecture/README.md) | System overview, chunk placement, read/write paths, GPU delivery |
 | [Installing](docs/install.md) | Requirements, installation, configuration, monitoring |
 | [Configuring clients](docs/clients.md) | Endpoint, credentials, bucket aliases, ETag behaviour |
 | [Securing access](docs/security.md) | Auth modes, NetworkPolicy, what it does not cover |

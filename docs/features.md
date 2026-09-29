@@ -74,3 +74,25 @@ when it is read back. This is on by default for Standard and not available on Ex
 
 It changes the object's ETag to the multipart `-N` form; see
 [clients.md](clients.md#etags-of-large-uploads). See [write-scatter.md](helm/write-scatter.md).
+
+## Warming the cache ahead of first read
+
+`pacer-daemon warm` reads a bucket prefix, an exact key, or a manifest of either into the
+cache before the workload that needs it starts, and sends none of the bytes back. It ships
+in the daemon image, so a warm is a Kubernetes Job on that image, on a node of the ring you
+want warm:
+
+```bash
+AWS_ACCESS_KEY_ID=pacer AWS_SECRET_ACCESS_KEY=pacer AWS_REGION=us-east-1 \
+pacer-daemon warm --endpoint http://pacer.pacer.svc.cluster.local:9000 \
+  s3://cache/models/llama-3-405b/
+```
+
+It expands the prefix, slices each object into bounded requests (`--slice`, default 1 GiB) so
+no single request runs long, and warms them at bounded concurrency (`--concurrency`). Add
+`--max-bytes` to refuse a warm larger than you intend to pay for, or `--dry-run` to see the
+object count and total size first. Re-running it is safe and cheap: an already-warm slice
+costs a cache hit. **One limit to know:** a warm fills each chunk at one of its
+`cluster.replicationR` homes, so a reader on another node can still find its first copy of a
+chunk cold ([#38](https://github.com/aws-samples/sample-pacer/issues/38)). Design:
+[ADR-0048](adr/0048-warm-only-get.md).

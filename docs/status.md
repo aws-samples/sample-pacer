@@ -14,7 +14,8 @@ PACER is beta, v0.1.0.
 | [EFA RDMA between nodes](features.md#efa-rdma-between-nodes) | Beta; off in the base chart |
 | [Delivery into client memory](features.md#delivery-into-client-memory) (`shm:` and `nic:`) | Beta, on by default. `nic:` needs EFA. The Python loader is not published |
 | Checkpoint restore and save across a fleet | Restore shipped and measured. Save is slower; it is limited by per-node network egress |
-| Pre-staging Job, Standard→Express two-tier cache, Append/Rename passthrough | Planned |
+| [Warming an object or a prefix ahead of first read](features.md#warming-the-cache-ahead-of-first-read) (`pacer-daemon warm`) | Shipped for `auth.mode: node`; fills one of each chunk's homes until [#38](https://github.com/aws-samples/sample-pacer/issues/38) |
+| Standard→Express two-tier cache, Append/Rename passthrough | Planned |
 
 ## Performance
 

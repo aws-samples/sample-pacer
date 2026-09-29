@@ -115,6 +115,6 @@ spelled out instead:
 
 ## See also
 
-* [`README.md`](../../README.md) § "Securing access — reachability *is* authorization".
+* [Securing access](../security.md), the operator-facing summary.
 * `threat-model.md` — M-001, T-002, T-003, T-008.
 * [ADR-0006](../adr/0006-strip-and-resign-auth.md).

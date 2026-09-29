@@ -42,7 +42,49 @@ env:
 # tag's peeled SHA and rewrite the comment to the new exact version.
 # Rationale and the threat it answers: threat-model.md, M-019 / T-012.
 jobs:
+  # Decides whether the change touches anything the jobs below check. A change
+  # that only edits documentation skips them.
+  #
+  # Not `paths-ignore`: `rust`, `helm` and `image` are required checks on `main`,
+  # and a workflow that never starts leaves a required check "Expected" forever,
+  # so a docs-only PR could not merge. A job skipped by its own `if:` reports as
+  # passed instead.
+  #
+  # The jobs below run unless this job SUCCEEDED and said `code=false`. A job
+  # skipped because a dependency failed also reports as passed, so gating on
+  # `code == 'true'` would let a broken detector merge unchecked code; gating on
+  # `!= 'false'` makes every failure here run the full set.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          # The PR's base, or the previous tip of `main` on a push.
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # Paths no job below reads: nothing compiles, templates or copies
+          # Markdown into the image (the chart's templates cite docs/ as prose).
+          DOC_PATHS: '^(docs/.*|.*\.md|LICENSE)$'
+        run: |
+          set -euo pipefail
+          code=true
+          # An unknown base (a first push, a force-push) keeps the full set.
+          if git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            changed=$(git diff --name-only "$BASE" HEAD)
+            if ! grep -qvE "$DOC_PATHS" <<<"$changed"; then
+              code=false
+            fi
+            printf 'changed:\n%s\n' "$changed"
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
   rust:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -82,6 +124,8 @@ jobs:
         run: cargo test --workspace
 
   helm:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -107,6 +151,8 @@ jobs:
             --set efa.enabled=true > /dev/null
 
   image:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0

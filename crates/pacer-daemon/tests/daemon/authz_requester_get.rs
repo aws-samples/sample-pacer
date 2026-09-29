@@ -187,6 +187,66 @@ async fn spawn_requester_daemon_with(
     upstream: SocketAddr,
     min_object_size: u64,
 ) -> (SocketAddr, Shutdown) {
+    let (front, metrics) = requester_front(upstream, min_object_size).await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("bound port has an address");
+    let shutdown = Shutdown::new();
+    tokio::spawn(pacer_daemon::listen::serve_s3_on(
+        listener,
+        front,
+        ListenLimits::default(),
+        metrics,
+        shutdown.signal(),
+    ));
+    (addr, shutdown)
+}
+
+/// [`spawn_requester_daemon`] on a TLS listener to a throwaway self-signed certificate for
+/// `localhost` — ADR-0041 § 9's recommended shape, the one `pacer-daemon warm --proxy`
+/// speaks. Returns the listener's address and the CA file a client must trust; the key and
+/// certificate live only in the returned temp dir, for the test's lifetime.
+async fn spawn_requester_daemon_tls(
+    upstream: SocketAddr,
+) -> (SocketAddr, Shutdown, std::path::PathBuf, tempfile::TempDir) {
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("a self-signed certificate");
+    let dir = tempfile::tempdir().expect("a temp dir for the key pair");
+    let (cert_path, key_path) = (dir.path().join("tls.crt"), dir.path().join("tls.key"));
+    std::fs::write(&cert_path, cert.pem()).expect("write the certificate");
+    std::fs::write(&key_path, key_pair.serialize_pem()).expect("write the key");
+    let acceptor = pacer_daemon::authz::tls_acceptor(&pacer_daemon::config::TlsListenConfig {
+        cert: cert_path.clone(),
+        key: key_path,
+        listen_addr: String::new(),
+    })
+    .expect("the minted pair must load");
+    let (front, metrics) = requester_front(upstream, 0).await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("bound port has an address");
+    let shutdown = Shutdown::new();
+    tokio::spawn(pacer_daemon::listen::serve_s3_tls_on(
+        listener,
+        acceptor,
+        front,
+        ListenLimits::default(),
+        metrics,
+        shutdown.signal(),
+    ));
+    // Self-signed: the certificate is its own CA.
+    (addr, shutdown, cert_path, dir)
+}
+
+/// The requester-mode daemon both listeners serve: `RequesterS3` (only `get_object`
+/// reachable) behind `RequesterFront`, over a throwaway backend it must never use.
+async fn requester_front(
+    upstream: SocketAddr,
+    min_object_size: u64,
+) -> (RequesterFront<s3s::service::S3Service>, Metrics) {
     let backend_dir = tempfile::tempdir().expect("a temp dir for the throwaway backend");
     let (service, creds) = fs_backend_service(backend_dir.path());
     let backend = sdk_client_for(service, creds);
@@ -215,20 +275,7 @@ async fn spawn_requester_daemon_with(
     b.set_host(s3s::host::MultiDomain::new([upstream.to_string()]).expect("a valid domain"));
     let inner = b.build();
     let front = RequesterFront::new(inner, domains, forwarder, metrics.clone());
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind loopback");
-    let addr = listener.local_addr().expect("bound port has an address");
-    let shutdown = Shutdown::new();
-    tokio::spawn(pacer_daemon::listen::serve_s3_on(
-        listener,
-        front,
-        ListenLimits::default(),
-        metrics,
-        shutdown.signal(),
-    ));
-    (addr, shutdown)
+    (front, metrics)
 }
 
 /// A bare-minimum SigV4-shaped `Authorization` header. `signed` names the
@@ -562,5 +609,72 @@ async fn a_warm_only_get_is_authorized_and_answers_header_only() {
         requests.load(Ordering::SeqCst),
         5,
         "the probe, and nothing else: every chunk was warmed"
+    );
+}
+
+/// ADR-0046 end to end in `auth.mode: requester`: the `pacer-daemon warm` command itself,
+/// through the daemon's TLS listener as a forwarding proxy (`--proxy`), warms an object —
+/// and the ordinary read after it costs only its authorization probe.
+///
+/// This is the test the command's own shape is on trial in. The SDK signs for the real S3
+/// host (here the fake), the connector dials the daemon over TLS and sends the request in
+/// absolute form inside that session, the `Range` and warm header ride outside the
+/// signature, and the daemon authorizes each slice with the caller's signature before it
+/// fills. A `CONNECT` anywhere in that path would be refused and fail the warm.
+#[tokio::test]
+async fn the_warm_command_warms_through_the_tls_listener_as_a_proxy() {
+    use pacer_daemon::warm::command::{proxied, run, Target, WarmArgs};
+
+    let (upstream, _upstream_shutdown, requests) = spawn_fake_s3().await;
+    let (daemon, _daemon_shutdown, ca, _dir) = spawn_requester_daemon_tls(upstream).await;
+    let config = aws_sdk_s3::Config::builder()
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            "caller", "secret", None, None, "test",
+        ))
+        .region(aws_sdk_s3::config::Region::new("us-east-2"))
+        .endpoint_url(format!("http://{upstream}"))
+        .force_path_style(true)
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
+    let proxy = format!("https://localhost:{}", daemon.port());
+    let client = proxied(config, &proxy, Some(&ca)).expect("a forwarding client");
+    let args = WarmArgs {
+        target: Target::Proxy {
+            url: proxy,
+            ca: Some(ca.clone()),
+        },
+        sources: vec![
+            pacer_daemon::warm::plan::Source::parse(&format!("s3:/{OBJECT_PATH}")).unwrap(),
+        ],
+        manifest: None,
+        concurrency: 1,
+        slice_bytes: 1 << 30,
+        max_bytes: None,
+        dry_run: false,
+    };
+
+    let summary = run(&client, &args).await.expect("the warm runs");
+    assert_eq!(summary.failed, 0, "{:?}", summary.failures);
+    assert_eq!(summary.drained_bytes, 0, "the daemon understood the warm");
+    assert_eq!(summary.warmed_bytes, OBJECT_BYTES.len() as u64);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        5,
+        "HeadObject forwarded, then the probe and one read per covering chunk"
+    );
+
+    let before = requests.load(Ordering::SeqCst);
+    let got = client
+        .get_object()
+        .bucket("bkt")
+        .key("obj")
+        .send()
+        .await
+        .expect("a read through the same proxy");
+    let body = got.body.collect().await.expect("the body").into_bytes();
+    assert_eq!(&body[..], OBJECT_BYTES);
+    assert_eq!(
+        requests.load(Ordering::SeqCst) - before,
+        1,
+        "the probe, and nothing else: the warm left every chunk cached"
     );
 }

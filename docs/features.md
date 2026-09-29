@@ -80,12 +80,19 @@ It changes the object's ETag to the multipart `-N` form; see
 `pacer-daemon warm` reads a bucket prefix, an exact key, or a manifest of either into the
 cache before the workload that needs it starts, and sends none of the bytes back. It ships
 in the daemon image, so a warm is a Kubernetes Job on that image, on a node of the ring you
-want warm:
+want warm. It reaches the daemon the way your release's `auth.mode` says clients do:
 
 ```bash
+# auth.mode: node — the daemon as the endpoint, the bucket by its alias, placeholder keys
 AWS_ACCESS_KEY_ID=pacer AWS_SECRET_ACCESS_KEY=pacer AWS_REGION=us-east-1 \
 pacer-daemon warm --endpoint http://pacer.pacer.svc.cluster.local:9000 \
   s3://cache/models/llama-3-405b/
+
+# auth.mode: requester — the daemon's TLS listener as a forwarding proxy, the real bucket,
+# the Job's own credentials (S3 authorizes every object for that identity)
+pacer-daemon warm --proxy https://pacer.pacer.svc.cluster.local:9443 \
+  --proxy-ca /etc/pacer-ca/ca.crt \
+  s3://amzn-s3-demo-bucket--use2-az1--x-s3/models/llama-3-405b/
 ```
 
 It expands the prefix, slices each object into bounded requests (`--slice`, default 1 GiB) so
@@ -94,5 +101,5 @@ no single request runs long, and warms them at bounded concurrency (`--concurren
 object count and total size first. Re-running it is safe and cheap: an already-warm slice
 costs a cache hit. **One limit to know:** a warm fills each chunk at one of its
 `cluster.replicationR` homes, so a reader on another node can still find its first copy of a
-chunk cold ([#38](https://github.com/aws-samples/sample-pacer/issues/38)). Design:
-[ADR-0048](adr/0048-warm-only-get.md).
+chunk cold ([#38](https://github.com/aws-samples/sample-pacer/issues/38)). Job manifests for
+both modes: [warm.md](helm/warm.md). Design: [ADR-0048](adr/0048-warm-only-get.md).

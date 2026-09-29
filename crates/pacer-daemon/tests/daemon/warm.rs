@@ -17,7 +17,7 @@
 #![allow(clippy::too_many_lines)]
 
 use aws_sdk_s3::primitives::ByteStream;
-use pacer_daemon::warm::command::{run, WarmArgs};
+use pacer_daemon::warm::command::{run, Target, WarmArgs};
 use pacer_daemon::warm::plan::Source;
 use pacer_daemon::warm::{SkipReason, WARM_HEADER};
 
@@ -58,7 +58,7 @@ async fn seed(h: &Daemon, key: &str, len: u64) {
 /// The command's arguments for `uris`, at its defaults.
 fn warm_args(uris: &[&str]) -> WarmArgs {
     WarmArgs {
-        endpoint: "in-process".into(),
+        target: Target::Endpoint("in-process".into()),
         sources: uris.iter().map(|u| Source::parse(u).unwrap()).collect(),
         manifest: None,
         concurrency: 4,

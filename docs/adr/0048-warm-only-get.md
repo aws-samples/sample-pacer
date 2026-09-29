@@ -55,18 +55,39 @@ body and `x-pacer-warmed: <bytes>`.**
    runs long regardless of object size; send warm GETs at bounded concurrency (`--concurrency`);
    refuse a total above `--max-bytes`; and report what warmed, what was skipped, and what failed.
    Re-running it is safe and cheap — an already-warm slice is a cache hit — which is what makes
-   it safe to run as a Kubernetes Job that a caller submits and does not wait on. This version
-   speaks `node` mode's client shape only (`--endpoint`).
+   it safe to run as a Kubernetes Job that a caller submits and does not wait on.
+7. **The command speaks each mode's own client contract.** `--endpoint` is `node` mode's: the
+   daemon as the S3 endpoint, bucket aliases, placeholder credentials. `--proxy` is `requester`
+   mode's ([auth.md](../helm/auth.md#the-client-contract)): the daemon's TLS listener as a
+   forwarding proxy, real bucket names, the caller's own credentials, SDK endpoint resolution
+   (so an Express bucket is addressed on its zonal endpoint). Exactly one is required.
+   The stock SDK HTTP client cannot do the second: through a proxy it opens a `CONNECT` tunnel
+   for any `https://` target, and the daemon refuses tunnels because it cannot see into one. So
+   `--proxy` swaps in a small client (`crates/pacer-daemon/src/warm/forward.rs`) that dials the
+   daemon over TLS whatever the target and marks the connection as a proxy, which makes hyper
+   send each request in absolute form inside that session — botocore's
+   `proxy_use_forwarding_for_https`. **Both hops are TLS, always:** `--proxy` accepts only an
+   `https://` URL, and because the daemon follows the scheme a request names when it forwards,
+   a plaintext client hop would have made its hop to S3 plaintext too. S3 Express's zonal
+   endpoints do not answer plain HTTP in any case.
 
 ## Consequences
 
 - **Cost is proportional to what is warmed, not open-ended.** A warm reads exactly the covering
   chunks of what it names, at the caller's own concurrency — the same cost invariant ADR-0011
   and ADR-0015 already established for a read.
-- **A warm through a single node fills only that chunk's home(s), never every replica.** With
-  `replication_r` R > 1, a restore storm behind a cold second co-home still pays one backend read
-  per chunk on that co-home's first real read. Warming more than one co-home is out of scope
-  here; see [#38](https://github.com/aws-samples/sample-pacer/issues/38).
+- **A warm fills one of each chunk's R homes, and at R = 2 that is about half of what a reader
+  elsewhere will ask for.** A read resolves a chunk at a co-home chosen from the reader's own
+  node name, so a reader on the node that ran the warm asks the co-homes the warm filled, and a
+  reader on any other node asks the unfilled one for roughly half the chunks — whose first read
+  then comes from S3. Observed on a three-node, R = 2 ring in both modes: a read from the warming
+  node was all hits, while a re-warm from another node read 34 of 64 chunks from S3.
+  Filling every co-home is [#38](https://github.com/aws-samples/sample-pacer/issues/38), and is
+  what makes a warm worth its name for a multi-node restore.
+- **In `requester` mode a warm's copies at other homes are pushed, not awaited.** A chunk whose
+  home is another node is read by the node that received the warm and pushed to that home
+  fire-and-forget, as for any read; the warm can answer before the home commits it. The same
+  change as #38 — synchronous pushes to every co-home — closes this.
 - **A byte range is an internal slicing detail, not a caller-facing feature.** The command warms
   whole objects; a future user-facing partial-object warm would be its own decision.
 - **`pacer_warm_requests_total`** (labeled `warmed`/`skipped`/`failed`) and

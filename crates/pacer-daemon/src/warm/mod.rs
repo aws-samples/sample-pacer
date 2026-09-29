@@ -25,6 +25,7 @@
 //! and holds the only concurrency knob that loads S3.
 
 pub mod command;
+pub mod forward;
 pub mod plan;
 
 /// Request header asking for a warm-only GET. `x-pacer-*` for the reason

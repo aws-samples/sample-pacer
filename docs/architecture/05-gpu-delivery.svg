@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <marker id="aK" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#232F3E"/></marker>
+    <marker id="aKs" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="3.5" markerHeight="3.5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#232F3E"/></marker>
+    <marker id="aB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#147EBA"/></marker>
+    <marker id="aP" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="3" markerHeight="3" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#8C4FFF"/></marker>
+    <marker id="aR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#DD344C"/></marker>
+  </defs>
+  <rect width="1600" height="900" fill="#FFFFFF"/>
+  <g font-family="Arial, Helvetica, sans-serif" fill="#232F3E">
+
+    <text x="40" y="58" font-size="34" font-weight="bold">Delivery: from a NIC straight into the loader's GPU memory</text>
+    <text x="40" y="92" font-size="18" fill="#545B64">Optional, per request. A client that names memory it owns gets the bytes placed there and a header-only answer.</text>
+
+    <!-- ===== Lane A: stock client ===== -->
+    <text x="40" y="145" font-size="20" font-weight="bold">A · Any S3 client, unchanged</text>
+    <rect x="40" y="160" width="860" height="270" rx="10" fill="none" stroke="#879196" stroke-width="1.5" stroke-dasharray="7 5"/>
+    <text x="58" y="184" font-size="14" font-weight="bold" fill="#545B64">Node A (runs the loader)</text>
+    <rect x="1120" y="160" width="440" height="270" rx="10" fill="none" stroke="#879196" stroke-width="1.5" stroke-dasharray="7 5"/>
+    <text x="1138" y="184" font-size="14" font-weight="bold" fill="#545B64">Node B (holds the chunk)</text>
+
+    <rect x="70" y="200" width="290" height="90" rx="8" fill="#E6F2F8" stroke="#147EBA" stroke-width="1.5"/>
+    <text x="215" y="235" font-size="16" font-weight="bold" text-anchor="middle">Loader process</text>
+    <text x="215" y="260" font-size="14" text-anchor="middle" fill="#545B64">host RAM buffer</text>
+    <rect x="70" y="330" width="290" height="80" rx="8" fill="#E9F5E1" stroke="#7AA116" stroke-width="2"/>
+    <text x="215" y="366" font-size="16" font-weight="bold" text-anchor="middle">GPU memory (HBM)</text>
+    <text x="215" y="390" font-size="13" text-anchor="middle" fill="#545B64">model weights end up here</text>
+    <line x1="215" y1="290" x2="215" y2="328" stroke="#DD344C" stroke-width="2.5" marker-end="url(#aR)"/>
+    <text x="228" y="315" font-size="13" fill="#DD344C" font-weight="bold">copy to GPU</text>
+
+    <rect x="580" y="200" width="290" height="90" rx="8" fill="#FFF4E5" stroke="#ED7100" stroke-width="2"/>
+    <text x="725" y="235" font-size="16" font-weight="bold" text-anchor="middle">pacer-daemon</text>
+    <text x="725" y="260" font-size="14" text-anchor="middle" fill="#545B64">registered buffer</text>
+
+    <rect x="1240" y="200" width="290" height="90" rx="8" fill="#FFF4E5" stroke="#ED7100" stroke-width="2"/>
+    <text x="1385" y="235" font-size="16" font-weight="bold" text-anchor="middle">pacer-daemon</text>
+    <text x="1385" y="260" font-size="14" text-anchor="middle" fill="#545B64">RAM slab / NVMe</text>
+
+    <line x1="1240" y1="245" x2="876" y2="245" stroke="#8C4FFF" stroke-width="8" marker-end="url(#aP)"/>
+    <text x="1055" y="232" font-size="14" font-weight="bold" text-anchor="middle" fill="#8C4FFF">RDMA WRITE</text>
+    <line x1="580" y1="245" x2="366" y2="245" stroke="#DD344C" stroke-width="5" marker-end="url(#aKs)"/>
+    <text x="470" y="232" font-size="14" font-weight="bold" text-anchor="middle" fill="#DD344C">HTTP body over TCP</text>
+    <text x="470" y="270" font-size="13" text-anchor="middle" fill="#DD344C">socket copies, CPU-bound</text>
+
+    <text x="420" y="345" font-size="15" fill="#545B64">Fast fabric, then two slow hops on the</text>
+    <text x="420" y="367" font-size="15" fill="#545B64">loader's node: the socket, then the copy</text>
+    <text x="420" y="389" font-size="15" fill="#545B64">into the GPU.</text>
+
+    <!-- ===== Lane B: cooperating loader ===== -->
+    <text x="40" y="480" font-size="20" font-weight="bold">B · A loader that names its GPU memory</text>
+    <rect x="40" y="495" width="860" height="310" rx="10" fill="none" stroke="#879196" stroke-width="1.5" stroke-dasharray="7 5"/>
+    <text x="58" y="519" font-size="14" font-weight="bold" fill="#545B64">Node A (runs the loader)</text>
+    <rect x="1120" y="495" width="440" height="310" rx="10" fill="none" stroke="#879196" stroke-width="1.5" stroke-dasharray="7 5"/>
+    <text x="1138" y="519" font-size="14" font-weight="bold" fill="#545B64">Node B (holds the chunk)</text>
+
+    <rect x="70" y="535" width="290" height="100" rx="8" fill="#E6F2F8" stroke="#147EBA" stroke-width="1.5"/>
+    <text x="215" y="566" font-size="16" font-weight="bold" text-anchor="middle">Loader process</text>
+    <text x="215" y="590" font-size="13" text-anchor="middle" fill="#545B64">registers its own GPU memory on</text>
+    <text x="215" y="608" font-size="13" text-anchor="middle" fill="#545B64">its own EFA NIC → a "write here" token</text>
+    <rect x="70" y="690" width="290" height="95" rx="8" fill="#E9F5E1" stroke="#7AA116" stroke-width="2.5"/>
+    <text x="215" y="728" font-size="16" font-weight="bold" text-anchor="middle">GPU memory (HBM)</text>
+    <text x="215" y="752" font-size="13" text-anchor="middle" fill="#545B64">bytes land here directly</text>
+    <line x1="215" y1="635" x2="215" y2="688" stroke="#232F3E" stroke-width="1.5" stroke-dasharray="4 3"/>
+
+    <rect x="580" y="535" width="290" height="100" rx="8" fill="#FFF4E5" stroke="#ED7100" stroke-width="2"/>
+    <text x="725" y="570" font-size="16" font-weight="bold" text-anchor="middle">pacer-daemon</text>
+    <text x="725" y="594" font-size="13" text-anchor="middle" fill="#545B64">writes each chunk into the</text>
+    <text x="725" y="612" font-size="13" text-anchor="middle" fill="#545B64">loader's window with its own NIC</text>
+
+    <rect x="1240" y="535" width="290" height="100" rx="8" fill="#FFF4E5" stroke="#ED7100" stroke-width="2"/>
+    <text x="1385" y="570" font-size="16" font-weight="bold" text-anchor="middle">pacer-daemon</text>
+    <text x="1385" y="594" font-size="14" text-anchor="middle" fill="#545B64">RAM slab / NVMe</text>
+
+    <!-- 1 GET with header -->
+    <line x1="360" y1="560" x2="578" y2="560" stroke="#232F3E" stroke-width="2" marker-end="url(#aK)"/>
+    <text x="469" y="552" font-size="13" text-anchor="middle" font-weight="bold">1 · GET + x-pacer-target</text>
+    <!-- 2 fetch from holder -->
+    <line x1="870" y1="560" x2="1238" y2="560" stroke="#147EBA" stroke-width="2" marker-end="url(#aB)"/>
+    <text x="1055" y="552" font-size="13" text-anchor="middle" fill="#147EBA" font-weight="bold">2 · fetch the chunk (as in the read path)</text>
+    <!-- 3 RDMA holder -> reader -->
+    <line x1="1240" y1="605" x2="878" y2="605" stroke="#8C4FFF" stroke-width="8" marker-end="url(#aP)"/>
+    <text x="1055" y="628" font-size="14" font-weight="bold" text-anchor="middle" fill="#8C4FFF">3 · RDMA WRITE</text>
+    <!-- 4 RDMA reader -> HBM -->
+    <path d="M725,635 L725,737 L368,737" stroke="#8C4FFF" stroke-width="10" fill="none" marker-end="url(#aP)"/>
+    <text x="545" y="700" font-size="16" font-weight="bold" text-anchor="middle" fill="#8C4FFF">4 · RDMA WRITE into GPU memory</text>
+    <text x="545" y="721" font-size="13" text-anchor="middle" fill="#8C4FFF">via the NIC next to that GPU · no socket</text>
+    <!-- optional: holder writes HBM directly -->
+    <path d="M1385,635 L1385,772 L368,772" stroke="#8C4FFF" stroke-width="3" stroke-dasharray="9 6" fill="none" marker-end="url(#aP)"/>
+    <text x="1372" y="700" font-size="13" text-anchor="end" fill="#8C4FFF" font-weight="bold">optional, delivery.remoteWrite:</text>
+    <text x="1372" y="718" font-size="13" text-anchor="end" fill="#8C4FFF">the holder writes the GPU itself,</text>
+    <text x="1372" y="736" font-size="13" text-anchor="end" fill="#8C4FFF">one hop instead of two</text>
+    <!-- 5 reply -->
+    <line x1="578" y1="612" x2="362" y2="612" stroke="#232F3E" stroke-width="2" marker-end="url(#aK)"/>
+    <text x="469" y="630" font-size="13" text-anchor="middle" font-weight="bold">5 · 200 OK, empty body</text>
+
+
+    <!-- Footer -->
+    <rect x="40" y="825" width="1520" height="60" rx="8" fill="#F7F9FA" stroke="#DDDDDD"/>
+    <text x="60" y="851" font-size="15"><tspan font-weight="bold">The answer is the completion signal:</tspan><tspan dx="6" fill="#545B64">header x-pacer-delivered + a CRC32 of the delivered bytes. No header = read the body as usual, so a stock client never notices.</tspan></text>
+    <text x="60" y="873" font-size="15" fill="#545B64">Same idea for host memory on the same node (shm: target). Measured once: a 131 GiB Llama-3.3-70B checkpoint into 8 GPUs in ≈6.3 s (one configuration, checkpoint stored in per-rank layout).</text>
+  </g>
+</svg>

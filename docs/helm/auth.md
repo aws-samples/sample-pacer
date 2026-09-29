@@ -206,6 +206,30 @@ anything beyond that is forwarded without being cached.
 - **The write scatter** (`scatter.*`) is refused: it converts a PUT into a multipart upload the
   daemon signs itself, and in this mode it has nothing to sign with.
 
+## Limitation: S3 sees the daemon's address, not the caller's
+
+The caller's signature authorizes the request, but the daemon opens the connection to S3.
+Every request S3 receives in requester mode — the authorization request, a fill, a forwarded
+write — therefore comes from the address of the daemon pod on the caller's node
+(`service.internalTrafficPolicy: Local`), not from the caller's pod. This cannot be changed:
+a SigV4 signature does not cover the source address, and S3 evaluates address conditions on
+the connection, not on a forwarded header.
+
+For IAM and bucket policy condition keys this means:
+
+| Condition | In requester mode |
+|---|---|
+| Principal, tags, `aws:PrincipalArn`, session tags (Pod Identity) | evaluated on the caller, as without PACER |
+| `aws:SourceVpc`, `aws:SourceVpce` | unchanged — the daemon uses the same VPC and endpoint as the caller |
+| `aws:VpcSourceIp` matching a subnet CIDR that holds both pods and daemon pods | unchanged |
+| `aws:VpcSourceIp` matching specific pod addresses | matches the daemon pod, so the policy must admit the daemon's address — after which every pod on that node passes the address check |
+| `aws:SourceIp` | only set for traffic that does not use a VPC endpoint; it is then the NAT's public address, for PACER and without it alike |
+
+A policy that tells callers apart by their network address cannot do so through PACER.
+Express One Zone evaluates these conditions when the session is created (`CreateSession`),
+which in this mode also passes through the daemon. Base per-caller access on the caller's
+identity, and use `aws:SourceVpce` or `aws:SourceVpc` for the network perimeter.
+
 ## What it costs
 
 - **One round trip to S3 per GET**, for the authorization request. It overlaps nothing: a cache

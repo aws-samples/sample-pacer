@@ -1,0 +1,62 @@
+# The CacheRing operator (ADR-0047): the operator binary, a pinned `helm`, and the
+# `pacer` chart the operator renders rings with — all three in one image, because an
+# operator release and the chart it was tested against are the same release (ADR-0047 § 1).
+#
+#     docker build -f Dockerfile.operator -t pacer-operator .
+#
+# Same AL2023 build → AL2023-minimal runtime as ./Dockerfile, for the same glibc reason.
+# BUMP THE TWO BASE PINS IN LOCKSTEP with ./Dockerfile, Dockerfile.runtime,
+# ci/Dockerfile.release and ci/Dockerfile.efa-builder.
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260914.0 AS builder
+RUN dnf install -y --allowerasing gcc gcc-c++ curl ca-certificates tar gzip
+ARG RUST_VERSION=1.96.0
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# helm renders every ring, so it is part of the operator's supply chain: an exact
+# version, and the tarball checked against the digest published with that release
+# (https://get.helm.sh/helm-<version>-linux-<arch>.tar.gz.sha256sum), per arch.
+ARG HELM_VERSION=v4.3.0
+ARG HELM_SHA256_AMD64=86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb
+ARG HELM_SHA256_ARM64=31c5794dd55c66a51e6b7d2e2ac7a114ae8b1de41ff1d9ba51748ac973b06a08
+ARG TARGETARCH=amd64
+RUN case "${TARGETARCH}" in \
+        amd64) sum="${HELM_SHA256_AMD64}" ;; \
+        arm64) sum="${HELM_SHA256_ARM64}" ;; \
+        *) echo "no helm digest for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && curl --proto '=https' --tlsv1.2 -fsSLo /tmp/helm.tgz \
+        "https://get.helm.sh/helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz" \
+ && echo "${sum}  /tmp/helm.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/helm.tgz -C /tmp \
+ && install -m 0755 "/tmp/linux-${TARGETARCH}/helm" /usr/local/bin/helm
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release -p pacer-operator
+
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260914.0-minimal
+# checkov:skip=CKV_DOCKER_2:Health is checked by Kubernetes, not by Docker; the
+# operator chart's Deployment is the only thing that runs this image.
+RUN echo 'pacer:x:65532:65532:pacer:/nonexistent:/sbin/nologin' >> /etc/passwd \
+ && echo 'pacer:x:65532:' >> /etc/group
+COPY --from=builder /usr/local/bin/helm /usr/local/bin/helm
+COPY --from=builder /src/target/release/pacer-operator /usr/local/bin/pacer-operator
+# The chart itself and nothing else in its directory: no example or site overlays, no
+# helm-unittest suites. What renders a ring is exactly these four paths.
+COPY deploy/helm/pacer/Chart.yaml deploy/helm/pacer/values.yaml \
+     deploy/helm/pacer/values.schema.json /opt/pacer/chart/
+COPY deploy/helm/pacer/templates /opt/pacer/chart/templates
+# `helm template` of a local chart resolves these three directories but writes nothing
+# to them — checked with all three unwritable, the render succeeds — which is why the
+# operator chart can run this image with a read-only root and no writable volume. Set
+# explicitly anyway, so they never fall back to $HOME (/nonexistent for this user).
+ENV PACER_OPERATOR_CHART_DIR=/opt/pacer/chart \
+    PACER_OPERATOR_HELM=/usr/local/bin/helm \
+    HELM_CACHE_HOME=/tmp/helm/cache \
+    HELM_CONFIG_HOME=/tmp/helm/config \
+    HELM_DATA_HOME=/tmp/helm/data
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/pacer-operator"]

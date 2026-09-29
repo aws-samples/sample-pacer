@@ -1,0 +1,84 @@
+{{/*
+The operator's RBAC has two parts, kept in separate rule blocks below because they answer
+different questions:
+
+1. What it watches to reconcile: CacheRings (+ their status subresource), the DaemonSets
+   it owns, and the EndpointSlices of a ring's peer Service (ADR-0047 § 5).
+2. What it may apply on a ring's behalf: exactly `pacer_operator::guard::ALLOWED_KINDS`
+   (ADR-0047 § 4). crates/pacer-operator/tests/rbac.rs renders this template and asserts
+   every entry of that constant has a matching rule here, so the two cannot drift apart.
+
+RoleBinding/RoleBinding escalation note: creating the pacer chart's own Role
+(list/watch on discovery.k8s.io/endpointslices) needs the operator to already hold that
+permission, which rule block 1 grants — so no explicit `bind`/`escalate` verb is needed.
+*/}}
+{{- $kind := ternary "Role" "ClusterRole" (not (empty .Values.watchNamespace)) }}
+{{- $bindingKind := ternary "RoleBinding" "ClusterRoleBinding" (not (empty .Values.watchNamespace)) }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ $kind }}
+metadata:
+  name: {{ include "pacer-operator.fullname" . }}
+  {{- with .Values.watchNamespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "pacer-operator.labels" . | nindent 4 }}
+rules:
+  # 1. What the operator watches.
+  - apiGroups: ["pacer.io"]
+    resources: ["cacherings"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["pacer.io"]
+    resources: ["cacherings/status"]
+    verbs: ["get", "patch", "update"]
+  # The owner reference the guard stamps sets blockOwnerDeletion, which the
+  # OwnerReferencesPermissionEnforcement admission plugin allows only to a client that
+  # may update the owner's finalizers. Not every cluster enables that plugin; granted so
+  # the operator works on the ones that do.
+  - apiGroups: ["pacer.io"]
+    resources: ["cacherings/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  # 2. What the operator applies — one rule per ALLOWED_KINDS entry, full CRUD because
+  # server-side apply and pruning both write, not just read.
+  - apiGroups: [""]
+    resources: ["configmaps", "services", "serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # monitoring.coreos.com/v1 is a CRD (deploy/helm/pacer's monitoring.prometheusRule.enabled
+  # gate exists for the same reason): granting this rule does not require the CRD to be
+  # installed, but rendering a ring with that value set will fail until it is.
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["prometheusrules"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ $bindingKind }}
+metadata:
+  name: {{ include "pacer-operator.fullname" . }}
+  {{- with .Values.watchNamespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "pacer-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: {{ $kind }}
+  name: {{ include "pacer-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pacer-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

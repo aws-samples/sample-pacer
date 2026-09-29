@@ -65,6 +65,44 @@ plus `helm` and `cargo-deny`; `.devcontainer/install-dev-tools.sh` installs thos
 two at the versions CI pins. Everything except `--features efa` builds on macOS and
 Linux — that one feature needs Linux with the EFA userspace present.
 
+The `make` targets:
+
+```bash
+make build      # debug build
+make test       # unit and integration tests
+make lint       # fmt --check, clippy -D warnings, helm lint
+make smoke      # start the daemon and check /healthz
+make ci         # lint, test, doc, deny, smoke
+make image      # build the container image locally
+```
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| [crates/pacer-daemon](crates/pacer-daemon) | S3 front end, proxy, auth, delivery, admin endpoint |
+| [crates/pacer-cache](crates/pacer-cache) | Chunking, admission, range handling, RAM and disk tiers |
+| [crates/pacer-backend](crates/pacer-backend) | S3 client: Express sessions, endpoint and region config |
+| [crates/pacer-ring](crates/pacer-ring) | Placement of chunks across nodes, membership, chunk directory |
+| [crates/pacer-transport](crates/pacer-transport) | Peer transport: gRPC, and EFA RDMA behind the `efa` feature |
+| [crates/pacer-client](crates/pacer-client) | Client side of `nic:` delivery |
+| [crates/pacer-proto](crates/pacer-proto) | Protobuf definitions for peer traffic |
+| [deploy/helm/pacer](deploy/helm/pacer) | Helm chart |
+| [deploy/grafana](deploy/grafana) | Grafana dashboard |
+| [docs/](docs) | User documentation, chart design notes, ADRs, benchmarks, runbooks |
+| [ci/](ci) | EFA builder image, release image, smoke test |
+
+## CI
+
+[ci.yaml](.github/workflows/ci.yaml) runs `cargo fmt --check`, `clippy -D warnings` and
+`cargo test`; `helm lint` and `helm template` over the base chart and a Karpenter + EFA
+configuration; and a release image build without push. Clippy with `--all-features` runs
+only in [the EFA builder image](ci/Dockerfile.efa-builder), because the `efa` feature links
+libibverbs and libfabric. CodeQL is configured on the repository. Dependabot
+([dependabot.yml](.github/dependabot.yml)) proposes grouped updates. Pushing a `vX.Y.Z` tag
+runs [release.yaml](.github/workflows/release.yaml), which builds per architecture, scans
+with Trivy, and publishes the multi-arch image and the chart.
+
 ## Contributing via Pull Requests
 Contributions via pull requests are much appreciated. Before sending us a pull request, please ensure that:
 

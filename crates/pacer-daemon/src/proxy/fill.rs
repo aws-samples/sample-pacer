@@ -247,6 +247,75 @@ enum FillState {
 pub struct FillRegistry {
     /// One entry per claimed key; absent means nobody is filling it.
     claims: Arc<Mutex<HashMap<String, FillState>>>,
+    /// One entry per key with a [`ReadTicket`] alive; absent means no fill-capable
+    /// read of it is in flight. Its own lock, never taken while `claims` is held —
+    /// every method below locks one map, releases it, then (if at all) the other.
+    reads: Arc<Mutex<HashMap<String, ReadEpoch>>>,
+}
+
+/// The in-flight reads of one key that may end in a tier insert, and how many
+/// invalidations have landed on it while any of them was alive (gh55).
+///
+/// Exists because a claim is not always held across the read that precedes an
+/// insert. The coalescing leader claims before its backend GET (ADR-0040), but
+/// `fetch_from_backend` (coalescing off, [`FillClaim::Busy`], a follower's
+/// fallback), the layer-1 admit of peer-fetched bytes, and the peer server's
+/// read-through all read first and claim only to insert. An `Invalidate` landing
+/// during such a read found no claim to poison, and the read then claimed a free
+/// key and inserted the pre-write bytes — gh22's race, on every path but one.
+///
+/// Removed when its last ticket drops, so the map is bounded by reads in flight,
+/// not by keys ever read. That also makes restarting `epoch` at zero safe: no
+/// ticket from an earlier entry for the same key can still exist.
+#[derive(Default)]
+struct ReadEpoch {
+    /// Live [`ReadTicket`]s for this key.
+    readers: usize,
+    /// Bumped by every [`FillRegistry::poison`] of this key while `readers > 0`.
+    epoch: u64,
+}
+
+/// Taken by a read that may insert its bytes, **before** that read is issued, and
+/// attached to the insert's [`FillGuard`] ([`FillGuard::fenced_by`]).
+///
+/// Stale once a write's `Invalidate` has poisoned the key since the ticket was
+/// taken. That ordering is the whole argument: a write invalidates only after
+/// its backend mutation committed (`PacerProxy::invalidate_key`), so a read that
+/// began after the poison was issued after the commit and returns the new bytes,
+/// while one that began before it may have returned the old ones and must not
+/// insert them.
+pub(crate) struct ReadTicket {
+    /// The registry's `reads` map this ticket holds one reader in.
+    reads: Arc<Mutex<HashMap<String, ReadEpoch>>>,
+    /// The key read, owned so `Drop` needs no borrow.
+    key: String,
+    /// The key's epoch when this ticket was taken.
+    epoch: u64,
+}
+
+impl ReadTicket {
+    /// Whether the key was invalidated after this ticket was taken.
+    fn is_stale(&self) -> bool {
+        self.reads
+            .lock()
+            .unwrap()
+            .get(&self.key)
+            // Unreachable while this ticket is alive (its own `readers` keeps the
+            // entry), and refusing is the safe answer if it ever were.
+            .is_none_or(|entry| entry.epoch != self.epoch)
+    }
+}
+
+impl Drop for ReadTicket {
+    fn drop(&mut self) {
+        let mut reads = self.reads.lock().unwrap();
+        if let Some(entry) = reads.get_mut(&self.key) {
+            entry.readers -= 1;
+            if entry.readers == 0 {
+                reads.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// What a would-be filler of one chunk key got when it asked
@@ -324,10 +393,28 @@ impl FillRegistry {
     /// what closes the broadcast channel and wakes every parked follower with
     /// `None` — see [`FillState::Poisoned`] for why that is exactly what they
     /// should get.
+    ///
+    /// Also marks every [`ReadTicket`] alive for `key` stale, which fences the
+    /// reads that hold no claim yet (gh55).
     pub(crate) fn poison(&self, key: &str) {
-        let mut claims = self.claims.lock().unwrap();
-        if let Some(state) = claims.get_mut(key) {
+        if let Some(state) = self.claims.lock().unwrap().get_mut(key) {
             *state = FillState::Poisoned;
+        }
+        if let Some(entry) = self.reads.lock().unwrap().get_mut(key) {
+            entry.epoch += 1;
+        }
+    }
+
+    /// Register a read of `key` whose bytes may be inserted, before issuing it.
+    /// See [`ReadTicket`] for why it must come first.
+    pub(crate) fn begin_read(&self, key: &str) -> ReadTicket {
+        let mut reads = self.reads.lock().unwrap();
+        let entry = reads.entry(key.to_owned()).or_default();
+        entry.readers += 1;
+        ReadTicket {
+            reads: Arc::clone(&self.reads),
+            key: key.to_owned(),
+            epoch: entry.epoch,
         }
     }
 
@@ -462,6 +549,10 @@ pub(crate) struct FillGuard {
     inflight: IntGauge,
     /// [`Metrics::fill_abandoned`], incremented on drop iff `!completed`.
     abandoned: IntCounter,
+    /// The ticket of the read whose bytes this claim will insert, when that read
+    /// began before the claim was taken ([`Self::fenced_by`]). `None` for the
+    /// coalescing leader, whose claim already spans its read.
+    read: Option<ReadTicket>,
 }
 
 impl FillGuard {
@@ -479,6 +570,7 @@ impl FillGuard {
             completed: false,
             inflight: metrics.fill_inflight.clone(),
             abandoned: metrics.fill_abandoned.clone(),
+            read: None,
         }
     }
 
@@ -519,13 +611,23 @@ impl FillGuard {
         self.completed = true;
     }
 
+    /// Fence this claim's insert by the read that produced its bytes, too: a claim
+    /// taken *after* that read cannot see an `Invalidate` that landed during it,
+    /// and the ticket can (gh55).
+    #[must_use]
+    pub(crate) fn fenced_by(mut self, read: ReadTicket) -> Self {
+        self.read = Some(read);
+        self
+    }
+
     /// Whether an `Invalidate` poisoned this guard's key while the fill was in
     /// flight (gh22, ADR-0044). Checked on both sides of every tier write a
     /// guard's holder makes — see [`FillCtx::put_chunk_fenced`] and `peer.rs`'s
     /// read-through pump, which holds the same guard but is not a `FillCtx`
-    /// method.
+    /// method. Also true when the read this claim was [fenced by](Self::fenced_by)
+    /// was invalidated before the claim existed.
     pub(crate) fn is_poisoned(&self) -> bool {
-        self.registry.is_poisoned(&self.key)
+        self.registry.is_poisoned(&self.key) || self.read.as_ref().is_some_and(ReadTicket::is_stale)
     }
 }
 
@@ -658,10 +760,15 @@ impl FillCtx {
         // Not a home: fetch from a peer. On success, layer 1 (ADR-0016) may
         // admit a local copy once the chunk proves hot. A peer failure falls
         // back to a no-fill backend GET.
+        // The ticket is taken before the peer fetch for the same reason
+        // `fetch_from_backend` takes one before its GET (gh55): the admit claims
+        // only once the bytes are here.
+        let read = self.filling.begin_read(&chunk_key);
         if let Some(bytes) = self.fetch_from_peer(&chunk_key).await {
-            self.maybe_admit_local(&chunk_key, &bytes).await;
+            self.maybe_admit_local(&chunk_key, &bytes, read).await;
             return Ok(bytes);
         }
+        drop(read);
         let body = self.fetch_from_backend(idx, &chunk_key, false).await?;
         self.spawn_requester_populate(idx, &chunk_key, &body);
         Ok(body)
@@ -891,7 +998,7 @@ impl FillCtx {
     /// on admission, insert the chunk locally and announce this node as a new
     /// holder to the chunk's directory home (ADR-0017 remote-announce). A
     /// no-store read never admits (it must populate nothing, ADR-0012).
-    async fn maybe_admit_local(&self, chunk_key: &str, data: &Bytes) {
+    async fn maybe_admit_local(&self, chunk_key: &str, data: &Bytes, read: ReadTicket) {
         if self.no_fill {
             return;
         }
@@ -906,7 +1013,7 @@ impl FillCtx {
         // skip, the bytes are already served. The guard's Drop releases the
         // slot even if this future is dropped before `guard.complete()` runs
         // (see FillGuard).
-        let Some(mut guard) = self.try_begin_fill(chunk_key) else {
+        let Some(mut guard) = self.try_begin_fill(chunk_key).map(|g| g.fenced_by(read)) else {
             return;
         };
         // Copy out of `data` before retaining it. On the RDMA zero-copy serve
@@ -985,9 +1092,12 @@ impl FillCtx {
         chunk_key: &str,
         fill: bool,
     ) -> S3Result<Bytes> {
+        // Before the GET, not after: this read claims only to insert, so the
+        // ticket is the one thing an `Invalidate` landing mid-read can mark (gh55).
+        let read = fill.then(|| self.filling.begin_read(chunk_key));
         let body = self.read_backend_chunk(idx, chunk_key).await?;
-        if fill {
-            self.maybe_fill(chunk_key, &body).await;
+        if let Some(read) = read {
+            self.maybe_fill(chunk_key, &body, read).await;
         }
         Ok(body)
     }
@@ -1121,8 +1231,8 @@ impl FillCtx {
     /// `owns_chunk` held or single-node). So the fill is by the chunk's home,
     /// which is also its directory shard — the admit is recorded locally
     /// (ADR-0017 "home fills first"), no announce RPC.
-    async fn maybe_fill(&self, chunk_key: &str, data: &Bytes) {
-        let Some(mut guard) = self.try_begin_fill(chunk_key) else {
+    async fn maybe_fill(&self, chunk_key: &str, data: &Bytes, read: ReadTicket) {
+        let Some(mut guard) = self.try_begin_fill(chunk_key).map(|g| g.fenced_by(read)) else {
             return;
         };
         self.insert_filled(chunk_key, data, &guard).await;
@@ -1615,5 +1725,81 @@ mod tests {
             tier.get_chunk(A_CHUNK_KEY).await.unwrap().is_none(),
             "nothing the poisoned leader read may reach the tier"
         );
+    }
+
+    /// gh55's hole, at the registry: a read that holds no claim while it is in
+    /// flight, an `Invalidate` that lands during it, and only then the claim the
+    /// insert needs. The claim alone cannot see the poison — nothing was claimed
+    /// when it ran — so the ticket taken before the read must.
+    #[test]
+    fn a_claim_taken_after_an_invalidation_is_fenced_by_the_read_before_it() {
+        let registry = FillRegistry::new();
+        let metrics = fill_metrics();
+
+        let read = registry.begin_read(A_CHUNK_KEY);
+        registry.poison(A_CHUNK_KEY);
+        let unfenced = FillGuard::for_fill(&registry, &metrics, A_CHUNK_KEY)
+            .expect("nothing holds the key, so the exclusive claim must succeed");
+        assert!(
+            !unfenced.is_poisoned(),
+            "the claim was taken after the poison and cannot see it on its own — \
+             the hole this ticket closes"
+        );
+        drop(unfenced);
+
+        let fenced = FillGuard::for_fill(&registry, &metrics, A_CHUNK_KEY)
+            .expect("the unfenced claim was released")
+            .fenced_by(read);
+        assert!(
+            fenced.is_poisoned(),
+            "a claim fenced by a read that began before the invalidation must refuse \
+             to insert that read's bytes"
+        );
+    }
+
+    /// The ticket fences only reads that began before the invalidation. A read
+    /// issued after it was issued after the write committed, so it returns the new
+    /// bytes and must still be allowed to fill — otherwise every write would leave
+    /// its key uncacheable for as long as any read of it happened to be in flight.
+    #[test]
+    fn a_read_begun_after_an_invalidation_is_not_fenced_by_it() {
+        let registry = FillRegistry::new();
+
+        let before = registry.begin_read(A_CHUNK_KEY);
+        registry.poison(A_CHUNK_KEY);
+        let after = registry.begin_read(A_CHUNK_KEY);
+
+        assert!(
+            before.is_stale(),
+            "the read in flight across the poison is stale"
+        );
+        assert!(
+            !after.is_stale(),
+            "a read that began after the poison returns the new bytes and may fill"
+        );
+    }
+
+    /// The `reads` map is bounded by reads in flight, not by keys ever read: the
+    /// last ticket for a key removes its entry, and a poison with no read in
+    /// flight creates none.
+    #[test]
+    fn read_entries_live_only_while_a_ticket_does() {
+        let registry = FillRegistry::new();
+        let in_flight = || registry.reads.lock().unwrap().len();
+
+        registry.poison(A_CHUNK_KEY);
+        assert_eq!(
+            in_flight(),
+            0,
+            "a poison with nothing in flight records nothing"
+        );
+
+        let first = registry.begin_read(A_CHUNK_KEY);
+        let second = registry.begin_read(A_CHUNK_KEY);
+        assert_eq!(in_flight(), 1, "two reads of one key share one entry");
+        drop(first);
+        assert_eq!(in_flight(), 1, "the entry outlives all but its last ticket");
+        drop(second);
+        assert_eq!(in_flight(), 0, "and goes with the last one");
     }
 }

@@ -754,6 +754,9 @@ impl PacerPeer {
         // HTTP Range is inclusive on both ends; the chunk spans `chunk_size`
         // bytes from `start` (S3 clamps a past-the-end `last` to the object).
         let last = start + self.chunk.chunk_size() - 1;
+        // Before the GET: the claim below is taken only once the response is here,
+        // so this ticket is what fences an `Invalidate` landing in between (gh55).
+        let read = self.filling.begin_read(cache_key);
         let resp = self
             .backend
             .get_object()
@@ -788,7 +791,7 @@ impl PacerPeer {
             self.min_object_size,
             self.max_object_size,
         ) {
-            FillGuard::for_fill(&self.filling, &self.metrics, cache_key)
+            FillGuard::for_fill(&self.filling, &self.metrics, cache_key).map(|g| g.fenced_by(read))
         } else {
             None
         };

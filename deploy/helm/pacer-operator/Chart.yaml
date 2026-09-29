@@ -1,0 +1,14 @@
+apiVersion: v2
+name: pacer-operator
+description: >-
+  Kubernetes operator for PACER (ADR-0047): reconciles CacheRing custom resources into
+  releases of the pacer chart, one ring per CacheRing.
+type: application
+version: 0.1.0
+# Matches the operator image tag this chart version was tested against — same convention
+# as deploy/helm/pacer/Chart.yaml, and for the same reason (see that file's comment).
+appVersion: "v0.1.0"
+kubeVersion: ">=1.26.0-0"
+home: https://github.com/aws-samples/sample-pacer
+sources:
+  - https://github.com/aws-samples/sample-pacer

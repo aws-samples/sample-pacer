@@ -122,6 +122,13 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
+      # The operator's contract with the charts it renders and installs (ADR-0047 § 1):
+      # render.rs runs the real pacer chart, rbac.rs the operator chart's RBAC. They are
+      # #[ignore]d in a plain `cargo test` because they need helm, and they fail rather
+      # than skip without it — so this step is where they are guaranteed to run.
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4  # v4.3.1
+      - name: test (operator ↔ chart contract)
+        run: cargo test -p pacer-operator --test render --test rbac -- --ignored
 
   helm:
     needs: changes
@@ -139,7 +146,7 @@ jobs:
       # nothing to do with which Helm it installs. The action's own v5 exists and is not a
       # Helm-5 thing either.
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4  # v4.3.1
-      - name: lint + template
+      - name: lint + template (pacer)
         run: |
           helm lint deploy/helm/pacer
           helm template pacer deploy/helm/pacer > /dev/null
@@ -149,6 +156,14 @@ jobs:
             --set karpenter.clusterName=ci \
             --set karpenter.role=ci-role \
             --set efa.enabled=true > /dev/null
+      - name: lint + template (pacer-operator)
+        # Both RBAC shapes: watchNamespace set renders a Role, empty a ClusterRole.
+        run: |
+          helm lint deploy/helm/pacer-operator
+          helm template pacer-operator deploy/helm/pacer-operator \
+            | grep -qx 'kind: ClusterRole'
+          helm template pacer-operator deploy/helm/pacer-operator \
+            --set watchNamespace=cache | grep -qx 'kind: Role'
 
   image:
     needs: changes
@@ -164,3 +179,15 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # The operator image (ADR-0047) as a second STEP of this job, not a matrix leg: `image`
+      # is a required check on `main` by that exact name, and a matrix renames it to
+      # `image (<leg>)`, which would leave the required check waiting forever. Its own
+      # cache scope, so the two builds' layers do not overwrite each other's entries.
+      - name: build operator image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          file: Dockerfile.operator
+          push: false
+          cache-from: type=gha,scope=operator
+          cache-to: type=gha,mode=max,scope=operator

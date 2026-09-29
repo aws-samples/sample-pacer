@@ -12,7 +12,11 @@ below, and each one names the values keys it covers.
 
 ## The second chart
 
-There are two charts. This directory documents the **daemon** chart. The **bench** chart
+There are three charts. This directory documents the **daemon** chart. The **operator**
+chart (`deploy/helm/pacer-operator`, ADR-0047) installs `pacer-operator`, which reconciles
+`CacheRing` resources into releases of *this* chart; its own values are few enough (RBAC
+scope, watch namespace, resources) to need only [`operator.md`](operator.md), not a page
+per key. The **bench** chart
 (`deploy/helm/pacer-bench`, quality item H1) renders one
 object per invocation — the ADR-0029 node launcher, each bench/probe/loader pod, the build
 pod, the python dev pod, the dev-loop placeholder — and obeys the same one-short-comment-per-key

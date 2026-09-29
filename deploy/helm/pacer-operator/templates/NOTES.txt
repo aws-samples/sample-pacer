@@ -1,0 +1,22 @@
+pacer-operator {{ .Chart.AppVersion }} installed as {{ .Release.Name }} in namespace {{ .Release.Namespace }},
+watching {{ if .Values.watchNamespace }}namespace {{ .Values.watchNamespace }}{{ else }}every namespace{{ end }} for CacheRings.
+
+Create a ring:
+
+  cat <<EOF | kubectl apply -f -
+  apiVersion: pacer.io/v1alpha1
+  kind: CacheRing
+  metadata:
+    name: training
+    namespace: {{ if .Values.watchNamespace }}{{ .Values.watchNamespace }}{{ else }}cache{{ end }}
+  spec:
+    values:
+      nodeSelector: { pacer.io/nodepool: cache }
+  EOF
+
+Watch it converge:
+
+  kubectl get cacherings -n {{ if .Values.watchNamespace }}{{ .Values.watchNamespace }}{{ else }}cache{{ end }} -w
+  kubectl describe cachering training -n {{ if .Values.watchNamespace }}{{ .Values.watchNamespace }}{{ else }}cache{{ end }}
+
+docs/helm/operator.md has the full reference (ADR-0047).

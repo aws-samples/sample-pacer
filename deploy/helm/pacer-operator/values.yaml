@@ -1,0 +1,55 @@
+# pacer-operator — Helm values. One short comment per key, same convention as
+# deploy/helm/pacer/values.yaml.
+
+image:
+  # Default is the public multi-arch GHCR image built from Dockerfile.operator.
+  repository: ghcr.io/aws-samples/sample-pacer-operator
+  # Empty → Chart.appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Namespace to watch for CacheRings, and the scope of the operator's own RBAC — one value,
+# so the two cannot disagree. Empty = every namespace, via a ClusterRole. Set = only that
+# namespace, via a Role there, which keeps the operator's blast radius to it
+# (ADR-0047 § 4). docs/helm/operator.md
+watchNamespace: ""
+
+# RUST_LOG for the operator: a level (`info`) or tracing directives
+# (`info,kube_runtime=debug`). One JSON object per line.
+logLevel: info
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+# A single replica: the operator has no leader election (ADR-0047 § 6), so a second
+# replica would duplicate every apply rather than add capacity.
+replicaCount: 1
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+priorityClassName: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# Merged onto the container's securityContext. The image already runs as 65532:65532
+# (ENTRYPOINT's USER); these are the properties a cluster's Pod Security admission
+# usually wants stated explicitly rather than defaulted.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop: ["ALL"]

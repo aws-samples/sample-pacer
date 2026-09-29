@@ -1,0 +1,21 @@
+# pacer chart values for the ring scripts/e2e/operator-kind.sh creates on kind.
+#
+# The images are built by the CI job and loaded into the kind nodes, never pulled.
+image:
+  repository: pacer
+  tag: e2e
+  pullPolicy: Never
+# The chart's default `pacer.io/nodepool: cache` selector is kept on purpose: kind.yaml
+# labels both workers with it, and the control-plane node stays out of the ring.
+cache:
+  # Inside the kind node container. hostPath is DirectoryOrCreate.
+  hostPath: /var/lib/pacer-e2e-cache
+config:
+  # Sized for a GitHub runner, where both "nodes" share one VM: the ring's daemons only
+  # need to boot and be ready, and nothing here reads through the cache.
+  memCapacity: 64MiB
+  diskCapacity: 256MiB
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi

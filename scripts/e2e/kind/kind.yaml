@@ -1,0 +1,21 @@
+# kind cluster for scripts/e2e/operator-kind.sh: one control plane and two workers, so
+# a ring has two members and membership can drop and recover.
+#
+# The node image is pinned by DIGEST to a kind v0.33.0 release image: kind's own default
+# image moves with the kind binary, and a tag alone is mutable. v1.36 matches the EKS
+# clusters this operator has been run on.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+  # The chart's default nodeSelector is `pacer.io/nodepool: cache`; labelling the workers
+  # with it keeps the ring off the control plane without overriding the chart.
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+    labels:
+      pacer.io/nodepool: cache
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+    labels:
+      pacer.io/nodepool: cache

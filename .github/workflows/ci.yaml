@@ -58,6 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.diff.outputs.code }}
+      operator: ${{ steps.diff.outputs.operator }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
@@ -69,18 +70,28 @@ jobs:
           # Paths no job below reads: nothing compiles, templates or copies
           # Markdown into the image (the chart's templates cite docs/ as prose).
           DOC_PATHS: '^(docs/.*|.*\.md|LICENSE)$'
+          # What the operator e2e exercises (ADR-0047): the operator, the chart it renders
+          # and installs, the two images the kind cluster runs, the e2e scripts and this
+          # workflow. A daemon-only change is not in here: the ring's daemons only have to
+          # boot and pass readiness, which the rust and image jobs already cover.
+          OPERATOR_PATHS: '^(crates/pacer-operator/.*|deploy/helm/pacer/.*|deploy/helm/pacer-operator/.*|Dockerfile|Dockerfile\.operator|Cargo\.lock|Cargo\.toml|scripts/e2e/.*|\.github/workflows/ci\.yaml)$'
         run: |
           set -euo pipefail
           code=true
+          operator=true
           # An unknown base (a first push, a force-push) keeps the full set.
           if git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
             changed=$(git diff --name-only "$BASE" HEAD)
             if ! grep -qvE "$DOC_PATHS" <<<"$changed"; then
               code=false
             fi
+            if ! grep -qE "$OPERATOR_PATHS" <<<"$changed"; then
+              operator=false
+            fi
             printf 'changed:\n%s\n' "$changed"
           fi
           echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+          echo "operator=$operator" | tee -a "$GITHUB_OUTPUT"
 
   rust:
     needs: changes
@@ -191,3 +202,52 @@ jobs:
           push: false
           cache-from: type=gha,scope=operator
           cache-to: type=gha,mode=max,scope=operator
+
+  # The operator end to end on a throwaway kind cluster (ADR-0047, #44): the same
+  # scripts/e2e/operator-e2e.sh that has run on EKS, against a real API server, a real
+  # DaemonSet controller and real EndpointSlices, with images built from this commit.
+  # Unit and render tests cannot see what this does — the operator's first cluster run
+  # crash-looped on a TLS panic that every one of them passed.
+  #
+  # Runs only when a path it exercises changed (OPERATOR_PATHS in `changes`), and is not a
+  # required check: a job skipped by its own `if:` reports as passed, so a change that
+  # never touches the operator does not pay ~15 minutes for it.
+  operator-e2e:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.operator != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # kind v0.33.0, checked against the digest published with that release:
+      # https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64.sha256sum
+      KIND_VERSION: v0.33.0
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      # Same cache scopes the `image` job writes, read-only here: on a warm cache these two
+      # builds are layer pulls, and this job never pushes its own layers over that job's.
+      - name: build daemon image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          load: true
+          tags: pacer:e2e
+          cache-from: type=gha
+      - name: build operator image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          file: Dockerfile.operator
+          load: true
+          tags: pacer-operator:e2e
+          cache-from: type=gha,scope=operator
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4  # v4.3.1
+      - name: install kind
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSLo /tmp/kind \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  /tmp/kind" | sha256sum -c -
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+      - name: operator e2e on kind
+        run: scripts/e2e/operator-kind.sh

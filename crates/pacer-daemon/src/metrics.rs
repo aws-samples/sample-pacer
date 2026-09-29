@@ -265,6 +265,8 @@ pub struct Metrics {
     pub writes_refused: IntCounter,
     /// How the retrying backend chunk read fared — see [`BackendReadMetrics`].
     pub backend_read: BackendReadMetrics,
+    /// Warm-only GETs (ADR-0048) — see [`WarmMetrics`].
+    pub warm: WarmMetrics,
     // ---- cluster tier (Phase 2) ----
     /// Misses resolved by fetching from the owning peer.
     pub peer_fetches: IntCounter,
@@ -442,6 +444,23 @@ pub struct BackendReadMetrics {
     /// health (`exhausted`) or at this daemon's credentials and request shape
     /// (`permanent`).
     pub failures: IntCounterVec,
+}
+
+/// Warm-only GETs (ADR-0048): how many were asked for, and how many bytes they put
+/// through the cache.
+///
+/// A warm's chunks resolve through the ordinary read path, so they are counted by its
+/// series like any read's — a re-run warm moves `pacer_cache_hits_total`, a cold one
+/// `pacer_bytes_filled_total`. These two are what says how much of that was a warm,
+/// which is the question a warm Job's operator is asking.
+#[derive(Clone)]
+pub struct WarmMetrics {
+    /// Warm requests, labeled `outcome` = `warmed` (every covering chunk resolved),
+    /// `skipped` (a shape or size the cache never holds, so nothing was read) or
+    /// `failed` (a chunk could not be read, and the caller was told so).
+    pub requests: IntCounterVec,
+    /// Bytes of object that `warmed` requests resolved through the cache path.
+    pub bytes: IntCounter,
 }
 
 /// ADR-0040's single flight, as an operator sees it: what it saved, and how often
@@ -1609,6 +1628,23 @@ fn register_backend_read_metrics(registry: &Registry) -> anyhow::Result<BackendR
     })
 }
 
+/// Register the ADR-0048 warm series, [`WarmMetrics`].
+fn register_warm_metrics(registry: &Registry) -> anyhow::Result<WarmMetrics> {
+    Ok(WarmMetrics {
+        requests: int_counter_vec(
+            registry,
+            "pacer_warm_requests_total",
+            "Warm-only GETs (ADR-0048), by outcome: warmed, skipped (never cacheable) or failed",
+            &["outcome"],
+        )?,
+        bytes: counter(
+            registry,
+            "pacer_warm_bytes_total",
+            "Bytes of object that warm-only GETs resolved through the cache path (ADR-0048)",
+        )?,
+    })
+}
+
 /// Register the write-scatter series (ADR-0032). Split out of [`Metrics::new`] for
 /// the same reason as [`register_delivery_metrics`].
 fn register_scatter_metrics(registry: &Registry) -> anyhow::Result<ScatterMetrics> {
@@ -2328,6 +2364,7 @@ impl Metrics {
             bytes_filled: cache_path.bytes_filled,
             writes_refused: cache_path.writes_refused,
             backend_read: register_backend_read_metrics(&registry)?,
+            warm: register_warm_metrics(&registry)?,
             peer_fetches: peer_path.fetches,
             peer_fallbacks: peer_path.fallbacks,
             bytes_from_peers: peer_path.bytes_from_peers,

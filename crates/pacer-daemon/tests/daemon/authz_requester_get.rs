@@ -28,6 +28,7 @@ use pacer_daemon::listen::ListenLimits;
 use pacer_daemon::metrics::Metrics;
 use pacer_daemon::proxy::{PacerProxy, RequesterS3};
 use pacer_daemon::shutdown::Shutdown;
+use pacer_daemon::warm::{WARMED_HEADER, WARM_HEADER};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -242,6 +243,13 @@ pub(super) fn authorization(signed: &str) -> String {
 }
 
 pub(super) async fn read_response(stream: &mut TcpStream) -> (u16, Vec<u8>) {
+    let (status, _headers, body) = read_response_with_headers(stream).await;
+    (status, body)
+}
+
+/// [`read_response`], plus the raw header block — for a test that has to see a response
+/// header the SDK's modelled output would drop (ADR-0048's `x-pacer-warmed`).
+pub(super) async fn read_response_with_headers(stream: &mut TcpStream) -> (u16, String, Vec<u8>) {
     let mut buf = Vec::new();
     let header_end = loop {
         let mut chunk = [0u8; 4096];
@@ -272,7 +280,16 @@ pub(super) async fn read_response(stream: &mut TcpStream) -> (u16, Vec<u8>) {
         assert!(n > 0, "connection closed before body completed");
         body.extend_from_slice(&chunk[..n]);
     }
-    (status, body)
+    (status, head, body)
+}
+
+/// The value of header `name` in a raw `head` block, case-insensitively — `None` when it
+/// is absent, which is the completion signal itself for [`WARMED_HEADER`].
+pub(super) fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+    })
 }
 
 /// A whole-object GET, unsigned `range`, authorized by the fake upstream:
@@ -484,4 +501,66 @@ async fn an_object_below_the_size_floor_is_passed_through_with_its_metadata() {
             "read {read}: the probe and the pass-through, never a cache hit"
         );
     }
+}
+
+/// ADR-0048 under `auth.mode: requester`: a warm-only GET is authorized exactly like the
+/// read it stands for — the probe still runs on the caller's own signature — and it
+/// answers header-only. A later ordinary read then costs only the probe: every chunk is a
+/// cache hit, so nothing crosses to the fake upstream a second time.
+#[tokio::test]
+async fn a_warm_only_get_is_authorized_and_answers_header_only() {
+    let (upstream, _upstream_shutdown, requests) = spawn_fake_s3().await;
+    let (daemon, _daemon_shutdown) = spawn_requester_daemon(upstream).await;
+    let auth = authorization("host;x-amz-date");
+    let mut client = TcpStream::connect(daemon)
+        .await
+        .expect("connect to the daemon");
+    let request = format!(
+        "GET http://{upstream}{OBJECT_PATH} HTTP/1.1\r\n\
+         Host: {upstream}\r\n\
+         Authorization: {auth}\r\n\
+         {WARM_HEADER}: 1\r\n\
+         Connection: close\r\n\
+         \r\n",
+    );
+    client
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let (status, head, body) = read_response_with_headers(&mut client).await;
+    assert_eq!(status, 200, "{head}");
+    assert!(body.is_empty(), "a warm answers header-only: {head}");
+    assert_eq!(
+        header_value(&head, WARMED_HEADER),
+        Some(OBJECT_BYTES.len().to_string().as_str()),
+        "{head}"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        4,
+        "the probe plus one read per covering chunk, exactly like an ordinary GET"
+    );
+
+    let mut client = TcpStream::connect(daemon)
+        .await
+        .expect("connect to the daemon");
+    let request = format!(
+        "GET http://{upstream}{OBJECT_PATH} HTTP/1.1\r\n\
+         Host: {upstream}\r\n\
+         Authorization: {auth}\r\n\
+         Connection: close\r\n\
+         \r\n",
+    );
+    client
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let (status, body) = read_response(&mut client).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, OBJECT_BYTES);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        5,
+        "the probe, and nothing else: every chunk was warmed"
+    );
 }

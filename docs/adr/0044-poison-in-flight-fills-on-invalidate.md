@@ -4,7 +4,9 @@ Date: 2026-09-28 · Status: **Accepted.** Amends
 [0040](0040-one-backend-read-per-chunk-key.md)'s claim registry. Fixes
 [#22](https://github.com/aws-samples/sample-pacer/issues/22). No measurement: the defect is
 established from the code and pinned by a test that races an invalidation against a held
-backend read.
+backend read. **Amended by [0046](0046-fence-reads-that-claim-only-to-insert.md):** the
+guarantee under Consequences held only for the coalescing leader; paths that claim only to
+insert were unfenced until 0046.
 
 ## Context
 

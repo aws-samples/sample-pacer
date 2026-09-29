@@ -77,6 +77,13 @@ struct GatedFs {
     arrived: Arc<AtomicUsize>,
     /// Raised by the test to let the held read finish.
     release: Arc<Notify>,
+    /// Where the first ranged GET is held: before the backend read (`false`), so it
+    /// returns whatever the object is once released, or after it (`true`), so it
+    /// returns the bytes it read *before* the hold — a read genuinely in flight
+    /// with the pre-write object, which is what gh55's arm needs.
+    hold_after_read: bool,
+    /// Set once a `hold_after_read` GET has its bytes and is about to wait.
+    snapshotted: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -114,10 +121,41 @@ impl s3s::S3 for GatedFs {
         // straight through, which is what makes the no-coalescing arm able to observe its
         // own second read rather than deadlocking against this gate.
         let first = self.arrived.fetch_add(1, Ordering::SeqCst) == 0;
+        if first && self.hold_after_read {
+            return self.snapshot_then_hold(req).await;
+        }
         if first {
             self.release.notified().await;
         }
         self.inner.get_object(req).await
+    }
+}
+
+impl GatedFs {
+    /// Read the object now, buffer the whole body, and only then wait for the
+    /// test's release — so the response carries the bytes as they were when the
+    /// read ran, however the object changes during the hold. Buffered rather than
+    /// streamed because `s3s-fs` reads the file lazily, and a body read after the
+    /// overwrite would return the new bytes and hide the race.
+    async fn snapshot_then_hold(
+        &self,
+        req: S3Request<dto::GetObjectInput>,
+    ) -> S3Result<S3Response<dto::GetObjectOutput>> {
+        let mut resp = s3s::S3::get_object(&self.inner, req).await?;
+        if let Some(body) = resp.output.body.take() {
+            let bytes: Vec<Bytes> = futures::TryStreamExt::try_collect(body)
+                .await
+                .expect("the fixture's own body must read");
+            resp.output.body = Some(dto::StreamingBlob::from(s3s::Body::from(Bytes::from(
+                bytes.concat(),
+            ))));
+        }
+        self.snapshotted.store(1, Ordering::SeqCst);
+        // `notified()` + a test that releases with `notify_one`, which stores a
+        // permit if this has not started waiting yet — so no wake-up can be lost
+        // between the store above and the wait below.
+        self.release.notified().await;
+        Ok(resp)
     }
 }
 
@@ -128,9 +166,15 @@ struct Harness {
     metrics: Metrics,
     arrived: Arc<AtomicUsize>,
     release: Arc<Notify>,
+    snapshotted: Arc<AtomicUsize>,
 }
 
 impl Harness {
+    /// Whether the held GET of a `hold_after_read` harness has read its bytes.
+    fn snapshotted(&self) -> bool {
+        self.snapshotted.load(Ordering::SeqCst) == 1
+    }
+
     /// Ranged backend GETs so far — the count this whole file exists to assert on.
     fn ranged_gets(&self) -> usize {
         self.arrived.load(Ordering::SeqCst)
@@ -146,13 +190,22 @@ impl Harness {
 /// Assemble the daemon over a gated backend, with `fill_coalesce` deciding whether
 /// ADR-0040 is in the path at all.
 async fn harness(fill_coalesce: bool) -> Harness {
+    harness_with(fill_coalesce, false).await
+}
+
+/// [`harness`], choosing where the first ranged GET is held
+/// ([`GatedFs::hold_after_read`]).
+async fn harness_with(fill_coalesce: bool, hold_after_read: bool) -> Harness {
     let backend_dir = tempfile::tempdir().unwrap();
     let arrived = Arc::new(AtomicUsize::new(0));
     let release = Arc::new(Notify::new());
+    let snapshotted = Arc::new(AtomicUsize::new(0));
     let (service, creds) = backend_service(GatedFs {
         inner: s3s_fs::FileSystem::new(backend_dir.path()).unwrap(),
         arrived: Arc::clone(&arrived),
         release: Arc::clone(&release),
+        hold_after_read,
+        snapshotted: Arc::clone(&snapshotted),
     });
     let pair = BackendPair::over(&service, &creds);
     // Seeded before anything is gated: `create_bucket` is not a ranged GET, so it cannot
@@ -178,6 +231,7 @@ async fn harness(fill_coalesce: bool) -> Harness {
         metrics,
         arrived,
         release,
+        snapshotted,
     }
 }
 
@@ -388,9 +442,17 @@ async fn an_invalidation_mid_fill_fences_the_leader_and_its_follower() {
     )
     .await;
 
+    // Let the follower's fallback finish before the leader is released. Its read is
+    // not gated, and the order is what the counts below are about: while the
+    // poisoned leader still holds the key, the fallback's insert finds it claimed
+    // and skips. Released the other way round (gh55), the leader drops its claim
+    // first and the fallback — which read *after* the write — rightly inserts,
+    // which is correct but made this arm's `fills_completed == 0` a coin toss.
+    let b = follower.await.unwrap();
+
     // Only now let the leader's held read proceed.
     h.release.notify_waiters();
-    let (a, b) = (leader.await.unwrap(), follower.await.unwrap());
+    let a = leader.await.unwrap();
 
     // Both requesters are served in full: a fence poisons the CACHE ENTRY, never
     // a caller already waiting on bytes that are already in hand or freshly
@@ -423,4 +485,64 @@ async fn an_invalidation_mid_fill_fences_the_leader_and_its_follower() {
             .is_none(),
         "the tier must not hold the pre-write bytes a poisoned fill tried to insert"
     );
+}
+
+/// gh55: a read that holds no claim while it is in flight — here with coalescing
+/// off, where every miss goes through `fetch_from_backend` and claims only to
+/// insert; `FillClaim::Busy` and a follower's fallback take the same path — must
+/// not cache the bytes it read before an overwrite that landed during it.
+///
+/// Unlike the arm above, the held read here has **already read the pre-write
+/// object** when the write lands ([`GatedFs::hold_after_read`]), so the failure
+/// is not a count but what a client sees: before the fix the read inserted those
+/// bytes into a key nothing claimed, and the next GET was served them from cache.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_in_flight_across_an_overwrite_does_not_cache_the_old_bytes() {
+    let h = harness_with(false, true).await;
+    let body_v1 = fixture();
+    seed(&h, &body_v1).await;
+
+    let reader = tokio::spawn(get_whole(h.daemon.client.clone()));
+    poll_until(
+        "the reader's backend GET has read the pre-write object",
+        || async { h.snapshotted() },
+    )
+    .await;
+
+    let body_v2 = seeded_body(0xa5, OBJECT_SIZE);
+    h.daemon
+        .client
+        .put_object()
+        .bucket(BUCKET)
+        .key(KEY)
+        .body(ByteStream::from(body_v2.clone()))
+        .send()
+        .await
+        .expect("the overwrite must succeed");
+
+    h.release.notify_one();
+    assert_eq!(
+        reader.await.unwrap(),
+        body_v1,
+        "the reader's own response is the object as it was when its read ran"
+    );
+
+    assert_eq!(
+        get_whole(h.daemon.client.clone()).await,
+        body_v2,
+        "a GET after the overwrite must not be served the pre-write bytes from cache"
+    );
+    let chunk_key = ChunkConfig::new(CHUNK_SIZE).chunk_key(&object_key(BUCKET, KEY), 0);
+    if let Some(cached) = h
+        .daemon
+        .tier
+        .get_chunk(&chunk_key)
+        .await
+        .expect("the tier read must not itself fail")
+    {
+        assert_eq!(
+            cached.body, body_v2,
+            "whatever the tier holds for the key must be the post-write object"
+        );
+    }
 }

@@ -43,7 +43,15 @@ curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/$CARGO
   tar xz --strip-components=1 -C "$BIN_DIR" "$deny_archive/cargo-deny"
 
 echo "install-dev-tools: helm (${DESIRED_VERSION:-latest 4.x})"
-curl -sSfL "$HELM_INSTALLER" | HELM_INSTALL_DIR="$BIN_DIR" USE_SUDO=false bash
+# Downloaded to a file and then run, rather than piped straight into bash: a
+# connection that drops mid-transfer fails the `curl -f` above the pipe would
+# have hidden, instead of handing bash a truncated script. Behavior is
+# otherwise identical — still the upstream installer, still floating by design
+# (see HELM_INSTALLER above).
+helm_installer_script="$(mktemp)"
+curl -sSfL "$HELM_INSTALLER" -o "$helm_installer_script"
+HELM_INSTALL_DIR="$BIN_DIR" USE_SUDO=false bash "$helm_installer_script"
+rm -f "$helm_installer_script"
 
 cargo-deny --version
 helm version --short

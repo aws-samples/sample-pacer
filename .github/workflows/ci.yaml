@@ -60,7 +60,7 @@ jobs:
       code: ${{ steps.diff.outputs.code }}
       operator: ${{ steps.diff.outputs.operator }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
       - id: diff
@@ -99,7 +99,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # The one exception to the exact-release rule above, and it cannot be
       # fixed: dtolnay/rust-toolchain publishes on moving BRANCHES (`stable`),
       # not version tags, so there is no release for this SHA to name and
@@ -138,7 +138,7 @@ jobs:
       # render.rs runs the real pacer chart, rbac.rs the operator chart's RBAC. They are
       # #[ignore]d in a plain `cargo test` because they need helm, and they fail rather
       # than skip without it — so this step is where they are guaranteed to run.
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4  # v4.3.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
       - name: test (operator ↔ chart contract)
         run: cargo test -p pacer-operator --test render --test rbac -- --ignored
 
@@ -147,7 +147,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # Installs helm `latest` (the action's default). That is Helm 4 today, matching the
       # GitLab `helm` job's `alpine/helm:4`, but the action takes only `latest` or an exact
       # version — it has no way to say "4.x" — so this is the one helm surface that will
@@ -157,7 +157,7 @@ jobs:
       # Note the two unrelated fours: `# v4.3.1` is the version of the ACTION, which has
       # nothing to do with which Helm it installs. The action's own v5 exists and is not a
       # Helm-5 thing either.
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4  # v4.3.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
       - name: lint + template (pacer)
         run: |
           helm lint deploy/helm/pacer
@@ -194,10 +194,10 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
       - name: build image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           push: false
@@ -208,7 +208,7 @@ jobs:
       # `image (<leg>)`, which would leave the required check waiting forever. Its own
       # cache scope, so the two builds' layers do not overwrite each other's entries.
       - name: build operator image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: Dockerfile.operator
@@ -236,19 +236,19 @@ jobs:
       KIND_VERSION: v0.33.0
       KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
       # Same cache scopes the `image` job writes, read-only here: on a warm cache these two
       # builds are layer pulls, and this job never pushes its own layers over that job's.
       - name: build daemon image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           load: true
           tags: pacer:e2e
           cache-from: type=gha
       - name: build operator image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: Dockerfile.operator
@@ -262,7 +262,7 @@ jobs:
       # image's OWN helm and chart: the daemon image must be that version, or a released
       # operator would create rings on some other release's daemon.
       - name: build operator image as the release does
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: Dockerfile.operator
@@ -281,7 +281,7 @@ jobs:
                 sed -n 's/^ *image: "\(.*sample-pacer:.*\)"$/\1/p' | sort -u)
           echo "daemon image a ring would get: ${got:-<none>}"
           [ "$got" = "$want" ] || { echo "expected $want" >&2; exit 1; }
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4  # v4.3.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
       - name: install kind
         run: |
           curl --proto '=https' --tlsv1.2 -fsSLo /tmp/kind \

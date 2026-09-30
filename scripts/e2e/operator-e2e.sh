@@ -44,7 +44,10 @@
 #   E2E_DELETE_CRD=1      also delete the CacheRing CRD at teardown, if no ring is left
 #   KUBECTL, HELM         client binaries (default kubectl, helm); the caller pins the context
 
-set -euo pipefail
+set -Eeuo pipefail
+# `set -e` exits WITHOUT a message; this names the line and command that failed, so an
+# unexpected exit is never a silent one. -E carries the trap into functions.
+trap 'echo "  FAIL: line $LINENO: \`$BASH_COMMAND\` exited $?" >&2' ERR
 
 : "${E2E_NAMESPACE:?set E2E_NAMESPACE}"
 : "${E2E_OPERATOR_IMAGE:?set E2E_OPERATOR_IMAGE (repository:tag)}"
@@ -104,7 +107,10 @@ inventory() {
   ring_field '{range .status.inventory[*]}{.kind}/{.name}{"\n"}{end}'
 }
 
-inventory_name() { inventory | awk -F/ -v kind="$1" '$1 == kind { print $2; exit }'; }
+# Reads ALL of its input, deliberately: an awk that exits at the first match leaves the
+# writer to take SIGPIPE, and under pipefail that fails the pipeline — which killed a CI run
+# silently mid-step, since `set -e` exits without a message.
+inventory_name() { inventory | awk -F/ -v kind="$1" '$1 == kind && !found { print $2; found = 1 }'; }
 
 dump() {
   echo "---- diagnostics ----" >&2
@@ -216,7 +222,9 @@ step_refuse() {
       [[ "$(condition Rendered observedGeneration)" == "$(ring_field '{.metadata.generation}')" ]]
   }
   await "Rendered=False/ValuesRefused" "$TIMEOUT" refused
-  condition Rendered message | grep -q e2eNoSuchKey || fail "refusal message does not name the key: $(condition Rendered message)"
+  local message
+  message=$(condition Rendered message)
+  [[ "$message" == *e2eNoSuchKey* ]] || fail "refusal message does not name the key: $message"
   ok "message names the key"
   local ds ready_now
   ds=$(inventory_name DaemonSet)

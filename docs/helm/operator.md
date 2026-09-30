@@ -6,10 +6,16 @@ page is the how-to; the ADR is the why.
 ## Install
 
 ```bash
-helm install pacer-operator deploy/helm/pacer-operator \
-  --namespace pacer-system --create-namespace \
+helm install pacer-operator oci://ghcr.io/aws-samples/sample-pacer/charts/pacer-operator \
+  --version 0.1.0 --namespace pacer-system --create-namespace \
   --set watchNamespace=cache
 ```
+
+Each release publishes the operator chart and image with the same version as the `pacer`
+chart, and the operator renders rings with exactly that `pacer` chart, so a ring's
+daemons default to the daemon image of the same release. From a checkout, install
+`deploy/helm/pacer-operator` instead and point `image.repository`/`image.tag` at an
+image you built with `docker build -f Dockerfile.operator .`.
 
 `watchNamespace` also sets the scope of the operator's own RBAC: set, it gets a Role in
 that namespace only; empty, it watches every namespace through a ClusterRole. Prefer a

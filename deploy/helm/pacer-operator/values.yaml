@@ -2,8 +2,8 @@
 # deploy/helm/pacer/values.yaml.
 
 image:
-  # Default is the public multi-arch GHCR image built from Dockerfile.operator.
-  repository: ghcr.io/aws-samples/sample-pacer-operator
+  # Default is the multi-arch GHCR image the release workflow builds from Dockerfile.operator.
+  repository: ghcr.io/aws-samples/sample-pacer/operator
   # Empty → Chart.appVersion.
   tag: ""
   pullPolicy: IfNotPresent

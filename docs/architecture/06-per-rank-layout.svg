@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <marker id="aK" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#232F3E"/></marker>
+    <marker id="aG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3F8624"/></marker>
+    <marker id="aB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#147EBA"/></marker>
+    <marker id="aP" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="3" markerHeight="3" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#8C4FFF"/></marker>
+  </defs>
+  <rect width="1600" height="900" fill="#FFFFFF"/>
+  <g font-family="Arial, Helvetica, sans-serif" fill="#232F3E">
+
+    <text x="40" y="58" font-size="34" font-weight="bold">vLLM weights stored per GPU rank</text>
+    <text x="40" y="92" font-size="18" fill="#545B64">An optional second load format for tensor-parallel loads. The published-safetensors loader stays the default and needs no conversion.</text>
+
+    <!-- ===== Lane A: published safetensors ===== -->
+    <text x="40" y="145" font-size="20" font-weight="bold">A · Published safetensors: a rank's bytes are spread across the file</text>
+    <rect x="40" y="160" width="1520" height="270" rx="10" fill="none" stroke="#879196" stroke-width="1.5" stroke-dasharray="7 5"/>
+    <text x="58" y="184" font-size="14" font-weight="bold" fill="#545B64">One tensor in a shard, TP=8 · orange = the bytes rank 0 needs</text>
+
+    <!-- Tensor split on rows: rank 0 is one contiguous range -->
+    <rect x="80" y="200" width="240" height="160" fill="#CFE3F0" stroke="#147EBA" stroke-width="1.5"/>
+    <rect x="80" y="200" width="240" height="20" fill="#ED7100"/>
+    <g stroke="#147EBA" stroke-width="0.8">
+      <line x1="80" y1="220" x2="320" y2="220"/><line x1="80" y1="240" x2="320" y2="240"/>
+      <line x1="80" y1="260" x2="320" y2="260"/><line x1="80" y1="280" x2="320" y2="280"/>
+      <line x1="80" y1="300" x2="320" y2="300"/><line x1="80" y1="320" x2="320" y2="320"/>
+      <line x1="80" y1="340" x2="320" y2="340"/>
+    </g>
+    <text x="200" y="385" font-size="14" font-weight="bold" text-anchor="middle">Split on rows: one byte range</text>
+    <text x="200" y="405" font-size="13" text-anchor="middle" fill="#545B64">qkv, gate_up, embed, lm_head · 65.8 % of bytes</text>
+
+    <!-- Tensor split on columns: rank 0 is one sliver per row -->
+    <rect x="420" y="200" width="240" height="160" fill="#CFE3F0" stroke="#147EBA" stroke-width="1.5"/>
+    <rect x="420" y="200" width="30" height="160" fill="#ED7100"/>
+    <g stroke="#147EBA" stroke-width="0.8">
+      <line x1="450" y1="200" x2="450" y2="360"/><line x1="480" y1="200" x2="480" y2="360"/>
+      <line x1="510" y1="200" x2="510" y2="360"/><line x1="540" y1="200" x2="540" y2="360"/>
+      <line x1="570" y1="200" x2="570" y2="360"/><line x1="600" y1="200" x2="600" y2="360"/>
+      <line x1="630" y1="200" x2="630" y2="360"/>
+    </g>
+    <g stroke="#FFFFFF" stroke-width="1" stroke-dasharray="2 4">
+      <line x1="420" y1="220" x2="660" y2="220"/><line x1="420" y1="240" x2="660" y2="240"/>
+      <line x1="420" y1="260" x2="660" y2="260"/><line x1="420" y1="280" x2="660" y2="280"/>
+      <line x1="420" y1="300" x2="660" y2="300"/><line x1="420" y1="320" x2="660" y2="320"/>
+      <line x1="420" y1="340" x2="660" y2="340"/>
+    </g>
+    <text x="540" y="385" font-size="14" font-weight="bold" text-anchor="middle">Split on columns: a sliver per row</text>
+    <text x="540" y="405" font-size="13" text-anchor="middle" fill="#545B64">o_proj, down_proj · 34.2 % of bytes</text>
+
+    <!-- What that costs -->
+    <text x="740" y="222" font-size="16" font-weight="bold">What the default loader does about it</text>
+    <text x="740" y="256" font-size="15" fill="#545B64">A 16 MiB chunk of a column-split tensor holds bytes for all eight ranks, so fetching</text>
+    <text x="740" y="278" font-size="15" fill="#545B64">it once per rank would read it eight times.</text>
+    <text x="740" y="312" font-size="15" fill="#545B64">Instead each span of a shard is fetched by one rank, which then broadcasts it to the</text>
+    <text x="740" y="334" font-size="15" fill="#545B64">other seven, and every rank copies its own slice into place.</text>
+    <text x="740" y="368" font-size="15"><tspan font-weight="bold">The cost is waiting:</tspan><tspan dx="6" fill="#545B64">in the recorded 70B load at TP=8, about two thirds of each</tspan></text>
+    <text x="740" y="390" font-size="15" fill="#545B64">rank's time went to waiting on the other ranks, not to moving bytes.</text>
+
+    <!-- ===== Lane B: per-rank layout ===== -->
+    <text x="40" y="480" font-size="20" font-weight="bold">B · Per-rank layout: each rank's parameters are one object, written once per model and TP width</text>
+    <rect x="40" y="495" width="1520" height="310" rx="10" fill="none" stroke="#879196" stroke-width="1.5" stroke-dasharray="7 5"/>
+
+    <!-- Convert once -->
+    <rect x="70" y="525" width="300" height="140" rx="8" fill="#E6F2F8" stroke="#147EBA" stroke-width="1.5"/>
+    <text x="220" y="556" font-size="16" font-weight="bold" text-anchor="middle">Convert once</text>
+    <text x="220" y="582" font-size="13" text-anchor="middle" fill="#545B64">run vLLM's own load_weights one time</text>
+    <text x="220" y="602" font-size="13" text-anchor="middle" fill="#545B64">and record every weight_loader call:</text>
+    <text x="220" y="622" font-size="13" text-anchor="middle" fill="#545B64">parameter, offset, size</text>
+    <text x="220" y="648" font-size="13" text-anchor="middle" fill="#545B64">then write each rank's memory image</text>
+
+    <!-- S3 objects -->
+    <rect x="470" y="525" width="330" height="260" rx="10" fill="#EFF6E9" stroke="#3F8624" stroke-width="2"/>
+    <text x="635" y="556" font-size="19" font-weight="bold" text-anchor="middle" fill="#3F8624">Amazon S3</text>
+    <rect x="500" y="572" width="270" height="28" rx="4" fill="#FFFFFF" stroke="#ED7100" stroke-width="1.5"/>
+    <text x="635" y="591" font-size="13" text-anchor="middle">rank 0 · 16.427 GiB, one piece</text>
+    <rect x="500" y="606" width="270" height="28" rx="4" fill="#FFFFFF" stroke="#3F8624" stroke-width="1"/>
+    <text x="635" y="625" font-size="13" text-anchor="middle">rank 1</text>
+    <text x="635" y="652" font-size="15" text-anchor="middle" fill="#545B64">…</text>
+    <rect x="500" y="662" width="270" height="28" rx="4" fill="#FFFFFF" stroke="#3F8624" stroke-width="1"/>
+    <text x="635" y="681" font-size="13" text-anchor="middle">rank 7</text>
+    <rect x="500" y="702" width="270" height="68" rx="4" fill="#FFFFFF" stroke="#3F8624" stroke-width="1" stroke-dasharray="4 3"/>
+    <text x="635" y="722" font-size="13" font-weight="bold" text-anchor="middle">manifest</text>
+    <text x="635" y="741" font-size="12" text-anchor="middle" fill="#545B64">vLLM version, model revision, TP, PP,</text>
+    <text x="635" y="758" font-size="12" text-anchor="middle" fill="#545B64">dtype, quantization, chunk size, plan digest</text>
+
+    <line x1="370" y1="595" x2="468" y2="595" stroke="#3F8624" stroke-width="2" marker-end="url(#aG)"/>
+    <text x="419" y="585" font-size="13" font-weight="bold" text-anchor="middle" fill="#3F8624">write</text>
+
+    <!-- Daemon -->
+    <rect x="900" y="525" width="300" height="110" rx="8" fill="#FFF4E5" stroke="#ED7100" stroke-width="2"/>
+    <text x="1050" y="558" font-size="16" font-weight="bold" text-anchor="middle">pacer-daemon</text>
+    <text x="1050" y="584" font-size="13" text-anchor="middle" fill="#545B64">serves the ranged GETs from its cache</text>
+    <text x="1050" y="604" font-size="13" text-anchor="middle" fill="#545B64">or S3, chunk by chunk, in order</text>
+
+    <line x1="800" y1="580" x2="898" y2="580" stroke="#147EBA" stroke-width="2" marker-end="url(#aB)"/>
+    <text x="849" y="570" font-size="13" font-weight="bold" text-anchor="middle" fill="#147EBA">read</text>
+
+    <!-- Loader -->
+    <rect x="1250" y="525" width="280" height="150" rx="8" fill="#E6F2F8" stroke="#147EBA" stroke-width="1.5"/>
+    <text x="1390" y="556" font-size="16" font-weight="bold" text-anchor="middle">Loader, one per GPU rank</text>
+    <text x="1268" y="582" font-size="13" fill="#545B64">1 · check the manifest; any mismatch</text>
+    <text x="1286" y="600" font-size="13" fill="#545B64">refuses the load</text>
+    <text x="1268" y="620" font-size="13" fill="#545B64">2 · register one GPU memory block</text>
+    <text x="1268" y="640" font-size="13" fill="#545B64">3 · point each parameter at its offset</text>
+    <text x="1268" y="660" font-size="13" fill="#545B64">4 · GET its object in ranges</text>
+
+    <line x1="1250" y1="580" x2="1202" y2="580" stroke="#232F3E" stroke-width="2" marker-end="url(#aK)"/>
+    <text x="1226" y="570" font-size="13" font-weight="bold" text-anchor="middle">4</text>
+
+    <!-- GPU -->
+    <rect x="1250" y="695" width="280" height="90" rx="8" fill="#E9F5E1" stroke="#7AA116" stroke-width="2.5"/>
+    <text x="1390" y="728" font-size="16" font-weight="bold" text-anchor="middle">GPU memory (HBM)</text>
+    <text x="1390" y="752" font-size="13" text-anchor="middle" fill="#545B64">the block is the model's parameters</text>
+
+    <path d="M1050,635 L1050,737 L1242,737" stroke="#8C4FFF" stroke-width="10" fill="none" marker-end="url(#aP)"/>
+    <text x="1062" y="672" font-size="15" font-weight="bold" fill="#8C4FFF">5 · RDMA WRITE</text>
+    <text x="1062" y="692" font-size="13" fill="#8C4FFF">each chunk into the block</text>
+
+    <!-- Why it is faster -->
+    <text x="70" y="700" font-size="15" font-weight="bold">Each chunk belongs to one rank.</text>
+    <text x="70" y="722" font-size="14" fill="#545B64">It is read once and written once,</text>
+    <text x="70" y="742" font-size="14" fill="#545B64">in order. Ranks do not exchange</text>
+    <text x="70" y="762" font-size="14" fill="#545B64">bytes or wait for each other.</text>
+
+    <!-- Footer -->
+    <rect x="40" y="825" width="1520" height="60" rx="8" fill="#F7F9FA" stroke="#DDDDDD"/>
+    <text x="60" y="851" font-size="15"><tspan font-weight="bold">Measured once:</tspan><tspan dx="6" fill="#545B64">Llama-3.3-70B-Instruct (131.4 GiB) into 8 GPUs at TP=8 in about 6.3 s, output token-identical to the stock loader.</tspan></text>
+    <text x="60" y="873" font-size="15" fill="#545B64">A layout works only for the TP width it was written for. The converter and the loader for this layout are not published yet.</text>
+  </g>
+</svg>

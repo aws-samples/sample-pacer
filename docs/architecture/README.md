@@ -1,6 +1,6 @@
 # Architecture diagrams
 
-Five pictures of how PACER works, in reading order. Each one shows the default `node` auth
+Six pictures of how PACER works, in reading order. Each one shows the default `node` auth
 mode and the shipped chart defaults. A picture leaves things out. The notes under each one
 say what it simplifies and link to the ADR that has the full rule.
 
@@ -92,4 +92,24 @@ ordinary response.
   `delivery.remoteWrite: true` the holder writes it directly, the dashed arrow
   ([docs/helm/delivery.md](../helm/delivery.md)).
 - The 6.3 s figure is the README's measured result, and it depends on a checkpoint stored in
-  a per-rank layout. The exporter and loader for that layout are not published.
+  a per-rank layout ([section 6](#6-loading-vllm-weights-stored-per-gpu-rank)). The exporter
+  and loader for that layout are not published.
+
+## 6. Loading vLLM weights stored per GPU rank
+
+![Top: in a published safetensors checkpoint, a tensor split on rows gives each rank one byte range, but a tensor split on columns gives it a sliver of every row, so ranks share fetched spans and wait on each other. Bottom: a one-time conversion writes each rank's parameters as one object with a manifest; at load time each rank checks the manifest, registers one GPU block and the daemon RDMA-writes the object into it in order](06-per-rank-layout.svg)
+
+A tensor-parallel rank needs a slice of most tensors, and in a published checkpoint a third of
+those bytes are not contiguous. Storing each rank's parameters as one object, in the order the
+rank holds them in memory, turns the load into sequential writes into one GPU block.
+
+- The layout is recorded from vLLM's own `weight_loader` calls rather than recomputed, so it
+  matches whatever vLLM would have built, quantized weights included. The manifest pins the
+  vLLM version and the shape of the load, and any mismatch refuses the load instead of
+  falling back ([ADR-0037](../adr/0037-checkpoint-stored-in-rank-memory-layout.md)).
+- The cost is one converted copy per TP and PP width. The published-safetensors loader stays
+  the default because it needs no conversion.
+- The byte shares and the two-thirds waiting figure come from one recorded 70B load at TP=8
+  ([ADR-0037](../adr/0037-checkpoint-stored-in-rank-memory-layout.md)). The 6.3 s result is
+  in [docs/status.md](../status.md#performance). The converter and loader for this layout are
+  not published yet.

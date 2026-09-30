@@ -71,10 +71,11 @@ jobs:
           # Markdown into the image (the chart's templates cite docs/ as prose).
           DOC_PATHS: '^(docs/.*|.*\.md|LICENSE)$'
           # What the operator e2e exercises (ADR-0047): the operator, the chart it renders
-          # and installs, the two images the kind cluster runs, the e2e scripts and this
-          # workflow. A daemon-only change is not in here: the ring's daemons only have to
-          # boot and pass readiness, which the rust and image jobs already cover.
-          OPERATOR_PATHS: '^(crates/pacer-operator/.*|deploy/helm/pacer/.*|deploy/helm/pacer-operator/.*|Dockerfile|Dockerfile\.operator|Cargo\.lock|Cargo\.toml|scripts/e2e/.*|\.github/workflows/ci\.yaml)$'
+          # and installs, the two images the kind cluster runs, the e2e scripts, this
+          # workflow, and release.yaml (whose operator build this job reproduces). A
+          # daemon-only change is not in here: the ring's daemons only have to boot and
+          # pass readiness, which the rust and image jobs already cover.
+          OPERATOR_PATHS: '^(crates/pacer-operator/.*|deploy/helm/pacer/.*|deploy/helm/pacer-operator/.*|Dockerfile|Dockerfile\.operator|Cargo\.lock|Cargo\.toml|scripts/e2e/.*|\.github/workflows/(ci|release)\.yaml)$'
         run: |
           set -euo pipefail
           code=true
@@ -175,6 +176,18 @@ jobs:
             | grep -qx 'kind: ClusterRole'
           helm template pacer-operator deploy/helm/pacer-operator \
             --set watchNamespace=cache | grep -qx 'kind: Role'
+      - name: package both charts as the release does
+        # release.yaml's `chart` job: bare X.Y.Z version, full tag as appVersion. The
+        # operator chart's appVersion is the operator image tag its Deployment pulls, so
+        # check that, rendered from the packaged chart.
+        run: |
+          set -euo pipefail
+          for chart in pacer pacer-operator; do
+            helm package "deploy/helm/$chart" --destination /tmp/charts \
+              --version 0.0.0-ci --app-version v0.0.0-ci
+          done
+          helm template op /tmp/charts/pacer-operator-0.0.0-ci.tgz |
+            grep -qx '          image: "ghcr.io/aws-samples/sample-pacer/operator:v0.0.0-ci"'
 
   image:
     needs: changes
@@ -242,6 +255,32 @@ jobs:
           load: true
           tags: pacer-operator:e2e
           cache-from: type=gha,scope=operator
+      # The release stamps the pacer chart embedded in the operator image with its own
+      # version (release.yaml, CHART_VERSION/CHART_APP_VERSION), because that chart's
+      # appVersion is the daemon image tag every ring defaults to. Build it the way the
+      # release does, with a version no real release has, and render a ring with the
+      # image's OWN helm and chart: the daemon image must be that version, or a released
+      # operator would create rings on some other release's daemon.
+      - name: build operator image as the release does
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          file: Dockerfile.operator
+          load: true
+          tags: pacer-operator:release-stamp
+          build-args: |
+            CHART_VERSION=0.0.0-ci
+            CHART_APP_VERSION=v0.0.0-ci
+          cache-from: type=gha,scope=operator
+      - name: the embedded chart carries the release version
+        run: |
+          set -euo pipefail
+          want='ghcr.io/aws-samples/sample-pacer:v0.0.0-ci'
+          got=$(docker run --rm --entrypoint /usr/local/bin/helm pacer-operator:release-stamp \
+                  template ring /opt/pacer/chart |
+                sed -n 's/^ *image: "\(.*sample-pacer:.*\)"$/\1/p' | sort -u)
+          echo "daemon image a ring would get: ${got:-<none>}"
+          [ "$got" = "$want" ] || { echo "expected $want" >&2; exit 1; }
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4  # v4.3.1
       - name: install kind
         run: |

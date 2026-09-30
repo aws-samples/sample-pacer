@@ -38,6 +38,10 @@ Release images and charts are published to GHCR when a `vX.Y.Z` tag is pushed. S
 [Releases](https://github.com/aws-samples/sample-pacer/releases). If no release is listed
 yet, install from source.
 
+To declare rings as Kubernetes objects instead of one Helm release each, install the
+operator and create a `CacheRing` per ring; the ring's `spec.values` take the same values
+as above. See [helm/operator.md](helm/operator.md).
+
 Then, before sending traffic:
 
 1. Lock down access as described in [security.md](security.md).

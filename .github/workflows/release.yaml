@@ -1,7 +1,8 @@
 name: Release
 
-# Tag-driven release: pushing a `vX.Y.Z` tag publishes the multi-arch daemon
-# image and the OCI Helm chart to GHCR, then cuts a GitHub Release on the tag.
+# Tag-driven release: pushing a `vX.Y.Z` tag publishes the multi-arch daemon and
+# operator images and the two OCI Helm charts (`pacer`, `pacer-operator`) to GHCR, then
+# cuts a GitHub Release on the tag.
 # `:latest` is deliberately never touched — release tags are immutable, and
 # nothing here runs on branches.
 #
@@ -30,6 +31,9 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  # The CacheRing operator (ADR-0047): same repository namespace as the builder image and
+  # the charts, for the reason CHART_REPO gives below.
+  OPERATOR_IMAGE: ghcr.io/${{ github.repository }}/operator
   # Per-arch EFA build environment, pushed so the release Dockerfile can FROM
   # it (daemon-less builds cannot `load:` an image locally).
   BUILDER_IMAGE: ghcr.io/${{ github.repository }}/efa-builder
@@ -149,20 +153,51 @@ jobs:
             BUILDER_IMAGE=${{ env.BUILDER_IMAGE }}:${{ github.ref_name }}-${{ matrix.arch }}
           push: true
           tags: ${{ env.IMAGE }}:${{ github.ref_name }}-${{ matrix.arch }}
+      # The chart version is the bare X.Y.Z (SemVer, required by Helm) and appVersion the
+      # full tag, exactly as the `chart` job packages the published chart.
+      - name: chart version
+        id: chart
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      # The operator image (Dockerfile.operator, ADR-0047), natively per arch like the
+      # daemon's. The two build args stamp the pacer chart embedded in it with this
+      # release's version and appVersion: the chart's default daemon image tag IS its
+      # appVersion, so without them every ring this operator creates would pull the daemon
+      # tag the repository's Chart.yaml happened to carry rather than this release's.
+      - name: build + push operator arch image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          file: Dockerfile.operator
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            CHART_VERSION=${{ steps.chart.outputs.version }}
+            CHART_APP_VERSION=${{ github.ref_name }}
+          push: true
+          tags: ${{ env.OPERATOR_IMAGE }}:${{ github.ref_name }}-${{ matrix.arch }}
+          cache-from: ${{ vars.RELEASE_CACHE_S3_BUCKET
+            && format('type=s3,region={0},bucket={1},name=operator-{2}', vars.RELEASE_CACHE_S3_REGION, vars.RELEASE_CACHE_S3_BUCKET, matrix.arch)
+            || format('type=gha,scope=operator-{0}', matrix.arch) }}
+          cache-to: ${{ vars.RELEASE_CACHE_S3_BUCKET
+            && format('type=s3,region={0},bucket={1},name=operator-{2},mode=max,ignore-error=true',
+              vars.RELEASE_CACHE_S3_REGION, vars.RELEASE_CACHE_S3_BUCKET, matrix.arch)
+            || format('type=gha,mode=max,scope=operator-{0},ignore-error=true', matrix.arch) }}
 
   # Vulnerability gate BEFORE the manifest list is stitched (same severity and
   # fixed-only policy as the pre-publish gate this project has always run).
+  # Both images, both arches: the operator image is gated exactly like the daemon's, since
+  # it is what an adopter's cluster runs with RBAC over their namespaces.
   scan:
     needs: build
     strategy:
       matrix:
         arch: [amd64, arm64]
+        image: [daemon, operator]
     runs-on: ubuntu-24.04
     steps:
       - name: trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
-          image-ref: ghcr.io/${{ github.repository }}:${{ github.ref_name }}-${{ matrix.arch }}
+          image-ref: ${{ matrix.image == 'operator' && env.OPERATOR_IMAGE || env.IMAGE }}:${{ github.ref_name }}-${{ matrix.arch }}
           exit-code: "1"
           severity: CRITICAL,HIGH
           ignore-unfixed: true
@@ -187,10 +222,12 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: stitch multi-arch manifest
         run: |
-          docker buildx imagetools create \
-            --tag "$IMAGE:$GITHUB_REF_NAME" \
-            "$IMAGE:$GITHUB_REF_NAME-amd64" \
-            "$IMAGE:$GITHUB_REF_NAME-arm64"
+          for image in "$IMAGE" "$OPERATOR_IMAGE"; do
+            docker buildx imagetools create \
+              --tag "$image:$GITHUB_REF_NAME" \
+              "$image:$GITHUB_REF_NAME-amd64" \
+              "$image:$GITHUB_REF_NAME-arm64"
+          done
 
   chart:
     needs: manifest
@@ -207,9 +244,13 @@ jobs:
           # reference (`.Values.image.tag | default .Chart.AppVersion`) is
           # exactly the multi-arch tag this release just pushed.
           VERSION="${GITHUB_REF_NAME#v}"
-          helm package deploy/helm/pacer \
-            --version "$VERSION" --app-version "$GITHUB_REF_NAME"
-          helm push "pacer-$VERSION.tgz" "$CHART_REPO"
+          # Both charts, one version: the operator chart's appVersion is likewise the
+          # operator image tag its Deployment pulls.
+          for chart in pacer pacer-operator; do
+            helm package "deploy/helm/$chart" \
+              --version "$VERSION" --app-version "$GITHUB_REF_NAME"
+            helm push "$chart-$VERSION.tgz" "$CHART_REPO"
+          done
 
   # Pushing the tag never creates a GitHub Release on its own — that is a
   # separate object, and every job above only reaches GHCR. Gated on `chart`
@@ -234,7 +275,13 @@ jobs:
             echo '```'
             echo "docker pull $IMAGE:$GITHUB_REF_NAME"
             echo "helm pull $CHART_REPO/pacer --version ${GITHUB_REF_NAME#v}"
+            echo "docker pull $OPERATOR_IMAGE:$GITHUB_REF_NAME"
+            echo "helm pull $CHART_REPO/pacer-operator --version ${GITHUB_REF_NAME#v}"
             echo '```'
+            echo
+            echo "The operator image renders rings with the \`pacer\` chart ${GITHUB_REF_NAME#v}, so a"
+            echo "ring it creates runs daemon image \`$IMAGE:$GITHUB_REF_NAME\` unless its values say"
+            echo "otherwise."
             echo
             gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
               -f tag_name="$GITHUB_REF_NAME" --jq .body

@@ -37,6 +37,24 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --release -p pacer-operator
 
+# The pacer chart the operator renders rings with: the chart itself and nothing else in
+# its directory (no example or site overlays, no helm-unittest suites), packaged with the
+# RELEASE's version and appVersion. That stamp is not cosmetic: the chart's default daemon
+# image tag is `.Chart.AppVersion`, so an operator image carrying the in-repo chart would
+# create rings that pull whatever daemon tag the repo happened to say, not the one released
+# with it. Empty build args keep the in-repo values (local and CI builds). After the cargo
+# build, so a chart edit does not recompile the operator.
+ARG CHART_VERSION=""
+ARG CHART_APP_VERSION=""
+COPY deploy/helm/pacer/Chart.yaml deploy/helm/pacer/values.yaml \
+     deploy/helm/pacer/values.schema.json /stage/pacer/
+COPY deploy/helm/pacer/templates /stage/pacer/templates
+RUN helm package /stage/pacer --destination /stage/pkg \
+        ${CHART_VERSION:+--version "$CHART_VERSION"} \
+        ${CHART_APP_VERSION:+--app-version "$CHART_APP_VERSION"} \
+ && mkdir -p /opt/pacer \
+ && tar -xzf /stage/pkg/pacer-*.tgz -C /opt/pacer
+
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260914.0-minimal
 # checkov:skip=CKV_DOCKER_2:Health is checked by Kubernetes, not by Docker; the
 # operator chart's Deployment is the only thing that runs this image.
@@ -44,11 +62,7 @@ RUN echo 'pacer:x:65532:65532:pacer:/nonexistent:/sbin/nologin' >> /etc/passwd \
  && echo 'pacer:x:65532:' >> /etc/group
 COPY --from=builder /usr/local/bin/helm /usr/local/bin/helm
 COPY --from=builder /src/target/release/pacer-operator /usr/local/bin/pacer-operator
-# The chart itself and nothing else in its directory: no example or site overlays, no
-# helm-unittest suites. What renders a ring is exactly these four paths.
-COPY deploy/helm/pacer/Chart.yaml deploy/helm/pacer/values.yaml \
-     deploy/helm/pacer/values.schema.json /opt/pacer/chart/
-COPY deploy/helm/pacer/templates /opt/pacer/chart/templates
+COPY --from=builder /opt/pacer/pacer /opt/pacer/chart
 # `helm template` of a local chart resolves these three directories but writes nothing
 # to them — checked with all three unwritable, the render succeeds — which is why the
 # operator chart can run this image with a read-only root and no writable volume. Set

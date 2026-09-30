@@ -26,7 +26,7 @@
 #
 # Usage:
 #   E2E_NAMESPACE=cache \
-#   E2E_OPERATOR_IMAGE=ghcr.io/aws-samples/sample-pacer-operator:v0.1.0 \
+#   E2E_OPERATOR_IMAGE=ghcr.io/aws-samples/sample-pacer/operator:v0.1.0 \
 #   E2E_RING_VALUES=ring-values.yaml \
 #   E2E_EXPECT_MEMBERS=2 \
 #     scripts/e2e/operator-e2e.sh

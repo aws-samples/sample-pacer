@@ -9,7 +9,7 @@
 # Deliberately NO `--features efa` here: this is the plain local build (no EFA
 # hardware on a dev box). The shipping EFA image is built by CI from
 # Dockerfile.runtime + ci/Dockerfile.efa-builder (planning/11 item #4).
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260928.0 AS builder
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260930.0 AS builder
 RUN dnf install -y --allowerasing gcc gcc-c++ curl ca-certificates
 ARG RUST_VERSION=1.96.0
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -20,7 +20,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --release -p pacer-daemon
 
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260928.0-minimal
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260930.0-minimal
 # checkov:skip=CKV_DOCKER_2:Health is checked by Kubernetes, not by Docker. This
 # image only ever runs as the DaemonSet's container, where the chart's
 # livenessProbe/readinessProbe hit /healthz and /readyz — and a container runtime

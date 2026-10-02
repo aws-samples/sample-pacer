@@ -21,6 +21,7 @@
 //!   (ADR-0026/ADR-0030).
 //! * `place` — one window's bytes into that memory, by copy or one-sided WRITE
 //!   (ADR-0026 point 4, ADR-0018, ADR-0030).
+//! * `warm` — the warm-only GET: every covering chunk resolved, no body (ADR-0048).
 //!
 //! Everything a *passthrough* op does is here in full, because there is nothing to
 //! it: count the op, resolve the bucket alias (ADR-0002), forward to `inner`.
@@ -45,6 +46,7 @@ mod fill;
 mod place;
 mod read;
 mod target;
+mod warm;
 mod write;
 
 pub use cluster::Cluster;

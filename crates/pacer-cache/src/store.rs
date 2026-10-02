@@ -836,6 +836,7 @@ impl ChunkStore {
             key: key.to_string(),
             body_len: body_len as u32,
             body_crc: slot::body_crc(&chunk.body),
+            e_tag: chunk.e_tag.clone(),
         };
         let Some(slot) = self.claim(&key, &header) else {
             StoreStats::inc(&self.inner.stats.write_dedups);
@@ -1165,7 +1166,10 @@ impl Inner {
             tracing::error!(key, slot, "chunk body failed its CRC — refusing to serve");
             return None;
         }
-        Some(CachedChunk::new(body))
+        Some(CachedChunk {
+            body,
+            e_tag: header.e_tag.clone(),
+        })
     }
 
     /// Write the header page and the body. One `pwrite` each; the header goes **last** so
@@ -1506,6 +1510,10 @@ mod tests {
         CachedChunk::new(Bytes::from(vec![byte; len]))
     }
 
+    fn versioned_chunk_of(byte: u8, len: usize, e_tag: &str) -> CachedChunk {
+        CachedChunk::versioned(Bytes::from(vec![byte; len]), e_tag.to_owned())
+    }
+
     /// Gate 33.1, base case: what goes in comes out, at both a full and a short body.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_written_chunk_reads_back_byte_exact() {
@@ -1527,6 +1535,23 @@ mod tests {
         assert!(short.body.iter().all(|&b| b == 0xcd));
         assert_eq!(store.len(), 2);
         assert_eq!(store.stats().hits.load(Ordering::Relaxed), 2);
+    }
+
+    /// gh64: a witness set on write must come back on the very next read, with no
+    /// restart involved — this used to fail even mid-process, because `verified`
+    /// rebuilt every hit as `CachedChunk::new(body)` regardless of what `put` was
+    /// given, which made `requester` mode's witness check (`witness_matches`) treat
+    /// every store-tier hit as a mismatch and never actually serve one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_written_chunk_reads_back_its_etag_witness() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_of(4, dir.path()).await;
+        store
+            .put("b/k#100:0", &versioned_chunk_of(1, 16, "\"live-etag-4\""))
+            .await
+            .unwrap();
+        let got = store.get("b/k#100:0").await.unwrap().unwrap();
+        assert_eq!(got.e_tag.as_deref(), Some("\"live-etag-4\""));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1660,6 +1685,35 @@ mod tests {
         let b = reopened.get("b/k#100:1").await.unwrap().unwrap();
         assert_eq!(b.body.len(), 99);
         assert!(b.body.iter().all(|&b| b == 8));
+    }
+
+    /// gh64: the ETag witness is part of the header the scan recovers, not just the
+    /// body — a restart must hand a caller the same witness it cached before, so a
+    /// caller that compares it against a freshly probed ETag can tell a chunk that
+    /// survived the restart unchanged from one whose object was overwritten while this
+    /// node was down. Before the v3 format this test would see the witness reopen as
+    /// `None` regardless of what was written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reopened_store_recovers_the_etag_witness() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = store_of(8, dir.path()).await;
+            store
+                .put(
+                    "b/k#100:0",
+                    &versioned_chunk_of(7, 4096, "\"etag-before-restart-4\""),
+                )
+                .await
+                .unwrap();
+            // A chunk cached with no witness must reopen the same way: `None`, not an
+            // empty string a careless read might treat as "matches everything".
+            store.put("b/k#100:1", &chunk_of(8, 99)).await.unwrap();
+        }
+        let reopened = store_of(8, dir.path()).await;
+        let a = reopened.get("b/k#100:0").await.unwrap().unwrap();
+        assert_eq!(a.e_tag.as_deref(), Some("\"etag-before-restart-4\""));
+        let b = reopened.get("b/k#100:1").await.unwrap().unwrap();
+        assert_eq!(b.e_tag, None);
     }
 
     /// Re-filling a held key must not consume a second slot — chunks are immutable, so a

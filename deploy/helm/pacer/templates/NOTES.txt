@@ -1,4 +1,11 @@
 PACER {{ .Chart.AppVersion }} installed as {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+{{- if include "pacer.scatterEnabled" . }}
+
+Write scatter is ON (ADR-0032): a PUT of a new key becomes a multipart upload the
+coordinating node creates directly on the bucket. If that node dies before it can abort
+one, the client never saw an upload ID to clean it up with. Give the bucket an
+AbortIncompleteMultipartUpload lifecycle rule — see docs/helm/write-scatter.md.
+{{- end }}
 {{- if include "pacer.requesterMode" . }}
 
 auth.mode=requester (ADR-0041): S3 authorizes each caller's OWN signature. Configure the

@@ -1,0 +1,27 @@
+# NOTES.txt's write-scatter lifecycle-rule notice (ADR-0032): a coordinator that dies
+# mid-upload leaves a multipart upload the client never saw an ID for, so the operator's
+# only way to learn the bucket needs an AbortIncompleteMultipartUpload rule is to be told —
+# nothing fails loudly without it, the cost just accrues silently.
+suite: write scatter NOTES.txt notice (ADR-0032)
+templates:
+  - NOTES.txt
+tests:
+  - it: "a Standard backend's default-on scatter prints the lifecycle-rule notice"
+    set: { config.backendType: standard }
+    asserts:
+      - matchRegexRaw:
+          pattern: "AbortIncompleteMultipartUpload"
+        template: NOTES.txt
+
+  - it: "Express leaves the scatter off by default and prints no notice"
+    asserts:
+      - notMatchRegexRaw:
+          pattern: "AbortIncompleteMultipartUpload"
+        template: NOTES.txt
+
+  - it: "an explicit scatter.enabled=false on Standard silences the notice"
+    set: { config.backendType: standard, scatter.enabled: false }
+    asserts:
+      - notMatchRegexRaw:
+          pattern: "AbortIncompleteMultipartUpload"
+        template: NOTES.txt

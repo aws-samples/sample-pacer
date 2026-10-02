@@ -10,8 +10,14 @@
 /// specifically because those are inherent methods — clippy exempts the trait
 /// impls that make up the server. Needed from clippy 1.98 (the public mirror's
 /// CI tracks stable; the internal pipeline pins 1.96, where it does not fire yet).
+///
+/// `double_must_use` fires inside `#[async_trait]`'s expansion of the generated
+/// server traits: the macro marks each method `#[must_use]` and returns a boxed
+/// `Future`, which is already `#[must_use]`. Neither attribute is ours to drop.
+/// Needed from clippy 1.99.
 #[allow(
     missing_docs,
+    clippy::double_must_use,
     clippy::excessive_nesting,
     clippy::missing_errors_doc,
     clippy::result_large_err,

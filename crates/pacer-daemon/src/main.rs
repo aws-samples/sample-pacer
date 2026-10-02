@@ -73,6 +73,13 @@ fn main() -> anyhow::Result<()> {
     // would otherwise be dropped on the floor (see `config::log_format`).
     init_logging(config::log_format());
 
+    // `pacer-daemon warm …` (ADR-0048) is a client of a daemon, not a daemon: it loads no
+    // daemon config and opens no listener, so it leaves before any of that runs.
+    let mut args = std::env::args().skip(1).peekable();
+    if args.peek().map(String::as_str) == Some(pacer_daemon::warm::command::SUBCOMMAND) {
+        return pacer_daemon::warm::command::main(args.skip(1));
+    }
+
     let cfg = config::Config::load()?;
     // Named fields, never `?cfg`. `Config` holds the ADR-0006 placeholder
     // credentials (`placeholder_access_key` / `placeholder_secret_key`), so a

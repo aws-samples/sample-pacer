@@ -142,17 +142,30 @@ pub(super) struct FillCtx {
     /// re-emits the caller's held signature instead of using
     /// [`Self::backend`].
     pub(super) requester: Option<RequesterRead>,
+    /// A warm-only GET (ADR-0048): resolve every chunk, but never admit a
+    /// requester-local copy of a peer's chunk.
+    ///
+    /// A warm reads each chunk once, so it could only ever trip layer 1's admission
+    /// by accident — and it would: a re-run warm, or the workload's first read inside
+    /// the admission window, is the second fetch that admits. The copy would then sit
+    /// on whichever node ran the warm, which is the one node the warm was not for.
+    /// Skipping the admission also keeps the warm out of the window's count, so the
+    /// workload's own reads decide what is hot here.
+    pub(super) warm: bool,
 }
 
 impl PacerProxy {
-    /// Everything one GET's chunk resolutions share, ready to be handed to each
-    /// in-flight resolution as a refcount.
+    /// Everything one GET's chunk resolutions share, ready to be wrapped in an `Arc`
+    /// and handed to each in-flight resolution as a refcount.
     ///
     /// Assembled here rather than at the read path's call site because every field
     /// but two is a copy of a proxy field, and those two — `admit` and `no_fill` —
     /// are this read's [`ReadDecision`] restated. Deriving them in one place is what
     /// keeps "a `no-store` read populates nothing" (ADR-0012) from being a claim two
     /// call sites have to agree on.
+    ///
+    /// `warm` comes back `false`; the warm path sets it with struct-update syntax
+    /// rather than as an eighth argument here.
     pub(super) fn fill_ctx(
         &self,
         object_key: String,
@@ -161,8 +174,8 @@ impl PacerProxy {
         object_len: u64,
         decision: ReadDecision,
         requester: Option<RequesterRead>,
-    ) -> Arc<FillCtx> {
-        Arc::new(FillCtx {
+    ) -> FillCtx {
+        FillCtx {
             tier: self.tier.clone(),
             backend: self.backend.clone(),
             chunk: self.chunk,
@@ -181,7 +194,8 @@ impl PacerProxy {
             #[cfg(feature = "efa")]
             remote_write: self.delivery.remote_write,
             requester,
-        })
+            warm: false,
+        }
     }
 }
 
@@ -765,7 +779,14 @@ impl FillCtx {
         // only once the bytes are here.
         let read = self.filling.begin_read(&chunk_key);
         if let Some(bytes) = self.fetch_from_peer(&chunk_key).await {
-            self.maybe_admit_local(&chunk_key, &bytes, read).await;
+            // ADR-0048: a warm must not leave a copy on the node that ran it, so it drops
+            // the ticket rather than admitting — the same release `maybe_admit_local` would
+            // give it, just with no insert behind it.
+            if self.warm {
+                drop(read);
+            } else {
+                self.maybe_admit_local(&chunk_key, &bytes, read).await;
+            }
             return Ok(bytes);
         }
         drop(read);

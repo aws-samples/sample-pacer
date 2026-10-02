@@ -34,7 +34,7 @@ use pacer_cache::{
     object_key, read_decision, resolve_range, should_admit, CacheValue, ReadDecision,
 };
 use s3s::dto::{self, ETag, Range as HttpRange, StreamingBlob, Timestamp};
-use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
+use s3s::{s3_error, S3Request, S3Response, S3Result};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
@@ -42,6 +42,11 @@ use tracing::warn;
 use super::cluster::is_home;
 use super::fill::{FillCtx, RequesterRead};
 use super::PacerProxy;
+use crate::warm::SkipReason;
+
+/// `ops_total` label for a warm-only GET (ADR-0048), which is counted apart from
+/// `get_object` because it is not a read.
+const OP_WARM: &str = "warm_object";
 
 /// Resolve the object header (length + response metadata) needed to compute
 /// the covering chunk set. A cache hit returns the stored header; a miss
@@ -441,7 +446,10 @@ impl PacerProxy {
                 .answer_endpoints(&req.input.bucket, &req.input.key, &raw)
                 .await;
         }
-        self.count("get_object");
+        // ADR-0048: a warm is the read path to its last step, then no body. Counted apart
+        // from `get_object` for the pre-flight's reason — a warm is not a read.
+        let warm = Self::requested_warm(&req.headers)?;
+        self.count(if warm { OP_WARM } else { "get_object" });
         let cache_control = req
             .headers
             .get(hyper::header::CACHE_CONTROL)
@@ -449,7 +457,10 @@ impl PacerProxy {
         let decision = read_decision(cache_control, req.input.part_number);
         if decision == ReadDecision::Bypass || !Self::cacheable_shape(&req.input) {
             self.metrics.cache_bypass.inc();
-            return self.inner.get_object(req).await;
+            return self.bypass_get(req, warm, SkipReason::Uncacheable).await;
+        }
+        if warm && decision == ReadDecision::CacheNoFill {
+            return Ok(self.warm_skipped(SkipReason::NoStore));
         }
 
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
@@ -466,11 +477,11 @@ impl PacerProxy {
         //     bypass because that is what it is.
         if !self.conditional_get_from_cache && req.input.if_match.is_some() {
             self.metrics.cache_bypass.inc();
-            return self.inner.get_object(req).await;
+            return self.bypass_get(req, warm, SkipReason::Uncacheable).await;
         }
         if !if_match_allows_cache(req.input.if_match.as_ref(), header.e_tag.as_deref()) {
             self.metrics.cache_bypass.inc();
-            return self.inner.get_object(req).await;
+            return self.bypass_get(req, warm, SkipReason::Uncacheable).await;
         }
         if req.input.if_match.is_some() {
             // The number that proves the ADR-0039 composition actually engaged. Without it a
@@ -493,7 +504,7 @@ impl PacerProxy {
         // cached (see below), so no chunked footprint is left behind.
         if !size_admitted {
             self.metrics.cache_bypass.inc();
-            return self.inner.get_object(req).await;
+            return self.bypass_get(req, warm, SkipReason::ObjectSize).await;
         }
         let admit = decision == ReadDecision::CacheAndFill;
         self.remember_header(&object_key, &header, header_cached, admit);
@@ -514,6 +525,10 @@ impl PacerProxy {
         // 4. Serve the covering chunks in order through the bounded look-ahead
         //    pipeline, filling misses per chunk.
         let ctx = self.fill_ctx(object_key, bucket, key, header.object_len, decision, None);
+        if warm {
+            return self.warm_range(ctx, &header, start, end).await;
+        }
+        let ctx = Arc::new(ctx);
 
         // 5. ADR-0026: a client that named memory it owns gets the bytes
         //    delivered into it and a header-only 200. Everything below this
@@ -567,7 +582,11 @@ impl PacerProxy {
                 "requester mode does not serve the delivery pre-flight"
             ));
         }
-        self.count("get_object");
+        // ADR-0048: allowed here, unlike the pre-flight, because a warm is authorized
+        // exactly like the read it stands for — by the probe below, on the caller's own
+        // signature — and it answers nothing a read would not.
+        let warm = Self::requested_warm(&req.headers)?;
+        self.count(if warm { OP_WARM } else { "get_object" });
         let held = req
             .extensions
             .get::<Arc<crate::authz::HeldRequest>>()
@@ -584,12 +603,20 @@ impl PacerProxy {
             .and_then(|v| v.to_str().ok());
         let decision = read_decision(cache_control, req.input.part_number);
         if decision == ReadDecision::Bypass || !Self::cacheable_shape(&req.input) {
-            return self.pass_through(&held, forwarder).await;
+            return self
+                .pass_through_or_skip(&held, forwarder, warm, SkipReason::Uncacheable)
+                .await;
+        }
+        if warm && decision == ReadDecision::CacheNoFill {
+            return Ok(self.warm_skipped(SkipReason::NoStore));
         }
 
         let header = self.probe_header(&held, forwarder).await?;
         if !self.requester_may_cache(&req, &header) {
-            return self.pass_through(&held, forwarder).await;
+            let reason = self.requester_skip_reason(&header);
+            return self
+                .pass_through_or_skip(&held, forwarder, warm, reason)
+                .await;
         }
 
         let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
@@ -619,6 +646,10 @@ impl PacerProxy {
                 e_tag: header.e_tag.clone(),
             }),
         );
+        if warm {
+            return self.warm_range(ctx, &header, start, end).await;
+        }
+        let ctx = Arc::new(ctx);
         // No ADR-0026 delivery into client memory in this mode, yet: its placement
         // path reads the tier directly and would bypass the version-witness check
         // `FillCtx::resolve_chunk` applies. A client that names a target simply gets
@@ -708,7 +739,7 @@ impl PacerProxy {
     ///
     /// S3's own error for a non-2xx answer, with its status and code; `InternalError`
     /// when S3 could not be reached at all.
-    async fn pass_through(
+    pub(super) async fn pass_through(
         &self,
         held: &crate::authz::HeldRequest,
         forwarder: &crate::authz::Forwarder,

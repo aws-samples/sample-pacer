@@ -394,6 +394,75 @@ async fn hot_chunk_admits_locally_on_second_fetch() {
     wait_announced(&owner_node, &chunk_key, &other_name).await;
 }
 
+/// ADR-0048's warm skips layer-1 admission: two warms through a non-owner cross the same
+/// threshold [`hot_chunk_admits_locally_on_second_fetch`] does with ordinary reads, but a
+/// warm reads *for* the workload's nodes, not *as* one, so it must not leave a copy behind
+/// on the node that happened to run it.
+#[tokio::test]
+async fn a_warm_through_a_non_owner_admits_no_local_copy() {
+    let h = cluster().await;
+    let body = big_body(11, (MIN_OBJECT_SIZE + 1024) as usize);
+    let key = "peer/warmed.bin";
+    h.backend
+        .put_object()
+        .bucket(BUCKET)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await
+        .unwrap();
+    let chunk_key = chunk0_key(&format!("{BUCKET}/{key}"));
+    let (owner, other) = h.owner_and_other(&chunk_key);
+
+    for _ in 0..2 {
+        h.nodes[other]
+            .client
+            .get_object()
+            .bucket(BUCKET)
+            .key(key)
+            .customize()
+            .mutate_request(|r| {
+                r.headers_mut().insert(pacer_daemon::warm::WARM_HEADER, "1");
+            })
+            .send()
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        h.nodes[other].metrics.local_admits.get(),
+        0,
+        "a warm must not leave a copy on the node that ran it"
+    );
+    assert_eq!(h.nodes[other].metrics.peer_fetches.get(), 2);
+    assert_eq!(
+        h.nodes[owner]
+            .metrics
+            .warm
+            .requests
+            .with_label_values(&["warmed"])
+            .get(),
+        0,
+        "the owner served these as ordinary peer reads, not warms of its own"
+    );
+    wait_for_fill(&h.nodes[owner].metrics, 0).await;
+    let owner_hits_before = h.nodes[owner].metrics.cache_hits.get();
+
+    // A workload's own read through the OWNER now hits what the warm placed there.
+    let got = h.nodes[owner]
+        .client
+        .get_object()
+        .bucket(BUCKET)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(&got.body.collect().await.unwrap().into_bytes(), &body);
+    assert_eq!(
+        h.nodes[owner].metrics.cache_hits.get(),
+        owner_hits_before + 1
+    );
+}
+
 /// Top-R co-homes (ADR-0016 layer 2): with R=2 on a 3-node cluster, BOTH of a
 /// chunk's two homes fill it on read-through and hold a cluster-wide copy,
 /// while a non-home requester fetches from a home and stores nothing. This is

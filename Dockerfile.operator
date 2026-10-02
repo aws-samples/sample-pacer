@@ -7,7 +7,7 @@
 # Same AL2023 build → AL2023-minimal runtime as ./Dockerfile, for the same glibc reason.
 # BUMP THE TWO BASE PINS IN LOCKSTEP with ./Dockerfile, Dockerfile.runtime,
 # ci/Dockerfile.release and ci/Dockerfile.efa-builder.
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260914.0 AS builder
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260928.0 AS builder
 RUN dnf install -y --allowerasing gcc gcc-c++ curl ca-certificates tar gzip
 ARG RUST_VERSION=1.96.0
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -55,7 +55,7 @@ RUN helm package /stage/pacer --destination /stage/pkg \
  && mkdir -p /opt/pacer \
  && tar -xzf /stage/pkg/pacer-*.tgz -C /opt/pacer
 
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260914.0-minimal
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260928.0-minimal
 # checkov:skip=CKV_DOCKER_2:Health is checked by Kubernetes, not by Docker; the
 # operator chart's Deployment is the only thing that runs this image.
 RUN echo 'pacer:x:65532:65532:pacer:/nonexistent:/sbin/nologin' >> /etc/passwd \

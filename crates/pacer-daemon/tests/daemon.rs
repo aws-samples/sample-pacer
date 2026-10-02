@@ -87,5 +87,7 @@ mod get_bypass;
 mod listener;
 #[path = "daemon/scatter/mod.rs"]
 mod scatter;
+#[path = "daemon/warm.rs"]
+mod warm;
 #[path = "daemon/write_framing.rs"]
 mod write_framing;

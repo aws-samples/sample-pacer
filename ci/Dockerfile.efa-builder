@@ -31,9 +31,10 @@
 # binary linking native C libs, shipped as a container image).
 #
 # Pinned to an IMMUTABLE dated release, not the floating `:2023` tag, which AL
-# updates in place (unreproducible builds). BUMP THIS IN LOCKSTEP with the
-# runtime pin in Dockerfile.runtime / ci/Dockerfile.release: the binary must be
-# linked against the same glibc it runs on. At this pin builder and -minimal both
+# updates in place (unreproducible builds). BUMP THIS IN LOCKSTEP with every other
+# AL2023 pin — Dockerfile (both stages), Dockerfile.runtime, Dockerfile.operator
+# (both stages), ci/Dockerfile.release: the binary must be linked against the same
+# glibc it runs on. `git grep <old-tag>` must come back empty after a bump. At this pin builder and -minimal both
 # carry glibc 2.34-231.amzn2023.0.5 on amd64 and arm64 — and so did the pin
 # before it, so this bump moves no ABI.
 #
@@ -45,7 +46,7 @@
 # over the four images this set pins — (bare, -minimal) x (amd64, arm64) — and
 # the same output answers the question a bump is usually FOR, since an empty
 # HIGH/CRITICAL list under `--ignore-unfixed` is exactly the `scan-image` gate.
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260914.0
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260928.0
 # checkov:skip=CKV_DOCKER_2:A builder image is never run as a service — it is the
 # `FROM` of a build stage and its containers exist only for the length of a
 # `cargo build`. There is nothing for a HEALTHCHECK to report to.

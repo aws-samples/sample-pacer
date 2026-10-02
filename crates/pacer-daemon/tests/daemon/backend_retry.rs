@@ -74,6 +74,9 @@ impl Faults {
     /// Claim one fault, if any are left. `fetch_update` rather than a
     /// `load`/`store` pair: `FILL_PARALLELISM` chunk reads race here, and two of
     /// them must not spend the same unit of budget.
+    // Rust 1.99 deprecates `fetch_update` for `try_update`, which the pinned
+    // 1.96 toolchains do not have. Rename it once those pins reach 1.99.
+    #[allow(deprecated)]
     fn take(&self) -> bool {
         let claimed = self
             .budget

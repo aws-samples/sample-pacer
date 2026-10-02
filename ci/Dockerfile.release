@@ -39,7 +39,7 @@ RUN ci/stage-efa-libs.sh target/release/pacer-daemon /efa-rootfs
 # exists (confirmed), and BUILDER_IMAGE (built from ci/Dockerfile.efa-builder)
 # is AL2023 too — build and runtime must share one glibc family or the
 # binary's dynamic symbol versions won't resolve at load time.
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260914.0-minimal
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260928.0-minimal
 # checkov:skip=CKV_DOCKER_2:Health is checked by Kubernetes, not by Docker — the
 # chart's livenessProbe/readinessProbe hit /healthz and /readyz, and kubelet
 # ignores HEALTHCHECK. Adding one would require a shell and an HTTP client in an

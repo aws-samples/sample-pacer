@@ -23,6 +23,18 @@ s3s.workspace = true
 s3s-aws.workspace = true
 aws-config.workspace = true
 aws-sdk-s3.workspace = true
+# The SDK's interceptor and HTTP-client traits. `pacer-daemon warm` (ADR-0048) adds its two
+# headers after signing and reads the warm answer's headers before the modelled output drops
+# them, and — for `--proxy` — supplies its own HTTP client that forwards inside TLS
+# (`warm/forward.rs`), since the stock client can only CONNECT-tunnel. No public aws-sdk-s3
+# API does any of it; the test suite uses the interceptor trait to record the requests the
+# daemon produces (`write_framing.rs`). These three, and `tower-service` and
+# `rustls-native-certs` below, are already in the tree as transitive dependencies of
+# aws-sdk-s3 and hyper-util, so they add no new supply-chain surface.
+aws-smithy-runtime-api = { version = "1", features = ["http-1x"] }
+aws-smithy-types = { version = "1", features = ["http-body-1-x"] }
+tower-service = "0.3"
+rustls-native-certs = "0.8"
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -73,12 +85,6 @@ tokio = { workspace = true, features = ["test-util"] }
 s3s-fs = "0.14"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
-# An SDK interceptor on the daemon's OWN backend client, so a test can assert on the
-# request the daemon PRODUCES rather than only on the one its client supplied — which
-# is what `write_framing.rs` needs and what no public aws-sdk-s3 API exposes. Already
-# in the tree as a transitive dependency of aws-sdk-s3, so this adds no new
-# supply-chain surface, and it is test-only.
-aws-smithy-runtime-api = "1"
 # Named, table-driven cases for the integration arms whose tests differ only by a
 # parameter — see the workspace pin for why this rather than a hand-rolled macro.
 rstest.workspace = true

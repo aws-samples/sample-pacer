@@ -143,18 +143,16 @@ impl ObjectHeader {
 /// `auth.mode=requester` (ADR-0041), by a read-path fill too, from the
 /// requester's own held probe.
 ///
-/// **Not validated in v1, and not a flag flip away from being.** Immutable
-/// checkpoint keys (ADR-0015: a new name per version) mean mixed-version
-/// assembly cannot arise for the target workload, which is why nothing checks
-/// this witness today. But turning that check on is not simply flipping a flag:
-/// this field is absent on most of the chunks that would need checking (every
-/// `node`-mode read fill carries no witness at all, gh22), and on the chunk
-/// store — the default disk tier wherever a slab exists (ADR-0038) — a
-/// witness that IS present does not survive the round trip regardless: its
-/// `SlotHeader` has no ETag field, and `ChunkStore::verified` reconstructs
-/// every hit as `CachedChunk::new(body)`, witness dropped. Enabling validation
-/// there needs a slot format change (v3) and a fill path that always sets the
-/// witness, not a flag.
+/// **Still not validated in `node` mode, though it now survives storage.** The chunk
+/// store's `SlotHeader` carries this witness through a disk round trip and a restart as
+/// of its v3 format (gh64) — `ChunkStore::verified` no longer drops it — so a witness
+/// that IS present stays present. What is missing is upstream of storage: every
+/// `node`-mode read fill still builds a chunk with no witness at all (`FillCtx::to_cached`'s
+/// `node`-mode arm, `pacer-daemon`, gh22), so there is nothing yet for a `node`-mode read
+/// to compare against, and `witness_matches` short-circuits to "always servable" in that
+/// mode regardless. Immutable checkpoint keys (ADR-0015: a new name per version) are why
+/// this has not mattered for the target workload; it matters for any mutable key a write
+/// invalidation failed to reach before a restart (gh64).
 ///
 /// The last chunk of an object may be shorter than `chunk_size` (see
 /// [`ChunkConfig::chunk_bounds`]).

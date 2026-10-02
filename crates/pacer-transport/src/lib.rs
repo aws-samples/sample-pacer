@@ -83,6 +83,10 @@ pub enum TransportError {
 
 /// The seam between the cache tier and the wire (see 05-architecture.md).
 /// gRPC implements it in Phase 2; EFA-RDMA in Phase 3 behind `feature = "efa"`.
+// `#[async_trait]` marks each trait method `#[must_use]` and returns a boxed
+// `Future`, already `#[must_use]`: clippy 1.99's `double_must_use` flags the
+// macro's expansion, not anything written here (same as `pacer_proto::v1`).
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait PeerTransport: Send + Sync {
     /// Fetch a cached blob (or a range of it) from a peer. The ONLY data

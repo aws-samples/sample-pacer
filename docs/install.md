@@ -8,7 +8,12 @@
 - **A bucket.** The default is an S3 Express One Zone directory bucket in the same AZ (by AZ
   ID) as the cache nodes, with a `com.amazonaws.<region>.s3express` Gateway VPC endpoint.
   PrivateLink is not supported for Express. For S3 Standard, set
-  `config.backendType: standard`.
+  `config.backendType: standard`. Whichever backend, give the bucket an
+  `AbortIncompleteMultipartUpload` lifecycle rule before writing through PACER: the write
+  scatter (Standard only, on by default — see [features.md](features.md)) creates
+  multipart uploads the client never sees an ID for, so only this rule or a surviving
+  coordinator can clean one up after a crash. [write-scatter.md](helm/write-scatter.md)
+  has the rule's form for both backends.
 - **EKS Pod Identity** for the chart's ServiceAccount, with permission for the bucket's
   operations (`s3express:CreateSession` for Express).
 - **Cache nodes**, ideally in one AZ, with instance-store NVMe (RAID0), and Nitro v4 or later

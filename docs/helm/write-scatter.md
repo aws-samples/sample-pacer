@@ -372,6 +372,50 @@ which no template can know. Rule 3 of the sizing block above `resources:` in
 `values.yaml` is where the operator sizes it, and `pacer_cgroup_memory_file_bytes`
 is where they watch it.
 
+## The bucket needs an `AbortIncompleteMultipartUpload` lifecycle rule
+
+A write scatter creates its own multipart upload directly on the real bucket (ADR-0032
+§ 2), and the coordinating node — not the client — holds the only upload ID. If that
+coordinator dies after `CreateMultipartUpload` and before `coordinate::unwind`
+(`crates/pacer-daemon/src/coordinate.rs`) gets to call `AbortMultipartUpload`, the upload
+is left incomplete: the client never saw an upload ID to abort it with, so nothing on the
+client side can clean it up, and S3 keeps billing the staged parts until something does.
+`unwind`'s own doc comment calls this out as exactly what the lifecycle rule is for — it
+only covers a coordinator that survives long enough to reach it.
+
+Give the bucket the rule regardless of whether the scatter is on for it. PACER also
+proxies a client's own multipart upload unchanged on every backend (ADR-0032
+Consequences, "a client-supplied multipart upload"), and that upload is just as
+orphanable if the client dies mid-upload — the rule is general bucket hygiene for
+anything written through PACER, and load-bearing specifically for the scatter's own
+uploads, where the client-side abort path does not exist at all.
+
+General-purpose (Standard) buckets:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket <your-bucket> \
+  --lifecycle-configuration '{"Rules":[
+    {"ID":"abort-incomplete-multipart-uploads","Status":"Enabled","Filter":{"Prefix":""},
+     "AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+```
+
+S3 Express One Zone directory buckets support lifecycle rules too, restricted to
+expiration actions (ADR-0002's "expiration-only lifecycle" limitation);
+`AbortIncompleteMultipartUpload` is one of them, so the same rule applies, addressed by
+the directory bucket's own name:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket <your-bucket>--use2-az1--x-s3 \
+  --lifecycle-configuration '{"Rules":[
+    {"ID":"abort-incomplete-multipart-uploads","Status":"Enabled","Filter":{"Prefix":""},
+     "AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+```
+
+7 days is a starting point, not a measurement: long enough that it never races a write
+that is still legitimately in flight, short enough that a crashed coordinator is not
+billed for staged parts indefinitely. Tighten it once you know how long your slowest
+write actually takes.
+
 ## See also
 
 * [memory-model.md](memory-model.md) — the memory sizing rule, including the

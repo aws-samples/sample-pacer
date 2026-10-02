@@ -46,7 +46,7 @@
 # over the four images this set pins — (bare, -minimal) x (amd64, arm64) — and
 # the same output answers the question a bump is usually FOR, since an empty
 # HIGH/CRITICAL list under `--ignore-unfixed` is exactly the `scan-image` gate.
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260928.0
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260930.0
 # checkov:skip=CKV_DOCKER_2:A builder image is never run as a service — it is the
 # `FROM` of a build stage and its containers exist only for the length of a
 # `cargo build`. There is nothing for a HEALTHCHECK to report to.

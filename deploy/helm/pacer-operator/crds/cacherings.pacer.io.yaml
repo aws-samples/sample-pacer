@@ -7,7 +7,6 @@ metadata:
 spec:
   group: pacer.io
   names:
-    categories: []
     kind: CacheRing
     plural: cacherings
     shortNames:

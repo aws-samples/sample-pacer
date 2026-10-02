@@ -97,7 +97,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
 # tree through the AWS SDK and hyper-rustls; listed here only to name the provider.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
-tonic = "0.12"
+tonic = "0.14"
 tonic-build = "0.12"
 prost = "0.13"
 protoc-bin-vendored = "3"

@@ -250,6 +250,17 @@ pub struct Metrics {
     /// tomorrow. This counter is the only series that says the conditional itself was
     /// honoured, which is what the Mountpoint arm's unexplained 0 % hit rate needed.
     pub conditional_get_served: IntCounter,
+    /// Cached object headers checked against the backend before their first use by this
+    /// process (ADR-0049), by `outcome`: `current` (the backend still has this version)
+    /// or `stale` (it does not, and the header was replaced).
+    ///
+    /// The one series that shows a restart's recovered cache being re-trusted rather
+    /// than served blind: after a restart it climbs by one per object read, then stops.
+    pub revalidations: IntCounterVec,
+    /// Cached chunks dropped because their version witness did not match the object
+    /// version the read resolved (ADR-0049) — a chunk a restart recovered from before an
+    /// overwrite, or one filled before ADR-0049 with no witness at all.
+    pub stale_chunks: IntCounter,
     /// Whole-object cache fills that completed.
     pub fills_completed: IntCounter,
     /// Cache fills abandoned (client disconnect or short read).
@@ -1510,6 +1521,8 @@ struct CachePathCounters {
     misses: IntCounter,
     bypass: IntCounter,
     conditional_get_served: IntCounter,
+    revalidations: IntCounterVec,
+    stale_chunks: IntCounter,
     fills_completed: IntCounter,
     fills_aborted: IntCounter,
     bytes_from_cache: IntCounter,
@@ -1517,7 +1530,7 @@ struct CachePathCounters {
     writes_refused: IntCounter,
 }
 
-/// Register the nine counters of [`CachePathCounters`].
+/// Register the eleven series of [`CachePathCounters`].
 ///
 /// # Errors
 ///
@@ -1534,6 +1547,16 @@ fn register_cache_path_counters(registry: &Registry) -> anyhow::Result<CachePath
         conditional_get_served: c(
             "pacer_conditional_get_served_total",
             "If-Match GETs whose ETag matched, so the cache path was taken (ADR-0039)",
+        )?,
+        revalidations: int_counter_vec(
+            registry,
+            "pacer_cache_revalidations_total",
+            "Cached object headers checked against the backend before this process first used them, by outcome current|stale (ADR-0049)",
+            &["outcome"],
+        )?,
+        stale_chunks: c(
+            "pacer_cache_stale_chunks_total",
+            "Cached chunks dropped because their version witness did not match the object version read (ADR-0049)",
         )?,
         fills_completed: c("pacer_fills_completed_total", "Whole-object cache fills")?,
         fills_aborted: c(
@@ -2358,6 +2381,8 @@ impl Metrics {
             cache_misses: cache_path.misses,
             cache_bypass: cache_path.bypass,
             conditional_get_served: cache_path.conditional_get_served,
+            revalidations: cache_path.revalidations,
+            stale_chunks: cache_path.stale_chunks,
             fills_completed: cache_path.fills_completed,
             fills_aborted: cache_path.fills_aborted,
             bytes_from_cache: cache_path.bytes_from_cache,

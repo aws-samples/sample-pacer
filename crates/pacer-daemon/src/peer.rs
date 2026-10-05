@@ -901,6 +901,10 @@ fn content_range_total(content_range: Option<&str>) -> Option<u64> {
 /// for). Without a fill, a closed channel ends the pump.
 async fn pump_read_through(mut st: PumpState) {
     let mut sent: u64 = 0;
+    // The fill's version witness (ADR-0049): the ETag of the very response these bytes
+    // are, which no header lookup could improve on. Taken before `meta` moves into the
+    // first frame.
+    let e_tag = st.meta.e_tag.clone();
     let mut first = Some(st.meta);
     let mut failed = false;
     loop {
@@ -949,10 +953,12 @@ async fn pump_read_through(mut st: PumpState) {
         // `admit` bool above), so this holds the claim this fill's insert needs
         // fenced against a write's `Invalidate` racing it (gh22, ADR-0044) —
         // see `insert_fenced`.
+        let cached = match e_tag {
+            Some(e_tag) => CachedChunk::versioned(body, e_tag),
+            None => CachedChunk::new(body),
+        };
         let inserted = match st.guard.as_ref() {
-            Some(guard) => {
-                insert_fenced(&st.tier, &st.cache_key, CachedChunk::new(body), guard).await
-            }
+            Some(guard) => insert_fenced(&st.tier, &st.cache_key, cached, guard).await,
             None => false,
         };
         if inserted {

@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use pacer_backend::retry::{BackendReadError, BackendReadErrorKind, ChunkRead, RetryPolicy};
-use pacer_cache::chunk::{CachedChunk, ChunkConfig};
+use pacer_cache::chunk::{CachedChunk, ChunkConfig, ObjectHeader};
 use pacer_cache::tier::ChunkTier;
 use pacer_cache::ReadDecision;
 use pacer_ring::directory::Tier;
@@ -52,7 +52,7 @@ use pacer_transport::TransportError;
 use prometheus::{IntCounter, IntGauge};
 use s3s::{s3_error, S3Result};
 use tokio::sync::broadcast;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::cachefill::ChunkFill;
 use crate::metrics::Metrics;
@@ -119,6 +119,11 @@ pub(super) struct FillCtx {
     pub(super) bucket: String,
     pub(super) key: String,
     pub(super) object_len: u64,
+    /// The object version this read serves: the ETag of the header it resolved — one
+    /// this process confirmed against the backend (ADR-0049) or, in `requester` mode,
+    /// the one this GET's probe just reported. Every chunk this read fills is tagged
+    /// with it, and a cached chunk is served only under it ([`Self::witness_matches`]).
+    pub(super) e_tag: Option<String>,
     /// `true` when a completed fetch of a missed chunk should be inserted
     /// (`CacheAndFill` + size-admitted); `false` bypasses the fill (`no-store`
     /// or a below-`min`/above-`max` object).
@@ -166,12 +171,16 @@ impl PacerProxy {
     ///
     /// `warm` comes back `false`; the warm path sets it with struct-update syntax
     /// rather than as an eighth argument here.
+    ///
+    /// The object's length and version both come from `header`, rather than as two
+    /// arguments, so a read cannot be built against one version's length and another's
+    /// ETag.
     pub(super) fn fill_ctx(
         &self,
         object_key: String,
         bucket: String,
         key: String,
-        object_len: u64,
+        header: &ObjectHeader,
         decision: ReadDecision,
         requester: Option<RequesterRead>,
     ) -> FillCtx {
@@ -188,7 +197,8 @@ impl PacerProxy {
             object_key,
             bucket,
             key,
-            object_len,
+            object_len: header.object_len,
+            e_tag: header.e_tag.clone(),
             admit: decision == ReadDecision::CacheAndFill,
             no_fill: decision == ReadDecision::CacheNoFill,
             #[cfg(feature = "efa")]
@@ -727,6 +737,19 @@ pub(crate) async fn insert_fenced(
 /// Poison **before** forget: a fill whose insert lands between the two is
 /// undone by `insert_fenced`'s after-check; one that finished and released its
 /// claim before this call is covered by the forget.
+/// Whether two ETags name the same object version (ADR-0049): both present, and equal
+/// once the surrounding quotes are dropped.
+///
+/// Absent on either side is never "the same" — there is nothing to compare. And quotes
+/// are dropped because each source spells the ETag its own way: `head_backend` stores it
+/// unquoted, `CompleteMultipartUpload` returns it quoted, and both end up as witnesses.
+pub(super) fn same_version(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.trim_matches('"') == b.trim_matches('"'),
+        _ => false,
+    }
+}
+
 pub(crate) async fn forget_fenced(filling: &FillRegistry, tier: &ChunkTier, key: &str) {
     filling.poison(key);
     tier.forget(key).await;
@@ -755,14 +778,10 @@ impl FillCtx {
     /// fall back to the backend and are never client-visible.
     pub(super) async fn resolve_chunk(&self, idx: u64) -> S3Result<Bytes> {
         let chunk_key = self.chunk.chunk_key(&self.object_key, idx);
-        if let Ok(Some(c)) = self.tier.get_chunk(&chunk_key).await {
-            // A stale entry in requester mode is a miss: resolved below, and a home's
-            // fill overwrites it under the current witness.
-            if self.witness_matches(c.e_tag.as_deref()) {
-                self.metrics.cache_hits.inc();
-                self.metrics.bytes_from_cache.inc_by(c.body.len() as u64);
-                return Ok(c.body);
-            }
+        if let Some(c) = self.cached_current(&chunk_key).await {
+            self.metrics.cache_hits.inc();
+            self.metrics.bytes_from_cache.inc_by(c.body.len() as u64);
+            return Ok(c.body);
         }
         // A chunk this node co-homes (or single-node) is read through the
         // backend and filled here (ADR-0016 layer 2: all R homes fill).
@@ -988,9 +1007,11 @@ impl FillCtx {
                 .fetch_blob(source, chunk_key, None, self.no_fill)
                 .await
             {
-                // A holder's copy of an older version (requester mode's witness
-                // check): skip it as if it were not cached, never serve it.
-                Ok(blob) if !self.witness_matches(blob.e_tag.as_deref()) => {}
+                // A holder's copy of another version: skip it as if it were not cached,
+                // never serve it — and tell the holder, which cannot know (ADR-0049).
+                Ok(blob) if !self.witness_matches(blob.e_tag.as_deref()) => {
+                    self.spawn_forget_at(source, chunk_key);
+                }
                 Ok(blob) => match collect_blob(blob).await {
                     Ok(bytes) => {
                         self.metrics.peer_fetches.inc();
@@ -1218,29 +1239,80 @@ impl FillCtx {
         self.fill.cached_bytes(data, &self.metrics)
     }
 
-    /// The cache entry for `data`. In `requester` mode it carries the probe's ETag
-    /// as its version witness, which [`Self::witness_matches`] checks on every
-    /// later read (ADR-0041, planning/30 § 3.4); node mode is unchanged.
+    /// The cache entry for `data`, carrying this read's version ([`Self::e_tag`]) as its
+    /// witness, which [`Self::witness_matches`] checks on every later read — in both
+    /// auth modes (ADR-0041 for `requester`, ADR-0049 for `node`).
     fn to_cached(&self, data: &Bytes) -> CachedChunk {
         let body = self.cached_bytes(data);
-        match self.requester.as_ref().and_then(|r| r.e_tag.clone()) {
+        match self.e_tag.clone() {
             Some(e_tag) => CachedChunk::versioned(body, e_tag),
             None => CachedChunk::new(body),
         }
     }
 
-    /// Whether a cached chunk whose witness is `e_tag` may be served to this read.
+    /// Whether a cached chunk whose witness is `e_tag` may be served to this read: only
+    /// when it is the version this read resolved ([`Self::e_tag`]).
     ///
-    /// Always, in node mode (ADR-0015's contract, unchanged). In `requester` mode
-    /// only when it matches the ETag this GET's probe just reported: a chunk filled
-    /// under an older version — overwritten through this proxy or around it — is a
-    /// miss and is re-read, never served. A probe with no ETag serves nothing from
-    /// the cache, because there is nothing to compare against.
-    fn witness_matches(&self, e_tag: Option<&str>) -> bool {
-        match &self.requester {
-            None => true,
-            Some(r) => r.e_tag.is_some() && r.e_tag.as_deref() == e_tag,
+    /// A chunk filled under an older version — overwritten through this proxy, around it,
+    /// or while this node was down and then recovered from disk by a restart (#64) — is a
+    /// miss and is re-read, never served. So is a chunk with no witness at all, which is
+    /// what every `node`-mode fill wrote before ADR-0049. A read whose own version has no
+    /// ETag serves nothing from the cache, because there is nothing to compare against.
+    ///
+    /// Compared by [`same_version`], which ignores the quotes the scatter path's witnesses
+    /// carry and the header's ETag does not.
+    pub(super) fn witness_matches(&self, e_tag: Option<&str>) -> bool {
+        same_version(self.e_tag.as_deref(), e_tag)
+    }
+
+    /// Ask `holder` to drop its copy of `chunk_key`, which just answered this read under
+    /// another version's witness (ADR-0049). Fire-and-forget, like an ADR-0017 announce.
+    ///
+    /// Without this a stale copy at a home outlives the read that found it: every
+    /// requester skips it and reads the backend, while the home — which still "holds" the
+    /// key — never reads it through again, so the chunk is uncached cluster-wide until the
+    /// home's own clients happen to read it or LRU reaches it. A restart that recovered
+    /// a pre-overwrite copy is the case that produces one.
+    ///
+    /// Safe if this read is the one that is behind: the holder forgets a current copy and
+    /// refills it on the next read through, which costs one backend read and serves
+    /// nothing wrong.
+    pub(super) fn spawn_forget_at(&self, holder: &pacer_ring::NodeId, chunk_key: &str) {
+        let Some(cluster) = &self.cluster else {
+            return;
+        };
+        let transport = Arc::clone(&cluster.transport);
+        let (holder, chunk_key) = (holder.clone(), chunk_key.to_owned());
+        tokio::spawn(async move {
+            if let Err(e) = transport.invalidate(&holder, &chunk_key).await {
+                debug!(key = %chunk_key, holder = %holder.name(), error = %e,
+                    "could not tell a holder its copy is another version; it serves a miss until evicted");
+            }
+        });
+    }
+
+    /// This node's cached copy of `chunk_key`, if it holds one of the version this read
+    /// serves — the one local-hit check, shared by the body path ([`Self::resolve_chunk`])
+    /// and the delivery path (`deliver_window`) so neither can serve what the other refuses.
+    ///
+    /// A copy under any other witness is **forgotten** here, not just skipped: the slot
+    /// store's `put` is a no-op for a key it already holds (chunks are immutable within
+    /// one version), so a re-fill under the new witness would otherwise never replace it,
+    /// and every later read would miss on it until LRU got there. A plain forget rather
+    /// than a fenced one: there is no fill of *this* version to fence — a fill racing it
+    /// is at worst forgotten too, and costs one more miss.
+    ///
+    /// A tier read error is a miss as well — the caller's fallback is the same.
+    pub(super) async fn cached_current(&self, chunk_key: &str) -> Option<CachedChunk> {
+        let cached = self.tier.get_chunk(chunk_key).await.ok().flatten()?;
+        if self.witness_matches(cached.e_tag.as_deref()) {
+            return Some(cached);
         }
+        self.tier.forget(chunk_key).await;
+        self.metrics.stale_chunks.inc();
+        trace!(key = %chunk_key, witness = ?cached.e_tag, current = ?self.e_tag,
+            "cached chunk is not the version this read serves; forgotten");
+        None
     }
 
     /// Insert a freshly-fetched chunk into the cache, guarded so only one fill
@@ -1332,6 +1404,17 @@ pub(super) async fn collect_blob(blob: pacer_transport::BlobStream) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0049's comparison: quotes are spelling, absence is never a match.
+    #[test]
+    fn same_version_ignores_quotes_and_never_matches_an_absent_etag() {
+        assert!(same_version(Some("abc-3"), Some("\"abc-3\"")));
+        assert!(same_version(Some("\"abc-3\""), Some("abc-3")));
+        assert!(!same_version(Some("abc-3"), Some("abc-4")));
+        assert!(!same_version(None, Some("abc-3")));
+        assert!(!same_version(Some("abc-3"), None));
+        assert!(!same_version(None, None));
+    }
 
     /// Build a [`pacer_transport::BlobStream`] whose body is `parts` in order,
     /// with `len` = the total byte count (as the transport sets it).

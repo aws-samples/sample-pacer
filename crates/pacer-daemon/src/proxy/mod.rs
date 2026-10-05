@@ -22,6 +22,8 @@
 //! * `place` — one window's bytes into that memory, by copy or one-sided WRITE
 //!   (ADR-0026 point 4, ADR-0018, ADR-0030).
 //! * `warm` — the warm-only GET: every covering chunk resolved, no body (ADR-0048).
+//! * `revalidate` — which cached headers this process has confirmed against the
+//!   backend, so a restart re-checks what it recovered (ADR-0049).
 //!
 //! Everything a *passthrough* op does is here in full, because there is nothing to
 //! it: count the op, resolve the bucket alias (ADR-0002), forward to `inner`.
@@ -45,6 +47,7 @@ mod deliver;
 mod fill;
 mod place;
 mod read;
+mod revalidate;
 mod target;
 mod warm;
 mod write;
@@ -95,6 +98,9 @@ pub struct PacerProxy {
     /// Chunk keys with a fill in flight, and what each one will hand a second
     /// arrival (ADR-0040). Shared with the peer server (one fill per key node-wide).
     filling: FillRegistry,
+    /// Objects whose cached header this process has confirmed against the backend
+    /// (ADR-0049). Empty at startup, so every header a restart recovered is checked once.
+    revalidated: revalidate::Revalidated,
     /// Cluster tier (Phase 2): ring + peer transport. None = single-node.
     cluster: Option<Cluster>,
     /// Backend shape (ADR-0023). Gates the Express-only request normalization
@@ -164,6 +170,7 @@ impl PacerProxy {
             // (ADR-0002): an empty map resolves every bucket to itself.
             bucket_map: HashMap::new(),
             filling: FillRegistry::new(),
+            revalidated: revalidate::Revalidated::default(),
             cluster: None,
             // Defaults to Express (ADR-0002/0023) so callers that don't set a
             // backend shape keep the historical behavior; main.rs overrides it

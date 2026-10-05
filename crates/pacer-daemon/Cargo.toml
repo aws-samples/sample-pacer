@@ -92,7 +92,7 @@ rstest.workspace = true
 # private key is ever committed — a fixture key in a public repository trips secret
 # scanners and reads as a leak whatever its purpose. Test-only, from the rustls project,
 # on the same aws-lc-rs backend the daemon uses.
-rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 # ONE integration binary, not one per file. Cargo links a fresh copy of this crate and
 # its whole dependency closure into every `tests/*.rs`, and nine of them was nine link

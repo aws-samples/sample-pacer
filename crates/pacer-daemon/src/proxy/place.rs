@@ -252,7 +252,9 @@ impl FillCtx {
         // when it was not. `stage_seconds{stage="cache_read"}` plus
         // `stage_seconds{stage="copy"}` is the whole of `chunk_seconds` on a local hit.
         let read_started = std::time::Instant::now();
-        let entry = self.tier.get_chunk(&chunk_key).await;
+        // The same local-hit check the body path makes (ADR-0049), so a chunk a restart
+        // recovered from before an overwrite is refused here too, not delivered.
+        let entry = self.cached_current(&chunk_key).await;
         self.metrics
             .delivery
             .stage_seconds
@@ -260,7 +262,7 @@ impl FillCtx {
             .observe(read_started.elapsed().as_secs_f64());
         // Local hit: a `memcpy`, and NO registration — the fast path never touches
         // `ibv_reg_mr`, which is the entire point of `ClientMemory`'s laziness.
-        if let Ok(Some(chunk)) = entry {
+        if let Some(chunk) = entry {
             self.metrics.cache_hits.inc();
             self.metrics.bytes_from_cache.inc_by(window.len as u64);
             return self
@@ -599,6 +601,12 @@ impl FillCtx {
                 .fetch_blob(source, chunk_key, None, self.no_fill)
                 .await
             {
+                // A holder's copy of another version — one it recovered from before an
+                // overwrite, say (ADR-0049): skip it as if it were not cached, as
+                // `fetch_from_peer` does.
+                Ok(blob) if !self.witness_matches(blob.e_tag.as_deref()) => {
+                    self.spawn_forget_at(source, chunk_key);
+                }
                 Ok(blob) => match collect_blob(blob).await {
                     Ok(bytes) => {
                         self.metrics.peer_fetches.inc();
@@ -740,7 +748,20 @@ impl FillCtx {
             )
             .await;
         match delivered {
-            Ok(ChunkDelivery::Landed { bytes, crc32 }) => {
+            // The holder wrote a copy of another version (ADR-0049): not a delivery. The
+            // caller moves on, and whichever source answers next overwrites the window
+            // before any response leaves this node.
+            Ok(ChunkDelivery::Landed { ref e_tag, .. })
+                if !self.witness_matches(e_tag.as_deref()) =>
+            {
+                None
+            }
+            Ok(ChunkDelivery::Streamed(ref blob))
+                if !self.witness_matches(blob.e_tag.as_deref()) =>
+            {
+                None
+            }
+            Ok(ChunkDelivery::Landed { bytes, crc32, .. }) => {
                 self.metrics.peer_fetches.inc();
                 self.metrics.bytes_from_peers.inc_by(bytes);
                 self.metrics
@@ -823,8 +844,19 @@ impl FillCtx {
         match delivered {
             // `crc32` is `None` by construction on this arm — the daemon registered this
             // window, so `run_delivery` digests it by reading it back, which proves what is
+            // A copy of another version (ADR-0049) is not a delivery: see the token arm.
+            Ok(pacer_transport::efa::ChunkDelivery::Landed { ref e_tag, .. })
+                if !self.witness_matches(e_tag.as_deref()) =>
+            {
+                None
+            }
+            Ok(pacer_transport::efa::ChunkDelivery::Streamed(ref blob))
+                if !self.witness_matches(blob.e_tag.as_deref()) =>
+            {
+                None
+            }
             // IN the client's memory rather than what a holder says it sent.
-            Ok(pacer_transport::efa::ChunkDelivery::Landed { bytes, crc32: _ }) => {
+            Ok(pacer_transport::efa::ChunkDelivery::Landed { bytes, .. }) => {
                 self.metrics.peer_fetches.inc();
                 self.metrics.bytes_from_peers.inc_by(bytes);
                 self.metrics

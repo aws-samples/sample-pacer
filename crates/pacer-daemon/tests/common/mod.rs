@@ -56,8 +56,8 @@ mod single;
 // make the callers spell it out.
 pub use fleet::{node_parts, serve_node, serve_peer, NodeParts, NodeSpec};
 pub use single::{
-    daemon_core, daemon_core_over, wait_until_connection_refused, BackendPair, Daemon, DaemonCore,
-    DaemonSpec,
+    daemon_core, daemon_core_in, daemon_core_over, wait_until_connection_refused, BackendPair,
+    Daemon, DaemonCore, DaemonSpec, TierKind,
 };
 
 use std::future::Future;

@@ -85,6 +85,8 @@ mod fill_coalesce;
 mod get_bypass;
 #[path = "daemon/listener.rs"]
 mod listener;
+#[path = "daemon/restart.rs"]
+mod restart;
 #[path = "daemon/scatter/mod.rs"]
 mod scatter;
 #[path = "daemon/warm.rs"]

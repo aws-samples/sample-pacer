@@ -13,6 +13,8 @@ use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use pacer_backend::BackendType;
 use pacer_cache::chunk::ChunkConfig;
+use pacer_cache::slot::SLOT_HEADER_BYTES;
+use pacer_cache::store::{ChunkStore, ReadShape, StoreConfig};
 use pacer_cache::tier::ChunkTier;
 use pacer_daemon::auth::PlaceholderAuth;
 use pacer_daemon::listen::ListenLimits;
@@ -155,15 +157,69 @@ pub async fn daemon_core(spec: DaemonSpec) -> DaemonCore {
 /// If the cache cannot be brought up.
 pub async fn daemon_core_over(spec: DaemonSpec, backend: BackendPair) -> DaemonCore {
     let cache_dir = tempfile::tempdir().expect("a temp dir for the cache");
+    let mut core = daemon_core_in(spec, backend, cache_dir.path(), TierKind::Foyer).await;
+    core.dirs.push(cache_dir);
+    core
+}
+
+/// Which backend holds chunk bodies — `config.diskTier`'s two values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierKind {
+    /// foyer's hybrid cache holds chunks and headers alike.
+    Foyer,
+    /// ADR-0033's slot store holds chunks; foyer keeps the headers.
+    Store,
+}
+
+/// Subdirectory of the cache dir for the slot store's extents — `main`'s layout, so a
+/// reopen over the same directory finds what the previous daemon wrote where `main`
+/// would look.
+const CHUNK_STORE_SUBDIR: &str = "chunk-store";
+
+/// Slots the store gets: room for every chunk an arm writes, with the eviction this
+/// suite is not about kept out of the way.
+const STORE_SLOTS: u64 = 64;
+
+/// [`daemon_core_over`] over a cache directory the caller owns, on either tier.
+///
+/// The directory is borrowed, not moved in, because the arms this exists for close one
+/// daemon and open the next over the **same** directory — what a pod restart on a
+/// `hostPath` cache does. `dirs` comes back empty; the caller keeps the directory alive.
+///
+/// # Panics
+///
+/// If the cache or the store cannot be opened.
+pub async fn daemon_core_in(
+    spec: DaemonSpec,
+    backend: BackendPair,
+    cache_dir: &std::path::Path,
+    kind: TierKind,
+) -> DaemonCore {
     let metrics = Metrics::new().expect("a fresh registry");
     let cache = if spec.foyer_metrics {
-        build_cache_with_metrics(cache_dir.path(), spec.cache, &metrics).await
+        build_cache_with_metrics(cache_dir, spec.cache, &metrics).await
     } else {
-        build_cache(cache_dir.path(), spec.cache).await
+        build_cache(cache_dir, spec.cache).await
     };
     // No slab: these daemons have no RDMA plane, so cached chunks belong on the heap
     // (ADR-0028's default).
-    let tier = ChunkTier::foyer(cache, Default::default());
+    let tier = match kind {
+        TierKind::Foyer => ChunkTier::foyer(cache, Default::default()),
+        TierKind::Store => {
+            let chunk_size = usize::try_from(spec.chunk_size).expect("a test chunk fits usize");
+            let store = ChunkStore::open(StoreConfig {
+                dir: cache_dir.join(CHUNK_STORE_SUBDIR),
+                chunk_size,
+                capacity_bytes: STORE_SLOTS * (SLOT_HEADER_BYTES as u64 + spec.chunk_size),
+                verify_body: true,
+                read_shape: ReadShape::default(),
+                read_concurrency: 0,
+            })
+            .await
+            .expect("opening the chunk store");
+            ChunkTier::with_store(cache, store, Default::default())
+        }
+    };
     let proxy = PacerProxy::new(
         backend.daemon,
         tier.clone(),
@@ -182,7 +238,7 @@ pub async fn daemon_core_over(spec: DaemonSpec, backend: BackendPair) -> DaemonC
         tier,
         backend: backend.truth,
         chunk_size: spec.chunk_size,
-        dirs: vec![cache_dir],
+        dirs: Vec::new(),
     }
 }
 

@@ -140,6 +140,11 @@ pub enum ChunkDelivery {
         /// back, so the digest has to come from the side that held the bytes
         /// (ADR-0030 point 7).
         crc32: Option<u32>,
+        /// The holder's version witness for the chunk it wrote — the ETag its cached copy
+        /// was filled under. The requester compares it with the version its read resolved
+        /// (ADR-0049) and treats a mismatch as no delivery, so the window is written again
+        /// from a current source before any response leaves this node.
+        e_tag: Option<String>,
     },
     /// The holder streamed the body instead (it had no cached AH for this
     /// requester, the body did not fit the offered window, or its own WRITE
@@ -300,6 +305,7 @@ impl EfaRdmaTransport {
             // The daemon registered this window, so `run_delivery` digests it by reading it
             // back — a stronger check than anything the holder could report.
             crc32: None,
+            e_tag: meta.e_tag,
         })
     }
 
@@ -404,6 +410,7 @@ impl EfaRdmaTransport {
         Ok(ChunkDelivery::Landed {
             bytes: meta.total_len,
             crc32: meta.written_crc32,
+            e_tag: meta.e_tag,
         })
     }
 }

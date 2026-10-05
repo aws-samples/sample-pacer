@@ -40,7 +40,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
 use super::cluster::is_home;
-use super::fill::{FillCtx, RequesterRead};
+use super::fill::{same_version, FillCtx, RequesterRead};
 use super::PacerProxy;
 use crate::warm::SkipReason;
 
@@ -48,38 +48,42 @@ use crate::warm::SkipReason;
 /// `get_object` because it is not a read.
 const OP_WARM: &str = "warm_object";
 
-/// Resolve the object header (length + response metadata) needed to compute
-/// the covering chunk set. A cache hit returns the stored header; a miss
-/// issues a backend `HeadObject` (a metadata op — no per-GB retrieval
-/// charge, ADR-0015). Returns `(header, was_cached)` so the caller inserts
-/// a freshly-discovered header once admission is decided.
+/// `outcome` label values of `pacer_cache_revalidations_total` (ADR-0049). Consts for
+/// the reason the fill path's labels are: a dashboard depends on the exact string.
 ///
-/// A free function for the same reason [`super::cluster::chunk_sources`] is: the pre-flight
-/// query needs an
-/// object's length to compute the same covering chunk set the read will, and a second HEAD
-/// path could disagree about which lengths are cached. Its cache read also *warms* the header
-/// the GET that follows will want, so the pre-flight is not purely a cost.
+/// The backend still has the version the cached header describes.
+const REVALIDATION_CURRENT: &str = "current";
+/// It does not: the header was replaced by the backend's current one.
+const REVALIDATION_STALE: &str = "stale";
+
+/// This node's cached header for `object_key`, if the foyer tier holds one.
+///
+/// A read failure is logged and treated as absent, because the caller's fallback — a
+/// `HeadObject` — is what a miss costs anyway.
+async fn cached_header(tier: &ChunkTier, object_key: &str) -> Option<ObjectHeader> {
+    match tier.cache().get(object_key).await {
+        Ok(Some(entry)) => entry.value().as_header().cloned(),
+        Ok(None) => None,
+        Err(e) => {
+            warn!(key = %object_key, error = %e, "cache read failed; heading backend");
+            None
+        }
+    }
+}
+
+/// The backend's current header for `bucket`/`key`, by `HeadObject` (a metadata op — no
+/// per-GB retrieval charge, ADR-0015).
 ///
 /// # Errors
 ///
 /// Maps a backend `NoSuchKey` to the same S3 error the passthrough would
 /// return; any other backend failure surfaces as `InternalError`.
-pub(super) async fn header_for(
-    tier: &ChunkTier,
+async fn head_backend(
     backend: &aws_sdk_s3::Client,
     object_key: &str,
     bucket: &str,
     key: &str,
-) -> S3Result<(ObjectHeader, bool)> {
-    match tier.cache().get(object_key).await {
-        Ok(Some(entry)) => {
-            if let Some(h) = entry.value().as_header() {
-                return Ok((h.clone(), true));
-            }
-        }
-        Ok(None) => {}
-        Err(e) => warn!(key = %object_key, error = %e, "cache read failed; heading backend"),
-    }
+) -> S3Result<ObjectHeader> {
     let head = backend
         .head_object()
         .bucket(bucket)
@@ -102,7 +106,7 @@ pub(super) async fn header_for(
         .content_length()
         .and_then(|l| u64::try_from(l).ok())
         .ok_or_else(|| s3_error!(InternalError, "backend HeadObject without content length"))?;
-    Ok((object_header_from_head(&head, object_len), false))
+    Ok(object_header_from_head(&head, object_len))
 }
 
 /// Map a backend `HeadObjectOutput` onto an [`ObjectHeader`], `object_len`
@@ -112,7 +116,7 @@ pub(super) async fn header_for(
 /// otherwise report a length for a *different* version than the ETag this
 /// header is about to carry.
 ///
-/// The one mapping every caller shares: [`header_for`]'s cache-miss HEAD and
+/// The one mapping every caller shares: [`head_backend`]'s HEAD and
 /// the scatter path's inline post-Complete `HeadObject` both need it, and issue #25 is
 /// exactly the bug that opened up when a second call site built an
 /// `ObjectHeader` by hand instead of reusing this one.
@@ -219,7 +223,7 @@ pub(crate) fn representation_output_fields(
 ///   not guess for. Letting s3s decide it means the one place quoting and weakness are
 ///   parsed is the one place upstream tests them.
 ///
-/// Ours comes from [`header_for`], which stores it unquoted, so the comparison is a plain
+/// Ours comes from [`head_backend`], which stores it unquoted, so the comparison is a plain
 /// string equality between two already-normalised strong values.
 fn if_match_allows_cache(if_match: Option<&dto::ETagCondition>, header_etag: Option<&str>) -> bool {
     let Some(condition) = if_match else {
@@ -295,19 +299,59 @@ impl PacerProxy {
     }
 
     /// Resolve the object header (length + response metadata) needed to compute
-    /// the covering chunk set — see [`header_for`], which this delegates to so the
-    /// pre-flight query resolves an object's length exactly as the read does.
+    /// the covering chunk set. Returns `(header, was_cached)` so the caller inserts
+    /// a freshly-discovered header once admission is decided.
+    ///
+    /// A cached header is used as-is only once this process has confirmed its object
+    /// against the backend (ADR-0049). Until then it may be one the disk tier recovered
+    /// from a previous process, describing a version that has since been overwritten, so
+    /// the first read of each object costs one `HeadObject`: a matching ETag confirms the
+    /// cached header, anything else replaces it with the backend's. A miss costs the same
+    /// `HeadObject` it always did, and confirms the object too.
+    ///
+    /// Two ETags are only "the same version" when both exist. A backend that reports none
+    /// gives nothing to compare, so its objects are re-headed rather than trusted — and
+    /// their chunks, whose witness is that same absent ETag, are never served from cache
+    /// ([`FillCtx::witness_matches`]).
     ///
     /// # Errors
     ///
-    /// See [`header_for`].
+    /// See [`head_backend`]. A confirmation that cannot reach the backend fails the GET
+    /// exactly as a miss would: a recovered header is never served unconfirmed.
     async fn header_for(
         &self,
         object_key: &str,
         bucket: &str,
         key: &str,
     ) -> S3Result<(ObjectHeader, bool)> {
-        header_for(&self.tier, &self.backend, object_key, bucket, key).await
+        let cached = cached_header(&self.tier, object_key).await;
+        if let Some(header) = &cached {
+            if self.revalidated.is_confirmed(object_key) {
+                return Ok((header.clone(), true));
+            }
+        }
+        let current = head_backend(&self.backend, object_key, bucket, key).await?;
+        self.revalidated.confirm(object_key);
+        let Some(header) = cached else {
+            return Ok((current, false));
+        };
+        if same_version(header.e_tag.as_deref(), current.e_tag.as_deref()) {
+            self.count_revalidation(REVALIDATION_CURRENT);
+            return Ok((header, true));
+        }
+        // Removed rather than left for `remember_header` to overwrite: a `no-store` read
+        // inserts nothing, and the stale header would then pass as confirmed.
+        self.tier.cache().remove(object_key);
+        self.count_revalidation(REVALIDATION_STALE);
+        Ok((current, false))
+    }
+
+    /// Count one cached header checked against the backend (ADR-0049).
+    fn count_revalidation(&self, outcome: &str) {
+        self.metrics
+            .revalidations
+            .with_label_values(&[outcome])
+            .inc();
     }
 
     /// Record what the header resolution found: cache a freshly-discovered header
@@ -427,7 +471,7 @@ impl PacerProxy {
     /// # Errors
     ///
     /// `InvalidRange` for a range the object cannot satisfy, and whatever the
-    /// header resolution ([`header_for`]) or the first unresolvable chunk
+    /// header resolution ([`Self::header_for`]) or the first unresolvable chunk
     /// ([`FillCtx::resolve_chunk`]) fails with.
     pub(super) async fn serve_get(
         &self,
@@ -524,7 +568,7 @@ impl PacerProxy {
 
         // 4. Serve the covering chunks in order through the bounded look-ahead
         //    pipeline, filling misses per chunk.
-        let ctx = self.fill_ctx(object_key, bucket, key, header.object_len, decision, None);
+        let ctx = self.fill_ctx(object_key, bucket, key, &header, decision, None);
         if warm {
             return self.warm_range(ctx, &header, start, end).await;
         }
@@ -638,7 +682,7 @@ impl PacerProxy {
             object_key,
             bucket,
             key,
-            header.object_len,
+            &header,
             decision,
             Some(RequesterRead {
                 held,
@@ -966,7 +1010,7 @@ mod tests {
     use super::if_match_allows_cache;
     use s3s::dto::{ETag, ETagCondition};
 
-    /// Our own ETag, as [`super::header_for`] stores it: unquoted.
+    /// Our own ETag, as [`super::head_backend`] stores it: unquoted.
     const OURS: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
     /// The condition as s3s would have parsed it off the wire, so these cases exercise the
@@ -985,7 +1029,7 @@ mod tests {
     #[test]
     fn the_etag_the_client_named_matches_ours() {
         // Sent quoted, as every S3 client sends it and RFC 9110 requires; s3s unquotes,
-        // and `header_for` stored ours unquoted, so the two meet already normalised.
+        // and `head_backend` stored ours unquoted, so the two meet already normalised.
         assert!(if_match_allows_cache(
             Some(&condition(&format!("\"{OURS}\""))),
             Some(OURS)

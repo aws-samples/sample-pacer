@@ -44,6 +44,13 @@ crate = "ring"
 expression = "MIT AND ISC AND OpenSSL"
 license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
+[[licenses.exceptions]]
+# webpki-root-certs (via kube-client -> rustls-platform-verifier) ships the
+# Mozilla CA bundle under CDLA-Permissive-2.0, a permissive data license
+# compatible with MIT-0. Allowed for this crate only, not workspace-wide.
+crate = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
